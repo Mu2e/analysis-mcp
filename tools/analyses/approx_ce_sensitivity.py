@@ -24,11 +24,34 @@ The chain, following the original macro:
 5. Scan every window [x1, x2] with x1 >= 50 MeV and keep the one maximizing
    S/sqrt(B).
 
+Cut modes: with `cut_mode="momentum"` (default) only the momentum window is
+scanned and no time or geometry cut is applied. With `cut_mode="box"` the
+momentum, time, R(max), d0 and cos(theta) cuts are optimized by coordinate
+ascent on S/sqrt(B). In box mode `cosmic_rate_per_s_per_mev` is the
+cosmic-electron rate for the LOOSE selection the cosmic shapes were extracted
+with (ConvAna set 81: e-, APR/CPR trigger, upstream-reflection and multi-track
+vetoes, 100 < p < 110 MeV/c; no t0, cos, R(max) or d0 cut): the box's cosmic
+count is that rate summed over the momentum window times the box's cosmic time
+efficiency (flat over the shapes' t0 range) and geometry efficiency (a fixed
+sample drawn from the shapes), with no further scaling. Its default is the
+Run-1A rate 10/7.8e5 times the loose/tight yield ratio from the shapes file
+(`reference_cuts.combined`, the fraction of the loose set passing the tight
+Run-1A cuts 540 < t0 < 1650 ns, 0.525 < cos < 0.649, 482 < R(max) < 642.6 mm).
+In momentum mode it is the rate after whatever fixed selection the result is meant to represent, applied as-is. Box mode assumes
+time is separable from momentum and geometry for CE and cosmics, and
+momentum and (rc, cos) separable for cosmics. The CE is NOT taken as separable
+in momentum and geometry: each CE event keeps its own signal bin and the box's
+signal is the smeared spectrum of the events passing the geometry cuts (see
+`BoxModel`), since a d0 or R(max) cut removes low-energy-loss events more than
+others. As a known first-order approximation, DIO's time and geometry
+efficiencies equal the CE's momentum-integrated ones.
+
 The numbers are rough by construction — this is a figure of merit for
 comparing beamline configurations, not a sensitivity calculation.
 """
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -74,6 +97,85 @@ BINNING = {
     "primary_start_r": (100, 0.0, 200.0),
 }
 EXTRA_PLOT_VARS = ("primary_start_z", "primary_start_r")
+
+# --- the box-cut model (cut_mode = "box") ------------------------------------
+
+CUT_MODES = ("momentum", "box")
+
+# The cosmic rate a cut_mode assumes when the caller gives none. Momentum mode
+# applies it as-is: the rough post-selection (tight) Run-1A rate. Box mode's
+# rate is for the LOOSE selection the cosmic shapes were extracted with, so its
+# default is that tight rate times the loose/tight yield ratio measured in the
+# shapes (`CosmicShapes.loose_to_tight_ratio`).
+COSMIC_RATE_MOMENTUM_MODE = COSMIC_RATE_PER_SECOND_PER_MEV
+
+
+def recommended_cosmic_rate(cut_mode: str) -> float:
+    """The cosmic rate (per second per MeV/c) used for `cut_mode` by default."""
+    if cut_mode == "box":
+        return COSMIC_RATE_MOMENTUM_MODE * load_cosmic_shapes().loose_to_tight_ratio
+    return COSMIC_RATE_MOMENTUM_MODE
+
+
+# The microbunch is the 1695 ns between proton pulses (the on-spill time per
+# event above, in ns). CE time follows the stopped muon's lifetime inside it.
+# Cosmics are flat over the time range of the loose shapes instead.
+MICROBUNCH_NS = 1695.0
+# Bound muon lifetime in aluminum (864 ns, the Mu2e stopping-target value).
+MUON_LIFETIME_NS = 864.0
+# The base time cut, which the time optimization may only tighten.
+TIME_MIN_NS = 525.0
+TIME_MAX_NS = 1650.0
+
+# The tight Run-1A cuts (no d0 cut): the optimization's starting point, and
+# the selection whose yield relative to the shapes' loose selection is
+# `reference_cuts.combined` in cosmic_shapes.json.
+REFERENCE_TIME_NS = (540.0, 1650.0)
+REFERENCE_COS = (0.525, 0.649)
+REFERENCE_RMAX_MM = (482.0, 642.6)
+
+# Cosmic shapes: made by scripts/extract_cosmic_shapes.py. Found relative to
+# this file, so any clone location works.
+DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+COSMIC_SHAPES_ROOT = DATA_DIR / "cosmic_shapes.root"
+COSMIC_SHAPES_JSON = DATA_DIR / "cosmic_shapes.json"
+COSMIC_SAMPLE_SIZE = 200_000
+COSMIC_SAMPLE_SEED = 20261101
+# R[mm] = p[MeV/c] sin(theta) / (C_LIGHT B[T])
+C_LIGHT_MEV_PER_MM_T = 0.299792458
+
+# Coordinate-ascent grids and stopping rule. A cut variable's candidate edges:
+# (low, high, step); time's range is the base time cut instead.
+TIME_STEP_NS = 5.0
+# R(max) must exceed this for the track to have hits in the tracker, so its
+# lower cut never goes below it (CE and cosmics) and is never open.
+RMAX_MIN_MM = 400.0
+RMAX_GRID_MM = (RMAX_MIN_MM, 1100.0, 5.0)
+D0_GRID_MM = (-700.0, 700.0, 5.0)
+COS_GRID = (0.0, 1.0, 0.005)
+MAX_SWEEPS = 20
+SWEEP_TOLERANCE = 1.0e-6       # relative FoM gain below which it stops
+# The box optimization maximizes the Punzi figure of merit S/(a/2 + sqrt(B))
+# (Punzi, physics/0308063), not S/sqrt(B): with cuts on five variables the
+# background can be driven to ~0 while keeping a sliver of signal, where
+# S/sqrt(B) diverges. a = 1.28 sigma matches the 90% CL limits Mu2e quotes;
+# the expected limit scales roughly as 1/FoM.
+PUNZI_A = 1.28
+
+
+def punzi_fom(signal, background):
+    """S / (PUNZI_A/2 + sqrt(B)); finite for B = 0."""
+    return signal / (PUNZI_A / 2.0 + np.sqrt(background))
+
+BOX_VARIABLES = ("p", "t", "rmax", "d0", "cos")
+GEOMETRY_VARIABLES = ("rmax", "d0", "cos")
+GEOMETRY_GRIDS = {"rmax": RMAX_GRID_MM, "d0": D0_GRID_MM, "cos": COS_GRID}
+# The momentum range the box-mode plots show (cosmics are flat in it).
+PLOT_P_RANGE_MEV = (95.0, 110.0)
+
+# The EdepAna columns box mode reads, for the selected events at the tracker front.
+HELIX_COLUMNS = {"rmax": "primary_trk_front_rmax", "d0": "primary_trk_front_d0",
+                 "cos": "primary_trk_front_cos"}
 
 
 class SensitivityError(RuntimeError):
@@ -177,6 +279,399 @@ def scan_signal_box(signal: Spectrum, dio: Spectrum, cosmic: Spectrum,
     return best, per_edge[:top_n]
 
 
+def ce_time_efficiency(t1: float, t2: float,
+                       lifetime_ns: float = MUON_LIFETIME_NS):
+    """Fraction of CEs in [t1, t2) ns of the microbunch [0, T): the density is
+    exp(-t/tau), normalized over the microbunch. Works on arrays."""
+    norm = -np.expm1(-MICROBUNCH_NS / lifetime_ns)
+    return (np.exp(-np.asarray(t1) / lifetime_ns)
+            - np.exp(-np.asarray(t2) / lifetime_ns)) / norm
+
+
+def cosmic_time_efficiency(t1, t2, t_range: tuple[float, float]):
+    """Fraction of cosmics in [t1, t2) ns: flat over `t_range`, the time range
+    of the loose cosmic shapes, so the overlap of the window with it over its
+    width. Works on arrays."""
+    low, high = t_range
+    overlap = np.minimum(np.asarray(t2), high) - np.maximum(np.asarray(t1), low)
+    return np.maximum(overlap, 0.0) / (high - low)
+
+
+@dataclass(frozen=True)
+class CosmicShapes:
+    """The extracted cosmic shapes the box model needs."""
+
+    rc_edges: np.ndarray
+    cos_edges: np.ndarray
+    rc_vs_cos: np.ndarray       # [irc, icos] weighted counts
+    p_edges: np.ndarray
+    p_counts: np.ndarray
+    b_eff_t: float              # effective field, T
+    t_range: tuple[float, float]    # ns, the t0 axis: where the cosmics are flat
+    loose_to_tight_ratio: float     # loose yield / tight Run-1A yield
+
+
+@lru_cache(maxsize=None)
+def load_cosmic_shapes(root_path: Path = COSMIC_SHAPES_ROOT,
+                       json_path: Path = COSMIC_SHAPES_JSON) -> CosmicShapes:
+    """Read `rc_vs_cos`, `p` and the effective field from the shapes files."""
+    import json
+
+    import uproot
+
+    for path in (root_path, json_path):
+        if not path.exists():
+            raise SensitivityError(
+                f"cosmic shapes file not found: {path}; make it with "
+                "scripts/extract_cosmic_shapes.py (see the README)")
+    try:
+        with uproot.open(root_path) as rootfile:
+            hist2, hist1 = rootfile["rc_vs_cos"], rootfile["p"]
+            shapes = dict(
+                rc_edges=np.asarray(hist2.axis(0).edges(), dtype=np.float64),
+                cos_edges=np.asarray(hist2.axis(1).edges(), dtype=np.float64),
+                rc_vs_cos=np.asarray(hist2.values(flow=False), dtype=np.float64),
+                p_edges=np.asarray(hist1.axis().edges(), dtype=np.float64),
+                p_counts=np.asarray(hist1.values(flow=False), dtype=np.float64))
+            t_edges = rootfile["t0"].axis().edges()
+            t_range = (float(t_edges[0]), float(t_edges[-1]))
+        info = json.loads(json_path.read_text(encoding="utf-8"))
+        b_eff = float(info["B_eff"]["median_T"])
+        tight = float(info["reference_cuts"]["combined"])
+    except (KeyError, ValueError, OSError) as exc:
+        raise SensitivityError(
+            f"cosmic shapes {root_path} / {json_path} are unreadable ({exc!r}); "
+            "remake them with scripts/extract_cosmic_shapes.py") from None
+    if not 0.0 < tight <= 1.0:
+        raise SensitivityError(
+            f"cosmic shapes {json_path}: reference_cuts.combined is {tight:g}, "
+            "outside (0, 1]; remake them with scripts/extract_cosmic_shapes.py")
+    if not b_eff > 0.0 or not (shapes["rc_vs_cos"].sum() > 0.0
+                               and shapes["p_counts"].sum() > 0.0):
+        raise SensitivityError(
+            f"cosmic shapes {root_path} are empty or have no field; remake them "
+            "with scripts/extract_cosmic_shapes.py")
+    return CosmicShapes(b_eff_t=b_eff, t_range=t_range,
+                        loose_to_tight_ratio=1.0 / tight, **shapes)
+
+
+@dataclass(frozen=True)
+class GeometryPopulation:
+    """Tracks as (rmax, d0, cos) columns with weights, for counting a box's
+    geometry efficiency: the weight passing over `norm`, the total weight
+    that defines efficiency 1. NaN never passes a cut."""
+
+    rmax: np.ndarray
+    d0: np.ndarray
+    cos: np.ndarray
+    weights: np.ndarray
+    norm: float
+    # CE only: each track's bin in the rebinned, unsmeared signal histogram,
+    # -1 where it has none (see `signal_bins`).
+    bins: np.ndarray | None = None
+
+    def column(self, name: str) -> np.ndarray:
+        return getattr(self, name)
+
+    def passing(self, cuts: dict[str, tuple[float, float]],
+                skip: str | None = None) -> np.ndarray:
+        """Mask of the tracks inside every geometry cut but `skip`'s. R(max)
+        is never below RMAX_MIN_MM, whatever its cut says."""
+        keep = np.ones(self.weights.size, dtype=bool)
+        for name in GEOMETRY_VARIABLES:
+            if name != skip:
+                low, high = cuts[name]
+                if name == "rmax":
+                    low = max(low, RMAX_MIN_MM)
+                values = self.column(name)
+                keep &= (values >= low) & (values < high)
+        return keep
+
+    def efficiency(self, cuts: dict[str, tuple[float, float]]) -> float:
+        return float(self.weights[self.passing(cuts)].sum() / self.norm)
+
+
+def cosmic_geometry_sample(shapes: CosmicShapes, n: int = COSMIC_SAMPLE_SIZE,
+                           seed: int = COSMIC_SAMPLE_SEED) -> GeometryPopulation:
+    """A fixed-seed sample of cosmic tracks.
+
+    (rc, cos) is drawn from `rc_vs_cos` (a bin by its content, uniform inside
+    it) and p from the `p` histogram the same way, taking the two as
+    independent; then R = p sin(theta)/(c B), rmax = rc + R, d0 = rc - R.
+    """
+    rng = np.random.default_rng(seed)
+
+    def draw(counts: np.ndarray, *edges: np.ndarray) -> list[np.ndarray]:
+        flat = rng.choice(counts.size, size=n, p=counts.ravel() / counts.sum())
+        out = []
+        for axis, index in zip(edges, np.unravel_index(flat, counts.shape)):
+            low, width = axis[index], np.diff(axis)[index]
+            out.append(low + rng.random(n) * width)
+        return out
+
+    rc, cos = draw(shapes.rc_vs_cos, shapes.rc_edges, shapes.cos_edges)
+    (p,) = draw(shapes.p_counts, shapes.p_edges)
+    radius = p * np.sqrt(1.0 - cos ** 2) / (C_LIGHT_MEV_PER_MM_T * shapes.b_eff_t)
+    return GeometryPopulation(rmax=rc + radius, d0=rc - radius, cos=cos,
+                              weights=np.ones(n), norm=float(n))
+
+
+def scan_bins(signal: np.ndarray, dio: np.ndarray, cosmic: np.ndarray,
+              first: int = 0) -> dict[str, float] | None:
+    """The bin window [a, b] (inclusive, a >= first) maximizing the Punzi
+    FoM of S against DIO + cosmic, or None if no window has signal.
+
+    Sums run outward from each lower edge, as in scan_signal_box (never
+    differences of prefix sums).
+    """
+    best = None
+    for a in range(first, signal.size):
+        s = np.cumsum(signal[a:])
+        d = np.cumsum(dio[a:])
+        c = np.cumsum(cosmic[a:])
+        background = d + c
+        usable = np.flatnonzero(s > 0.0)
+        if usable.size == 0:
+            continue
+        ratio = punzi_fom(s[usable], background[usable])
+        k = int(np.argmax(ratio))
+        if best is None or ratio[k] > best["fom"]:
+            j = int(usable[k])
+            best = {"a": a, "b": a + j, "fom": float(ratio[k]),
+                    "signal": float(s[j]), "dio": float(d[j]),
+                    "cosmic": float(c[j])}
+    return best
+
+
+def grid_edges(grid: tuple[float, float, float]) -> np.ndarray:
+    low, high, step = grid
+    return low + step * np.arange(int(round((high - low) / step)) + 1)
+
+
+def time_edges(time_min_ns: float, time_max_ns: float) -> np.ndarray:
+    """5 ns steps inside the base time window, ending exactly on its top."""
+    n = int(np.ceil((time_max_ns - time_min_ns) / TIME_STEP_NS))
+    return np.append(time_min_ns + TIME_STEP_NS * np.arange(n), time_max_ns)
+
+
+def signal_bins(energy: np.ndarray) -> np.ndarray:
+    """Each value's bin in the rebinned signal histogram (SIGNAL_VAR binned per
+    BINNING, then merged by SIGNAL_REBIN), or -1 where it has none: NaN, off
+    the axis, or in the bins `Spectrum.rebin` drops. Fine bins follow
+    `np.histogram` (edges from linspace, the top edge in the last bin), so a
+    value lands where `Spectrum.from_values` put it."""
+    nbins, xmin, xmax = BINNING[SIGNAL_VAR]
+    energy = np.asarray(energy, dtype=np.float64)
+    edges = np.linspace(xmin, xmax, nbins + 1)
+    fine = np.searchsorted(edges, energy, side="right") - 1
+    fine[energy == xmax] = nbins - 1
+    index = fine // SIGNAL_REBIN
+    inside = (np.isfinite(energy) & (energy >= xmin) & (energy <= xmax)
+              & (index < nbins // SIGNAL_REBIN))
+    return np.where(inside, index, -1)
+
+
+def smearing_matrix(template: Spectrum, kernel: Kernel) -> np.ndarray:
+    """M[k, j]: the smeared content of bin k from a unit entry in bin j, with
+    the very `Spectrum.smear` the signal goes through, so that M @ h is the
+    smeared spectrum of any histogram h on the template's grid."""
+    n = template.nbins
+    matrix = np.empty((n, n))
+    unit = np.zeros(n)
+    for j in range(n):
+        unit[j] = 1.0
+        matrix[:, j] = replace(template, values=unit).smear(kernel).values
+        unit[j] = 0.0
+    return matrix
+
+
+@dataclass
+class BoxModel:
+    """Everything the box optimization counts with.
+
+    The DIO and cosmic momentum spectra are rates over the whole microbunch
+    and acceptance, with no time or geometry cut; a box multiplies them by its
+    efficiencies (see `rates`).
+
+    The CE signal is not a spectrum times an efficiency. Geometry cuts are
+    correlated with the energy loss, so each CE event in `ce_geometry` carries
+    its signal bin, and the box's signal is the smeared spectrum of the events
+    that pass: `signal_scale` x the sum over them of weight x W(bin), where
+    W(j) = sum of `response[k, j]` over the momentum window. With the geometry
+    open this is `signal`'s window sum, as the same events fill both.
+    """
+
+    signal: Spectrum
+    dio: Spectrum
+    cosmic: Spectrum
+    ce_geometry: GeometryPopulation
+    cosmic_geometry: GeometryPopulation
+    response: np.ndarray        # smearing_matrix of the signal's resolution
+    signal_scale: float         # npot * SIGNAL_BR * sig_eff / signal entries
+    lifetime_ns: float
+    time_min_ns: float
+    time_max_ns: float
+    cosmic_t_range: tuple[float, float]     # where cosmics are flat in time
+    first_bin: int              # lowest allowed momentum bin (SIGNAL_BOX_MIN_MEV)
+
+    def event_signal(self, bins: tuple[int, int]) -> np.ndarray:
+        """Each CE event's signal in the momentum window, weight and
+        normalization included, before any cut."""
+        a, b = bins
+        pop = self.ce_geometry
+        window = self.response[a:b + 1].sum(axis=0)
+        return np.where(pop.bins >= 0, window[pop.bins], 0.0) \
+            * pop.weights * self.signal_scale
+
+    def signal_spectrum(self, keep: np.ndarray) -> np.ndarray:
+        """The smeared signal spectrum of the CE events in `keep`."""
+        pop = self.ce_geometry
+        used = keep & (pop.bins >= 0)
+        hist = np.bincount(pop.bins[used], weights=pop.weights[used],
+                           minlength=self.signal.nbins)
+        return self.response @ hist * self.signal_scale
+
+    def window_sums(self, bins: tuple[int, int]) -> tuple[float, float, float]:
+        """(signal, DIO, cosmic) summed over momentum bins a..b, directly."""
+        a, b = bins
+        return (float(self.signal.values[a:b + 1].sum()),
+                float(self.dio.values[a:b + 1].sum()),
+                float(self.cosmic.values[a:b + 1].sum()))
+
+    def rates(self, cuts: dict) -> dict[str, float]:
+        """Signal, DIO and cosmic in the box, and the efficiencies behind them."""
+        t1, t2 = cuts["t"]
+        ce_t = float(ce_time_efficiency(t1, t2, self.lifetime_ns))
+        cos_t = float(cosmic_time_efficiency(t1, t2, self.cosmic_t_range))
+        ce_g = self.ce_geometry.efficiency(cuts)
+        cos_g = self.cosmic_geometry.efficiency(cuts)
+        s, d, c = self.window_sums(cuts["p"])
+        ce_eff = ce_t * ce_g
+        cos_eff = cos_t * cos_g
+        in_box = self.ce_geometry.passing(cuts)
+        signal = float(self.event_signal(cuts["p"])[in_box].sum()) * ce_t
+        dio = d * ce_eff        # the CE's momentum-integrated efficiency
+        cosmic = c * cos_eff
+        background = dio + cosmic
+        return {"signal": signal, "dio": dio, "cosmic": cosmic,
+                "background": background,
+                "sensitivity": (signal / np.sqrt(background)
+                                if signal > 0.0 and background > 0.0 else 0.0),
+                "fom": float(punzi_fom(signal, background)),
+                "ce_time": ce_t, "ce_geometry": ce_g, "ce_efficiency": ce_eff,
+                # signal with the geometry cuts / without, in the p window:
+                # differs from ce_geometry by the energy-loss correlation
+                "ce_window_geometry": signal / (s * ce_t) if s > 0.0 else 0.0,
+                "cosmic_time": cos_t, "cosmic_geometry": cos_g,
+                "cosmic_efficiency": cos_eff}
+
+    def step(self, cuts: dict, variable: str) -> tuple | None:
+        """The best (low, high) for `variable` with the other cuts held, as
+        (low, high, fom), or None if no window has signal and background.
+
+        The variable is histogrammed once (for the tracks passing the other
+        cuts) and every window then comes from cumulative sums, O(N + G^2).
+        """
+        t1, t2 = cuts["t"]
+        ce_t = float(ce_time_efficiency(t1, t2, self.lifetime_ns))
+        cos_t = float(cosmic_time_efficiency(t1, t2, self.cosmic_t_range))
+        _, d, c = self.window_sums(cuts["p"])
+        ce_g = self.ce_geometry.efficiency(cuts)    # DIO's, as in `rates`
+        event = self.event_signal(cuts["p"])
+        if variable == "p":
+            ce_eff = ce_t * ce_g
+            cos_eff = cos_t * self.cosmic_geometry.efficiency(cuts)
+            found = scan_bins(self.signal_spectrum(self.ce_geometry.passing(cuts))
+                              * ce_t,
+                              self.dio.values * ce_eff,
+                              self.cosmic.values * cos_eff, self.first_bin)
+            return (None if found is None else
+                    ((found["a"], found["b"]), found["fom"]))
+        if variable == "t":
+            edges = time_edges(self.time_min_ns, self.time_max_ns)
+            ce_bins = ce_time_efficiency(edges[:-1], edges[1:], self.lifetime_ns)
+            cos_bins = cosmic_time_efficiency(edges[:-1], edges[1:],
+                                             self.cosmic_t_range)
+            cos_g = self.cosmic_geometry.efficiency(cuts)
+            ce_s = float(event[self.ce_geometry.passing(cuts)].sum())
+            found = scan_bins(ce_s * ce_bins, d * ce_g * ce_bins,
+                              c * cos_g * cos_bins)
+            if found is None:
+                return None
+            return ((float(edges[found["a"]]), float(edges[found["b"] + 1])),
+                    found["fom"])
+        # A geometry variable. Bin 0 and the last bin are the under/overflow,
+        # so a window reaching them is open on that side (R(max) may not start
+        # in the underflow: its lower cut is at least RMAX_MIN_MM).
+        grid = grid_edges(GEOMETRY_GRIDS[variable])
+        edges = np.concatenate(([-np.inf], grid, [np.inf]))
+        hists = []
+        # The CE is histogrammed twice: by weight (the efficiency DIO takes)
+        # and by signal in the window (the signal count itself).
+        for pop, per_event in ((self.ce_geometry, None),
+                               (self.ce_geometry, event),
+                               (self.cosmic_geometry, None)):
+            keep = pop.passing(cuts, skip=variable)
+            values = pop.column(variable)[keep]
+            weights = (pop.weights[keep] / pop.norm if per_event is None
+                       else per_event[keep])
+            finite = np.isfinite(values)
+            index = np.searchsorted(grid, values[finite], side="right")
+            hists.append(np.bincount(index, weights=weights[finite],
+                                     minlength=edges.size - 1))
+        ce_eff_hist, ce_signal_hist, cos_hist = hists
+        found = scan_bins(ce_t * ce_signal_hist, d * ce_t * ce_eff_hist,
+                          c * cos_t * cos_hist,
+                          first=1 if variable == "rmax" else 0)
+        if found is None:
+            return None
+        return ((float(edges[found["a"]]), float(edges[found["b"] + 1])),
+                found["fom"])
+
+    def start_cuts(self, p_bins: tuple[int, int]) -> dict:
+        """The starting box: the momentum-only window, the reference cuts
+        (time clipped to the base window) and no d0 cut."""
+        low = max(REFERENCE_TIME_NS[0], self.time_min_ns)
+        high = min(REFERENCE_TIME_NS[1], self.time_max_ns)
+        if not low < high:
+            low, high = self.time_min_ns, self.time_max_ns
+        return {"p": p_bins, "t": (low, high), "rmax": REFERENCE_RMAX_MM,
+                "d0": (-np.inf, np.inf), "cos": REFERENCE_COS}
+
+    def optimize(self, p_bins: tuple[int, int]) -> tuple[dict, dict, list[dict], dict]:
+        """Coordinate ascent on the Punzi FoM from `start_cuts`.
+
+        Each step re-optimizes one variable's (low, high) jointly with the
+        others held, and is kept only if it does not lower the FoM (the
+        start's reference cuts are not on the grids). Sweeps stop when one
+        gains less than SWEEP_TOLERANCE relative, or at MAX_SWEEPS.
+        Returns (cuts, rates at the cuts, one record per sweep, the start).
+        """
+        cuts = self.start_cuts(p_bins)
+        fom = self.rates(cuts)["fom"]
+        start = {"cuts": dict(cuts), "fom": fom}
+        sweeps = []
+        for number in range(1, MAX_SWEEPS + 1):
+            before = fom
+            for variable in BOX_VARIABLES:
+                found = self.step(cuts, variable)
+                if found is None or not found[1] > fom:
+                    continue
+                cuts[variable], fom = found
+            sweeps.append({"sweep": number, "fom": fom,
+                           "cuts": dict(cuts)})
+            gain = fom - before
+            if (gain / before if before > 0.0 else float(gain > 0.0)) < SWEEP_TOLERANCE:
+                break
+        if not fom > 0.0:
+            raise SensitivityError(
+                "no box had signal > 0: no selected CE "
+                "event reaching the tracker front passes any geometry window, "
+                "or the input histograms are empty above "
+                f"{SIGNAL_BOX_MIN_MEV:g} MeV")
+        return cuts, self.rates(cuts), sweeps, start
+
+
 # --- plots -------------------------------------------------------------------
 
 def _write_plots(outdir: Path, signal: Spectrum, dio_reco: Spectrum,
@@ -264,6 +759,139 @@ def _write_plots(outdir: Path, signal: Spectrum, dio_reco: Spectrum,
     return written
 
 
+def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
+    """The cosmic and CE distributions of each box variable, for the box-mode
+    plots.
+
+    Counts are expected events in the box's normalization (the box rate
+    formula with the cuts left out). "nominal" has only the base selection:
+    the time window and PLOT_P_RANGE_MEV, no box cuts. "after" has every
+    optimized cut but the variable's own. The CE counts ("ce_nominal",
+    "ce_after") are the correlated per-event signal in the same windows; in
+    momentum it is the smeared spectrum of the passing events, in time the
+    lifetime model binned on the time axis. Each panel: name, bin edges, the
+    count arrays and the selected (low, high).
+    """
+    pop = model.cosmic_geometry
+    centers = model.cosmic.centers()
+    in_range = np.flatnonzero((centers >= PLOT_P_RANGE_MEV[0])
+                              & (centers <= PLOT_P_RANGE_MEV[1]))
+    p_range = (int(in_range[0]), int(in_range[-1]))
+    cosmic_nominal = model.window_sums(p_range)[2]
+    cosmic_cut = model.window_sums(cuts["p"])[2]
+    t1, t2 = cuts["t"]
+    time_nominal = float(cosmic_time_efficiency(
+        model.time_min_ns, model.time_max_ns, model.cosmic_t_range))
+    time_cut = float(cosmic_time_efficiency(t1, t2, model.cosmic_t_range))
+    geometry_cut = pop.efficiency(cuts)
+    open_geometry = {name: (-np.inf, np.inf) for name in GEOMETRY_VARIABLES}
+    no_geometry = {**cuts, **open_geometry}
+    ce = model.ce_geometry
+    ce_time_nominal = float(ce_time_efficiency(
+        model.time_min_ns, model.time_max_ns, model.lifetime_ns))
+    ce_time_cut = float(ce_time_efficiency(t1, t2, model.lifetime_ns))
+    ce_event_nominal = model.event_signal(p_range)
+    ce_event_cut = model.event_signal(cuts["p"])
+    ce_in_nominal = ce.passing(no_geometry)
+    ce_in_cut = ce.passing(cuts)
+
+    panels = []
+    # momentum: flat per bin
+    p_edges = model.cosmic.edges()[p_range[0]:p_range[1] + 2]
+    p_values = model.cosmic.values[p_range[0]:p_range[1] + 1]
+    centers_low = centers[cuts["p"][0]]
+    centers_high = centers[cuts["p"][1]]
+    panels.append({
+        "name": "p", "edges": p_edges,
+        "nominal": p_values * time_nominal,
+        "after": p_values * time_cut * geometry_cut,
+        "ce_nominal": ce_time_nominal * model.signal_spectrum(
+            ce_in_nominal)[p_range[0]:p_range[1] + 1],
+        "ce_after": ce_time_cut * model.signal_spectrum(
+            ce_in_cut)[p_range[0]:p_range[1] + 1],
+        "band": (float(centers_low), float(centers_high))})
+    # time: flat per bin over the base window
+    t_edges = time_edges(model.time_min_ns, model.time_max_ns)
+    widths = cosmic_time_efficiency(t_edges[:-1], t_edges[1:],
+                                    model.cosmic_t_range)
+    ce_widths = ce_time_efficiency(t_edges[:-1], t_edges[1:], model.lifetime_ns)
+    panels.append({
+        "name": "t", "edges": t_edges,
+        "nominal": cosmic_nominal * widths,
+        "after": cosmic_cut * geometry_cut * widths,
+        "ce_nominal": ce_event_nominal[ce_in_nominal].sum() * ce_widths,
+        "ce_after": ce_event_cut[ce_in_cut].sum() * ce_widths,
+        "band": (float(t1), float(t2))})
+    for name in GEOMETRY_VARIABLES:
+        grid = grid_edges(GEOMETRY_GRIDS[name])
+        values = pop.column(name)
+        counts, ce_counts = [], []
+        for scale, geometry, event, ce_time in (
+                (cosmic_nominal * time_nominal, no_geometry, ce_event_nominal,
+                 ce_time_nominal),
+                (cosmic_cut * time_cut, cuts, ce_event_cut, ce_time_cut)):
+            keep = pop.passing(geometry, skip=name)
+            hist, _ = np.histogram(values[keep], bins=grid)
+            counts.append(hist * scale / pop.norm)
+            keep = ce.passing(geometry, skip=name)
+            hist, _ = np.histogram(ce.column(name)[keep], bins=grid,
+                                   weights=event[keep])
+            ce_counts.append(hist * ce_time)
+        low, high = cuts[name]
+        panels.append({"name": name, "edges": grid, "nominal": counts[0],
+                       "after": counts[1],
+                       "ce_nominal": ce_counts[0], "ce_after": ce_counts[1],
+                       "band": (float(max(low, grid[0])), float(min(high, grid[-1])))})
+    return panels
+
+
+BOX_PLOT_LABELS = {
+    "p": "Momentum (MeV/c)", "t": "Time (ns)", "rmax": "R(max) (mm)",
+    "d0": "d0 (mm)", "cos": "cos(theta)"}
+
+
+def _write_box_plots(outdir: Path, panels: list[dict]) -> list[str]:
+    """One PNG per box variable: cosmics (left axis) and the CE signal (right
+    axis) before and after the other cuts, with the selected range shaded.
+    Returns the paths written."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figdir = outdir / "figures"
+    figdir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    for panel in panels:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.stairs(panel["nominal"], panel["edges"], color="tab:gray", lw=1.5,
+                  label="nominal (base selection)")
+        ax.stairs(panel["after"], panel["edges"], color="tab:green", lw=1.8,
+                  label="after the other cuts")
+        low, high = panel["band"]
+        ax.axvspan(low, high, color="0.85", zorder=0,
+                   label=f"selected [{low:.4g}, {high:.4g}]")
+        right = ax.twinx()
+        right.stairs(panel["ce_nominal"], panel["edges"], color="tab:blue",
+                     lw=1.5, ls=":", label="CE nominal (right axis)")
+        right.stairs(panel["ce_after"], panel["edges"], color="tab:blue",
+                     lw=1.8, ls="--", label="CE after the other cuts (right axis)")
+        right.set_ylabel("Expected CE counts / bin", color="tab:blue")
+        ax.set_xlabel(BOX_PLOT_LABELS[panel["name"]])
+        ax.set_ylabel("Expected cosmic counts / bin")
+        ax.set_title(f"Cosmics and CE signal vs {panel['name']}")
+        handles = [*ax.get_legend_handles_labels()[0],
+                   *right.get_legend_handles_labels()[0]]
+        labels = [*ax.get_legend_handles_labels()[1],
+                  *right.get_legend_handles_labels()[1]]
+        ax.legend(handles, labels, fontsize="small")
+        fig.tight_layout()
+        path = figdir / f"box_{panel['name']}.png"
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        written.append(str(path))
+    return written
+
+
 # --- the runner --------------------------------------------------------------
 
 def selected_hist(variables: dict[str, np.ndarray], mask: np.ndarray,
@@ -317,8 +945,139 @@ def signal_efficiency(variables: dict[str, np.ndarray], mask: np.ndarray,
     return sig_eff, acceptance
 
 
+BOX_CUT_METRICS = ("time_low_ns", "time_high_ns", "rmax_low_mm", "rmax_high_mm",
+                   "d0_low_mm", "d0_high_mm", "cos_low", "cos_high",
+                   "ce_box_efficiency", "cosmic_box_efficiency")
+NO_BOX_METRICS = {name: -1.0 for name in BOX_CUT_METRICS}
+
+
+def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
+                 signal: Spectrum, dio: Spectrum, cosmic: Spectrum,
+                 momentum_best: dict[str, float],
+                 params: dict[str, float | str], kernel: Kernel,
+                 signal_scale: float) -> dict:
+    """Optimize the box from the momentum-only result and the selected events'
+    helix geometry; `kernel` and `signal_scale` are what turned the signal
+    histogram into `signal` (smearing, normalization per entry). Returns the headline numbers, metrics, log lines, plot
+    panels and sweep records `run` reports."""
+    front = mask & variables["has_trk_front"]
+    weights = variables["weight"][front]
+    if not weights.sum() > 0.0:
+        raise SensitivityError(
+            "no selected event reached the tracker front, so there is no CE "
+            "geometry to cut on; run this on a CE (signal) sample, or loosen "
+            "the selection")
+    ce_geometry = GeometryPopulation(
+        weights=weights, norm=float(weights.sum()),
+        bins=signal_bins(variables[SIGNAL_VAR][front]),
+        **{name: variables[column][front] for name, column in HELIX_COLUMNS.items()})
+    defined = np.isfinite(ce_geometry.rmax) & np.isfinite(ce_geometry.d0) \
+        & np.isfinite(ce_geometry.cos)
+    if not defined.any():
+        raise SensitivityError(
+            "no selected event at the tracker front has a defined helix "
+            "(EdepAna writes -1 for a neutral primary or zero field), so "
+            "there is no CE geometry to cut on")
+
+    shapes = load_cosmic_shapes()
+    model = BoxModel(
+        signal=signal, dio=dio, cosmic=cosmic, ce_geometry=ce_geometry,
+        cosmic_geometry=cosmic_geometry_sample(shapes),
+        response=smearing_matrix(signal, kernel), signal_scale=signal_scale,
+        lifetime_ns=params["muon_lifetime_ns"],
+        time_min_ns=params["time_min_ns"], time_max_ns=params["time_max_ns"],
+        cosmic_t_range=shapes.t_range,
+        first_bin=int(np.searchsorted(signal.centers(), SIGNAL_BOX_MIN_MEV)))
+    centers = signal.centers()
+    p_bins = (int(np.argmin(np.abs(centers - momentum_best["low_mev"]))),
+              int(np.argmin(np.abs(centers - momentum_best["high_mev"]))))
+    cuts, rates, sweeps, start = model.optimize(p_bins)
+
+    def reported(name: str) -> tuple[float, float]:
+        """A cut as reported: an end beyond its grid (open) sits on the grid's end."""
+        low, high = cuts[name]
+        if name == "t":
+            return float(low), float(high)
+        grid = grid_edges(GEOMETRY_GRIDS[name])
+        return float(max(low, grid[0])), float(min(high, grid[-1]))
+
+    p_low, p_high = float(centers[cuts["p"][0]]), float(centers[cuts["p"][1]])
+    headline = {"sensitivity": rates["sensitivity"], "fom": rates["fom"],
+                "low_mev": p_low,
+                "high_mev": p_high, "signal": rates["signal"],
+                "dio": rates["dio"], "cosmic": rates["cosmic"],
+                "background": rates["background"]}
+    metrics = {}
+    for name, prefix in (("t", "time_%s_ns"), ("rmax", "rmax_%s_mm"),
+                         ("d0", "d0_%s_mm"), ("cos", "cos_%s")):
+        metrics[prefix % "low"], metrics[prefix % "high"] = reported(name)
+    # time x momentum-integrated geometry, as before the correlation was kept
+    metrics["ce_box_efficiency"] = rates["ce_efficiency"]
+    metrics["cosmic_box_efficiency"] = rates["cosmic_efficiency"]
+
+    def span(name: str, unit: str) -> str:
+        low, high = reported(name)
+        return f"[{low:.6g}, {high:.6g}] {unit}"
+
+    log = [
+        f"Box cuts (cut_mode = box), coordinate ascent on the Punzi FoM "
+        f"S/({PUNZI_A:g}/2 + sqrt(B)):",
+        f"  momentum   [{p_low:.1f}, {p_high:.1f}] MeV",
+        f"  time       {span('t', 'ns')}  (base window "
+        f"[{params['time_min_ns']:g}, {params['time_max_ns']:g}], "
+        f"muon lifetime {params['muon_lifetime_ns']:g} ns)",
+        f"  R(max)     {span('rmax', 'mm')}",
+        f"  d0         {span('d0', 'mm')}",
+        f"  cos(theta) {span('cos', '')}",
+        "  (a geometry cut at the end of its grid is open on that side)",
+        f"  CE efficiency     time {rates['ce_time']:.4g} x geometry "
+        f"{rates['ce_geometry']:.4g} = {rates['ce_efficiency']:.4g}"
+        " (geometry integrated over momentum; DIO takes this)",
+        f"  CE geometry efficiency in the momentum window (signal with the "
+        f"geometry cuts / without): {rates['ce_window_geometry']:.4g}, "
+        f"vs {rates['ce_geometry']:.4g} integrated over momentum "
+        "(the difference is the energy-loss correlation, which the signal keeps)",
+        f"  cosmic efficiency time {rates['cosmic_time']:.4g} (flat over "
+        f"{shapes.t_range[0]:g}-{shapes.t_range[1]:g} ns) x geometry "
+        f"{rates['cosmic_geometry']:.4g} = {rates['cosmic_efficiency']:.4g}",
+        "  cosmic_rate_per_s_per_mev is the rate for the loose selection of the "
+        "cosmic shapes (e-, 100 < p < 110 MeV/c, no t0, cos, R(max) or d0 cut)",
+        f"  loose/tight Run-1A yield ratio {shapes.loose_to_tight_ratio:.4g} "
+        f"(tight: {REFERENCE_TIME_NS[0]:g} < t < {REFERENCE_TIME_NS[1]:g} ns, "
+        f"{REFERENCE_COS[0]:g} < cos < {REFERENCE_COS[1]:g}, "
+        f"{REFERENCE_RMAX_MM[0]:g} < R(max) < {REFERENCE_RMAX_MM[1]:g} mm); "
+        "applied to the default rate only",
+        f"  S = {rates['signal']:.3g}, DIO = {rates['dio']:.3g}, "
+        f"cosmic = {rates['cosmic']:.3g} -> B = {rates['background']:.3g}, "
+        f"S/sqrt(B) = {rates['sensitivity']:.4g}, Punzi FoM = {rates['fom']:.4g} "
+        f"(start {start['fom']:.4g})",
+        "",
+        "Punzi FoM after each sweep:",
+        *(f"  sweep {record['sweep']:2d}  {record['fom']:.6g}"
+          for record in sweeps),
+    ]
+    return {"headline": headline, "metrics": metrics, "log": log,
+            "panels": box_panels(model, cuts),
+            "cosmic_loose_to_tight_ratio": shapes.loose_to_tight_ratio,
+            "start_fom": start["fom"],
+            "sweeps": [record["fom"] for record in sweeps]}
+
+
 def run(context: RunContext) -> RunOutcome:
     """Compute the approximate CE sensitivity for one EdepAna ROOT file."""
+    cut_mode = context.params["cut_mode"]
+    if cut_mode not in CUT_MODES:
+        return RunOutcome(error=(
+            f"cut_mode must be one of {', '.join(repr(m) for m in CUT_MODES)}, "
+            f"got {cut_mode!r}: 'momentum' scans the momentum window alone, "
+            "'box' also optimizes time, R(max), d0 and cos(theta) cuts"))
+    time_min_ns = context.params["time_min_ns"]
+    time_max_ns = context.params["time_max_ns"]
+    if cut_mode == "box" and not time_min_ns < time_max_ns:
+        return RunOutcome(error=(
+            f"time_min_ns ({time_min_ns:g}) must be below time_max_ns "
+            f"({time_max_ns:g}): they are the base time window the box "
+            "optimization scans inside"))
     sig_eff = context.params["sig_eff"]
     stops_per_pot = context.params["stops_per_pot"]
     if np.isnan(sig_eff) or np.isnan(stops_per_pot):
@@ -333,6 +1092,9 @@ def run(context: RunContext) -> RunOutcome:
     ce_acceptance = n_gen_events = run_record = None
     npot = context.params["npot"]
     cosmic_rate_per_s_per_mev = context.params["cosmic_rate_per_s_per_mev"]
+    cosmic_rate_source = "user" if cosmic_rate_per_s_per_mev > 0.0 else "mode default"
+    if cosmic_rate_source == "mode default":
+        cosmic_rate_per_s_per_mev = recommended_cosmic_rate(cut_mode)
     mean_pot_per_event = context.params["mean_pot_per_event"]
     selection = context.params["selection"]
     outdir = context.outdir
@@ -340,6 +1102,14 @@ def run(context: RunContext) -> RunOutcome:
 
     try:
         variables = read_edep_tree(context.input_path)
+        if cut_mode == "box" and HELIX_COLUMNS["rmax"] not in variables:
+            raise SensitivityError(
+                "cut_mode='box' needs the tracker-front helix branches "
+                "(primary_trk_front_r_center, _radius, _cos, _time), which "
+                "this file's EdepAna tree lacks: they come from EdepAna in a "
+                "an Offline with PR #2092 (not yet in a Musing). Rerun 'edep' "
+                "with such a build, or use cut_mode='momentum', which works on "
+                "this file")
         mask = select_events(variables, selection)
         if stops_per_pot > 0.0:
             run_record = read_run_record(context.input_path)
@@ -374,13 +1144,13 @@ def run(context: RunContext) -> RunOutcome:
 
         # 1-2. signal shape -> rate, then smeared by the tracker resolution
         signal = signal.rebin(SIGNAL_REBIN)
-        signal = signal.scaled(npot * SIGNAL_BR * sig_eff / signal.entries)
+        signal_scale = npot * SIGNAL_BR * sig_eff / signal.entries
+        signal = signal.scaled(signal_scale)
         # A density in energy offset. The efficiency is folded in here, so it
         # rides along with the response into the smeared DIO spectrum.
         response = response.scaled(sig_eff / response.entries / response.width)
-        signal_reco = signal.smear(
-            Kernel.gaussian(signal.width, TRK_RESOLUTION_SIGMA_MEV)
-        )
+        signal_kernel = Kernel.gaussian(signal.width, TRK_RESOLUTION_SIGMA_MEV)
+        signal_reco = signal.smear(signal_kernel)
         mpv, fwhm = mpv_fwhm(signal_reco)
 
         # 3. DIO: theory spectrum -> rate, smeared by the energy loss and then
@@ -403,23 +1173,38 @@ def run(context: RunContext) -> RunOutcome:
 
         # 5. best window
         best, top = scan_signal_box(signal_reco, dio_reco, cosmic)
+
+        # 6. (box mode) the best box in momentum, time, R(max), d0 and cos
+        box = None
+        if cut_mode == "box":
+            box = optimize_box(variables, mask, signal_reco, dio_reco, cosmic,
+                               best, context.params, signal_kernel, signal_scale)
     except (SensitivityError, EdepTreeError, SelectionError) as exc:
         return RunOutcome(error=str(exc), extra={"selection": selection})
 
+    # What the momentum-only scan found stays in `best`; in box mode the
+    # headline metrics describe the optimized box instead.
+    headline = best if box is None else box["headline"]
     metrics = {
-        "sensitivity": float(best["sensitivity"]),
-        "signal_box_low_mev": float(best["low_mev"]),
-        "signal_box_high_mev": float(best["high_mev"]),
-        "signal_rate": float(best["signal"]),
-        "dio_background": float(best["dio"]),
-        "cosmic_background": float(best["cosmic"]),
-        "total_background": float(best["background"]),
+        "sensitivity": float(headline["sensitivity"]),
+        "signal_box_low_mev": float(headline["low_mev"]),
+        "signal_box_high_mev": float(headline["high_mev"]),
+        "signal_rate": float(headline["signal"]),
+        "dio_background": float(headline["dio"]),
+        "cosmic_background": float(headline["cosmic"]),
+        "total_background": float(headline["background"]),
         "signal_mpv_mev": float(mpv),
         "signal_fwhm_mev": float(fwhm),
         # The assumptions the rates above are built on, reported with them so
         # a number never travels without the normalization behind it.
         "npot": float(npot),
         "cosmic_rate_per_s_per_mev": float(cosmic_rate_per_s_per_mev),
+        "momentum_only_sensitivity": float(best["sensitivity"]),
+        # The figure of merit the box is optimized on, for the headline
+        # window or box in either mode; the expected limit scales ~ 1/punzi_fom.
+        "punzi_fom": float(punzi_fom(headline["signal"], headline["background"])),
+        # -1 in momentum mode, where no such cut or efficiency exists.
+        **(box["metrics"] if box is not None else NO_BOX_METRICS),
     }
 
     log_path = outdir / "approx_ce_sensitivity.log"
@@ -443,6 +1228,7 @@ def run(context: RunContext) -> RunOutcome:
         f"  signal BR        {SIGNAL_BR:.4g} per stop  (R_mue = {R_MUE:g} per capture "
         f"x {MUON_CAPTURE_RATE:g} captures per stop)",
         f"  cosmic rate      {cosmic_rate_per_s_per_mev:.4g} per s per MeV/c "
+        f"({cosmic_rate_source}) "
         f"-> {cosmic_rate:.4g} per MeV/c ({onspill_seconds:.4g} s on-spill)",
         f"  signal entries   {signal.entries:g}",
         f"  MPV / FWHM       {mpv:.3f} / {fwhm:.3f} MeV",
@@ -460,11 +1246,15 @@ def run(context: RunContext) -> RunOutcome:
         f"S/sqrt(B) = {e['sensitivity']:.4g}"
         for e in top
     ]
+    if box is not None:
+        lines += ["", *box["log"]]
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     files = _write_plots(outdir, signal_reco, dio_reco, cosmic, response,
                          resolution.as_spectrum(dio_true.width, "resolution"),
                          dio_true, extras, best, mpv, fwhm)
+    if box is not None:
+        files += _write_box_plots(outdir, box["panels"])
 
     return RunOutcome(
         metrics=metrics,
@@ -477,6 +1267,12 @@ def run(context: RunContext) -> RunOutcome:
                 "ce_acceptance": ce_acceptance,
                 "n_gen_events": n_gen_events,
                 "edep_run_recorded": run_record is not None}),
+            "cut_mode": cut_mode,
+            "cosmic_rate_source": cosmic_rate_source,
+            **({} if box is None else {
+                "cosmic_loose_to_tight_ratio": box["cosmic_loose_to_tight_ratio"],
+                "box_start_fom": box["start_fom"],
+                "box_sweeps": box["sweeps"]}),
             "selection": selection,
             "n_events_selected": n_selected,
             "signal_br": SIGNAL_BR,
@@ -489,6 +1285,20 @@ def run(context: RunContext) -> RunOutcome:
 
 
 def summarize(metrics: dict[str, float]) -> str:
+    if metrics["ce_box_efficiency"] >= 0.0:     # -1 in momentum mode
+        return (
+            f"S/sqrt(B) = {metrics['sensitivity']:.4g} in the optimized box "
+            f"p [{metrics['signal_box_low_mev']:.1f}, "
+            f"{metrics['signal_box_high_mev']:.1f}] MeV/c, "
+            f"t [{metrics['time_low_ns']:g}, {metrics['time_high_ns']:g}] ns, "
+            f"R(max) [{metrics['rmax_low_mm']:g}, {metrics['rmax_high_mm']:g}] mm, "
+            f"d0 [{metrics['d0_low_mm']:g}, {metrics['d0_high_mm']:g}] mm, "
+            f"cos [{metrics['cos_low']:g}, {metrics['cos_high']:g}] "
+            f"(S = {metrics['signal_rate']:.3g}, B = {metrics['total_background']:.3g}; "
+            f"momentum-only S/sqrt(B) = {metrics['momentum_only_sensitivity']:.4g}) "
+            f"for {metrics['npot']:.3g} POT and a cosmic rate of "
+            f"{metrics['cosmic_rate_per_s_per_mev']:.4g} per s per MeV/c "
+            "for the loose cosmic selection.")
     return (
         f"S/sqrt(B) = {metrics['sensitivity']:.4g} in "
         f"[{metrics['signal_box_low_mev']:.1f}, "
@@ -513,8 +1323,12 @@ SPEC = AnalysisSpec(
         "signal_rate", "dio_background", "cosmic_background",
         "total_background", "signal_mpv_mev", "signal_fwhm_mev",
         "npot", "cosmic_rate_per_s_per_mev",
+        "momentum_only_sensitivity", "punzi_fom", *BOX_CUT_METRICS,
     ),
     units={
+        "time_low_ns": "ns", "time_high_ns": "ns",
+        "rmax_low_mm": "mm", "rmax_high_mm": "mm",
+        "d0_low_mm": "mm", "d0_high_mm": "mm",
         "signal_box_low_mev": "MeV",
         "signal_box_high_mev": "MeV",
         "signal_mpv_mev": "MeV",
@@ -526,7 +1340,10 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="sig_eff",
             description="Signal (CE) reconstruction+selection efficiency, 0-1. "
-                        "Scales signal and both backgrounds. Pass this or "
+                        "Scales signal and both backgrounds. In cut_mode 'box' "
+                        "it must NOT include the efficiency of the time, "
+                        "R(max), d0 and cos cuts: the box applies those "
+                        "explicitly. Pass this or "
                         "stops_per_pot, not both; 0 means not given.",
             default=0.0, minimum=0.0, maximum=1.0,
         ),
@@ -537,7 +1354,9 @@ SPEC = AnalysisSpec(
                         "sig_eff: sig_eff becomes stops_per_pot times the CE "
                         "acceptance, the file's events passing `selection` "
                         "per generated event (EdepAna's ngen), so the "
-                        "selection sets the signal's size too. The file must "
+                        "selection sets the signal's size too (in cut_mode 'box' "
+                        "the selection must not contain the time, R(max), d0 "
+                        "or cos cuts, which the box applies). The file must "
                         "come from one full 'edep' run: one 'edep' recorded "
                         "as run with max_events is refused, and a merged one "
                         "is refused when ngen shows it (not every merge "
@@ -557,10 +1376,56 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="cosmic_rate_per_s_per_mev",
             description="Cosmic-ray background rate, flat in momentum, per "
-                        "second per MeV/c. The default is the rough Run-1A "
-                        "mu- -> e- number; scaled by the on-spill live time "
-                        "that npot and mean npot per event implies.",
-            default=COSMIC_RATE_PER_SECOND_PER_MEV, minimum=0.0,
+                        "second per MeV/c. 0 (the default) means the "
+                        "recommended rate for cut_mode: the rough Run-1A "
+                        "mu- -> e- number (10/7.8e5) in either mode, which "
+                        "the box mode assumes was measured after its "
+                        "reference cuts. The metric reports the value used. "
+                        "Scaled by the on-spill live time "
+                        "that npot and mean npot per event implies. "
+                        + "In 'box' mode it is the cosmic-electron rate for the LOOSE selection the cosmic shapes were extracted with (ConvAna set 81: e-, APR/CPR trigger, upstream-reflection and multi-track vetoes, 100 < p < 110 MeV/c; no t0, cos, R(max) or d0 cut); the box's cosmic count is this rate times the box's cosmic time and geometry efficiencies, with no further scaling. In 'momentum' mode it is the rate after whatever fixed selection the result is meant to represent, applied as-is. The default (0) is, in momentum mode, the Run-1A rate 10/7.8e5 and, in box mode, that rate times the loose/tight yield ratio from the shapes file (the tight Run-1A cuts 540 < t0 < 1650 ns, 0.525 < cos < 0.649, 482 < R(max) < 642.6 mm pass 3.2% of the loose set, so ~31x, ~4.0e-4).",
+            default=0.0, minimum=0.0,
+        ),
+        ParamSpec(
+            name="cut_mode",
+            description="'momentum' (default): scan the momentum window alone "
+                        "(no time or geometry cut is applied). 'box': also "
+                        "optimize time, R(max), d0 and cos(theta) cuts by "
+                        "coordinate ascent on S/sqrt(B), using the cosmic "
+                        "shapes and the CE helix at the tracker front (needs "
+                        "an EdepAna tree with the helix branches, from a "
+                        "an Offline with PR #2092, not yet in a Musing). In box "
+                        "mode cosmic_rate_per_s_per_mev is the cosmic rate "
+                        "for the loose selection of the cosmic shapes (set 81: "
+                        "e-, 100 < p < 110 MeV/c, no t0, cos, R(max) or d0 "
+                        "cut), scaled by the box's time and geometry "
+                        "efficiencies; its default then is the Run-1A rate "
+                        "times the loose/tight yield ratio (~31x). In "
+                        "momentum mode it is applied as-is. DIO is assumed "
+                        "to share the CE's time and geometry efficiencies.",
+            default="momentum", kind="text",
+        ),
+        ParamSpec(
+            name="muon_lifetime_ns",
+            description="Muon lifetime (ns) setting the CE time distribution "
+                        "exp(-t/tau) over the microbunch; box mode only. The "
+                        "default is the bound-muon lifetime in aluminum.",
+            default=MUON_LIFETIME_NS, minimum=1.0,
+        ),
+        ParamSpec(
+            name="time_min_ns",
+            description="Lower edge (ns) of the base time cut in box mode; "
+                        "the time optimization only tightens it. Ignored in "
+                        "momentum mode.",
+            default=TIME_MIN_NS, minimum=0.0, maximum=MICROBUNCH_NS,
+        ),
+        ParamSpec(
+            name="time_max_ns",
+            description="Upper edge (ns) of the base time cut in box mode "
+                        "(the microbunch is 1695 ns long); the time "
+                        "optimization only tightens it. Ignored in momentum "
+                        "mode.",
+            default=TIME_MAX_NS, minimum=0.0, maximum=MICROBUNCH_NS,
         ),
         ParamSpec(
             name="selection",

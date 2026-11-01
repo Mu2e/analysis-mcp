@@ -118,7 +118,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event, the events passing a `selection`, and (with an Offline that has the step counts) approximate calo/tracker hit counts from detector steps |
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
-| `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
+| `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window (or, with `cut_mode="box"`, the best momentum/time/R(max)/d0/cos box), with the cuts and its signal/DIO/cosmic counts |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
 | `fullsim_sensitivity` | reconstructed CE-mixed-with-pileup EventNtuple `nts.*.root` file(s), e.g. CeMLeadingLogMix1BB | `S/sqrt(B)` for the best momentum window, as `approx_ce_sensitivity`, with the signal efficiency and detector response measured after the CE-like cuts |
 | `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
@@ -180,6 +180,13 @@ Six more variables, the per-event step counts `event_{calo,trk}_nsteps`,
 a tree written by an EdepAna with the step counts. They are read only where the
 file has them; a selection naming one against a tree without them is refused
 with a plain error (for `edep` on an older Offline, before the job runs).
+
+Likewise six helix variables exist only in a tree from an Offline with PR
+#2092 (not yet in a Musing): `primary_trk_front_r_center`, `_radius`, `_cos` and
+`_time` (read only if all four branches are in every file; EdepAna's -1 and
+"no front step" values are NaN), and the derived `primary_trk_front_rmax`
+(= r_center + radius) and `primary_trk_front_d0` (= r_center - radius, signed;
+Mu2e's d0 = rmax - 2R). `approx_ce_sensitivity`'s `cut_mode="box"` needs them.
 
 The defaults reproduce the fixed cuts the module's histograms and summary had:
 `event_calo_edep_vis > 50` for `edep` (so `n_events_selected` equals
@@ -913,6 +920,116 @@ momentum window:
 4. **Window scan** — every `[x1, x2]` with `x1 >= 50 MeV`, keeping the best
    S/sqrt(B). The top 10 windows go to the log.
 
+### Box cuts (`cut_mode="box"`)
+
+`cut_mode="momentum"` (the default) is everything above: the momentum window
+alone, with no time or geometry cut, and every number as it was before the box
+option existed. `cut_mode="box"` also optimizes cuts on **time, R(max), d0 and
+cos(theta)** next to the momentum window, by coordinate ascent on the Punzi
+figure of merit S/(a/2 + sqrt(B)) with a = 1.28 (90% CL). Not S/sqrt(B): with
+five cut variables the background can be cut to ~0 while keeping a sliver of
+signal, where S/sqrt(B) diverges; the expected limit scales roughly as
+1/FoM. It
+needs a tree with the tracker-front helix branches (see the selection section;
+an Offline with PR #2092, not yet in a Musing) and otherwise returns an error
+saying so and that `cut_mode="momentum"` works on the file.
+
+New parameters: `cut_mode`, `muon_lifetime_ns` (default 864, the bound-muon
+lifetime in aluminum), `time_min_ns` / `time_max_ns` (default 525 / 1650: the
+base time cut, which the time optimization may only tighten). In momentum mode
+the time window is **not** applied.
+
+Model. For the cosmics, momentum, time and the (helix-center radius rc, cos)
+distribution are taken as mutually separable; for the CE only time is separable
+from the rest, momentum and geometry are not (see S below). For a box [p1,p2] x [t1,t2] x
+R(max) x d0 x cos:
+
+- CE time follows the muon lifetime over one 1695 ns microbunch, density
+  exp(-t/tau): eps_t = (e^(-t1/tau) - e^(-t2/tau)) / (1 - e^(-T/tau)).
+  Cosmic time is flat over the time range of the loose cosmic shapes (the `t0`
+  axis of the shapes file, 400-1700 ns): eps_t = overlap / width.
+- CE geometry is counted per event: the weighted fraction of the selected
+  events that reached the tracker front whose (R(max), d0, cos) pass.
+- Cosmic geometry is a fixed-seed sample (200k points) drawn from the shapes
+  file's `rc_vs_cos` (bin by content, uniform inside it) with p drawn from its
+  `p` histogram (100-110 MeV/c) and R = p sin(theta) / (0.299792458 B), B the
+  effective field 1.036 T; R(max) = rc + R, d0 = rc - R.
+- S = eps_CE,t x the sum, over the CE events passing the geometry cuts, of
+  weight x W(bin) x (the signal's per-entry normalization), W(j) being the
+  fraction of a unit entry in signal bin j that the tracker-resolution smearing
+  puts in the p window (a response matrix built with the same `Spectrum.smear`
+  as the signal). That is the smeared signal spectrum of only the passing
+  events: a d0 or R(max) cut removes low-energy-loss events preferentially, so
+  the in-window fraction is not the momentum-integrated one. With open geometry
+  it is the plain window sum. The log reports the in-window geometry
+  efficiency (signal with the geometry cuts / without) next to the
+  momentum-integrated one; `ce_box_efficiency` stays time x the
+  momentum-integrated geometry efficiency.
+  DIO = (DIO summed over the p window) x eps_CE,t x the CE's
+  momentum-integrated geometry efficiency: **a known first-order
+  approximation**, the DIO's time and geometry efficiencies are taken equal to
+  the CE's; DIO is a different momentum spectrum, so the CE's in-window
+  correlation does not transfer. Cosmic = (cosmic spectrum summed over the p window) x eps_cos,t x
+  eps_cos,geom, with no further scaling. Window sums are direct slice sums.
+- Because the box applies the time/R(max)/d0/cos cuts explicitly, `sig_eff`
+  must **not** include their efficiency (nor may `selection`, when
+  `stops_per_pot` takes the acceptance from it).
+
+**The cosmic rate.** In box mode `cosmic_rate_per_s_per_mev` is the
+cosmic-electron rate for the *loose* selection the shapes were extracted with
+(ConvAna set 81: e-, APR/CPR trigger, upstream-reflection and multi-track
+vetoes, 100 < p < 110 MeV/c; no t0, cos, R(max) or d0 cut). Its default (0
+means "the recommended rate for `cut_mode`") is the Run-1A rate 10/7.8e5 times
+the loose/tight yield ratio of the shapes file (`reference_cuts.combined`:
+0.0320 of the loose set passes the tight Run-1A cuts 540 < t0 < 1650 ns,
+0.525 < cos < 0.649, 482 < R(max) < 642.6 mm, so about 31x, ~4.0e-4 per s per
+MeV/c). In momentum mode the default is 10/7.8e5, applied as-is: the rate after
+whatever fixed selection the result is meant to represent. A value you pass
+overrides either; the metric and log report the value used, and the run's
+`cosmic_rate_source` says `mode default` or `user` (`cosmic_loose_to_tight_ratio`
+reports the ratio). In box mode `momentum_only_sensitivity` is computed with
+this loose-selection rate, so it is not the number momentum mode gives by
+default.
+
+Optimization. It starts from the momentum-only window, the tight Run-1A cuts
+(time clipped to the base window) and no d0 cut. Each step re-optimizes one
+variable's (low, high) pair jointly on a grid with the others fixed, by
+histogramming the variable for the events/sample points passing the other cuts
+and using cumulative sums outward from each lower edge (O(N + G^2)); a step is
+kept only if it does not lower the FoM. Order p, t, R(max), d0, cos.
+Grids: p = the spectrum bins (>= 50 MeV), t 5 ns steps inside the base window,
+R(max) 400-1100 mm in 5 mm, d0 -700..700 mm in 5 mm, cos 0..1 in 0.005 (the
+d0 and cos grids have under/overflow bins, so a cut at a grid end is open on
+that side). R(max) is never open below: a track needs R(max) > 400 mm to have
+hits in the tracker, so `RMAX_MIN_MM` is the floor of its lower cut for CE and
+cosmics alike (applied wherever the geometry is counted, so `ce_geometry` is
+relative to all selected events, including those below 400 mm). Sweeps stop when one gains < 1e-6 relative or after 20.
+
+Metrics. In box mode `sensitivity`, `signal_box_low_mev` / `_high_mev` (bin
+centers, as in momentum mode), `signal_rate`, `dio_background`,
+`cosmic_background` and `total_background` describe the optimized box. The new
+metrics are always reported, -1 in momentum mode: `time_low_ns`,
+`time_high_ns`, `rmax_low_mm`, `rmax_high_mm`, `d0_low_mm`, `d0_high_mm`,
+`cos_low`, `cos_high`, `ce_box_efficiency` (eps_CE,t x eps_CE,geom) and
+`cosmic_box_efficiency`; `momentum_only_sensitivity` is the momentum-only
+result in both modes, and `punzi_fom` is the Punzi FoM of the headline window
+or box in both modes. The log lists the final cuts, efficiencies, the
+loose/tight ratio and each sweep's FoM. Box mode adds one PNG per
+variable in `figures/` (`box_p.png`, `box_t.png`, `box_rmax.png`,
+`box_d0.png`, `box_cos.png`): the cosmic distribution as expected counts per
+bin in the optimized configuration, "nominal" (base time window, p in 95-110
+MeV/c, no box cuts) and "after the other cuts" (all optimized cuts but this
+variable's), with the selected range shaded. The CE signal is overlaid on a
+right-hand axis ("Expected CE counts / bin", dashed blue for "after", dotted
+for "nominal") in the same normalization as `signal_rate`: the smeared
+spectrum of the passing events for p, the lifetime model binned in time, and
+for the geometry variables the events' in-window signal.
+
+The cosmic shapes are `data/cosmic_shapes.json` and `data/cosmic_shapes.root`,
+found relative to the module. Regenerate them with
+`scripts/extract_cosmic_shapes.py` (read its docstring for the input and
+options).
+
 The numbers are rough by construction: this is a figure of merit for comparing
 beamline configurations, not a sensitivity calculation. Note it needs a **CE
 signal** sample — given a file where no event passes the selection and
@@ -1240,7 +1357,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-216 tests, none of which start a mu2e job or reach SAM or metacat (the
+231 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 

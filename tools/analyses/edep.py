@@ -102,6 +102,28 @@ OPTIONAL_EDEP_VARIABLES: dict[str, str] = {
 }
 assert tuple(OPTIONAL_EDEP_VARIABLES) == _STEP_BRANCHES
 
+# Optional: the helix of the primary at the tracker front, only in a tree from
+# an Offline with PR #2092 (not yet in a Musing). Read only where the file has all
+# four (`_HELIX_BRANCHES`, per primary), and NaN where undefined: EdepAna
+# writes -1 for the radii and the time (no front step, neutral primary, zero
+# field) and 0 for the cosine when there is no front step. rmax and d0 are
+# derived, with Mu2e's convention d0 = rmax - 2R (signed).
+_HELIX_BRANCHES = ("primary_trk_front_r_center", "primary_trk_front_radius",
+                   "primary_trk_front_cos", "primary_trk_front_time")
+HELIX_EDEP_VARIABLES: dict[str, str] = {
+    "primary_trk_front_r_center":
+        "transverse radius of the primary's helix center from the tracker "
+        "axis at the tracker front (mm; needs the helix branches)",
+    "primary_trk_front_radius":
+        "primary's helix radius at the tracker front (mm)",
+    "primary_trk_front_cos": "pz/p of the primary at the tracker front",
+    "primary_trk_front_time": "time of the primary at the tracker front (ns)",
+    "primary_trk_front_rmax":
+        "helix center radius plus helix radius, R(max) (mm)",
+    "primary_trk_front_d0":
+        "helix center radius minus helix radius, signed: d0 = rmax - 2R (mm)",
+}
+
 
 class EdepTreeError(RuntimeError):
     """The input is not an EdepAna file with the tree, worded for the caller."""
@@ -142,6 +164,22 @@ def edep_variables(branches: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
                                        - out["primary_start_e"])
     out["primary_trk_front_energy_edep_diff"] = (out["primary_calo_edep_vis"]
                                                  - out["primary_trk_front_energy"])
+    # The helix at the tracker front, where the tree has it (all four).
+    if all(name in branches for name in _HELIX_BRANCHES):
+        for name in _HELIX_BRANCHES:
+            first = np.full(nprim.size, np.nan)
+            if has_primary.any():
+                first[has_primary] = [entry[0] for entry in branches[name][has_primary]]
+            out[name] = first
+        for name in ("primary_trk_front_r_center", "primary_trk_front_radius",
+                     "primary_trk_front_time"):
+            out[name] = np.where(has_front & (out[name] >= 0.0), out[name], np.nan)
+        out["primary_trk_front_cos"] = np.where(has_front,
+                                                out["primary_trk_front_cos"], np.nan)
+        out["primary_trk_front_rmax"] = (out["primary_trk_front_r_center"]
+                                         + out["primary_trk_front_radius"])
+        out["primary_trk_front_d0"] = (out["primary_trk_front_r_center"]
+                                       - out["primary_trk_front_radius"])
     # Step counts, where the tree has them (the caller passes only those).
     for name in _STEP_BRANCHES:
         if name in branches:
@@ -152,8 +190,8 @@ def edep_variables(branches: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 def read_edep_tree(paths: list[Path] | Path) -> dict[str, np.ndarray]:
     """EDEP_VARIABLES for every event in the EdepAna file(s), concatenated.
 
-    The optional step-count variables are included only if every file has
-    their branches (a mix would leave events without a value).
+    The optional step-count and helix variables are included only if every
+    file has their branches (a mix would leave events without a value).
     """
     import uproot
 
@@ -164,6 +202,8 @@ def read_edep_tree(paths: list[Path] | Path) -> dict[str, np.ndarray]:
             with uproot.open(path) as rootfile:
                 tree = rootfile[TREE_PATH]
                 present = [name for name in _STEP_BRANCHES if name in tree]
+                if all(name in tree for name in _HELIX_BRANCHES):
+                    present += _HELIX_BRANCHES
                 branches = tree.arrays(_EVENT_BRANCHES + _PRIMARY_BRANCHES
                                        + tuple(present), library="np")
         except KeyError as exc:
@@ -267,6 +307,14 @@ def check_optional_names(variables: dict[str, np.ndarray], selection: str) -> No
             "step-count branches: they come from an EdepAna with Offline PR #2067 "
             "(merged 2026-10-27). Rerun 'edep' in an Offline that has it, or drop "
             "them from the selection.")
+    missing = sorted(n for n in names
+                     if n in HELIX_EDEP_VARIABLES and n not in variables)
+    if missing:
+        raise EdepTreeError(
+            f"the selection uses {', '.join(missing)}, but this EdepAna tree has no "
+            "helix branches: they come from EdepAna in an Offline with PR #2092 "
+            "(not yet in a Musing). Rerun 'edep' with such a build, or drop them from the "
+            "selection.")
 
 
 def select_events(variables: dict[str, np.ndarray], selection: str) -> np.ndarray:
@@ -286,7 +334,10 @@ def selection_help() -> str:
         "are the first primary's. Also, only for an EdepAna tree made with "
         "Offline PR #2067 (the step counts): "
         + ", ".join(OPTIONAL_EDEP_VARIABLES) + "; on an older tree a "
-        "selection naming one is an error. An empty string selects every event."
+        "selection naming one is an error. Likewise, only for a tree from an "
+        "Offline with PR #2092, which adds the tracker-front helix branches (NaN where "
+        "undefined): " + ", ".join(HELIX_EDEP_VARIABLES) + ". "
+        "An empty string selects every event."
     )
 
 # Matches the block EdepAna_module.cc prints, e.g.:
