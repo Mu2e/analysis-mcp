@@ -106,6 +106,14 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   built on it. They share `tools/analyses/occupancy.py` (per-run fcl, summary
   table, tree). A skipped collection's metrics are -1, never absent, so every
   listed metric is always reported; keep that when adding collections.
+- **`edep_occupancy` needs EdepAna's `occupancy/` histograms** (Offline PR
+  #2097, `edepana-occupancy`, in no release yet). It runs through `edep.run`
+  (never a second copy of the job/fcl logic) and then reads
+  `EDepAna/occupancy`; a file without them is a plain error. Peaks of a sum
+  are not sums of peaks, so `edep_occupancy_combine` adds the per-channel
+  histograms in `occupancy_per_microbunch.root`, not metrics. A tracker "row"
+  (same plane and straw number over six panels) is one radius; the calo
+  average is radial in the crystal-centre radius.
 - **A stop file holds mu+ stops too** (about 1% in MDC2025). A rate for a
   mu- capture process (conversion, DIO, RMC) is `muon_stop_rate`'s
   `muminus_*`, not `stops_per_*`, which keep counting every stop.

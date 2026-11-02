@@ -77,6 +77,10 @@ tools/
     occupancy_digi.py          digi occupancy of dig files
     occupancy_reco.py          hit/cluster occupancy of mcs/rec files
     occupancy_ntuple.py        the same counts read from an EventNtuple
+    edep_occupancy.py          EdepAna's occupancy histograms: per-microbunch
+                               scaling, peak channel rates, plots; reuses
+                               edep.py's job and fcl
+    edep_occupancy_combine.py  adds those histograms over pileup components
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
       cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
@@ -131,6 +135,8 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `calo_cluster_resolution_ntuple` | simulated EventNtuple file(s) (calo MC truth) | calorimeter cluster dE (reco minus true energy) and dT (reco time minus earliest true deposit) for clusters passing a selection: plots, histograms, mean/rms/median/sigma68 |
 | `variable_comparison_ntuple` | two sets of EventNtuple file(s): the input (new) and a `reference_file(s)` (baseline) | one track or cluster variable compared: overlaid distributions with ratio, shifts and a KS test, and, for the same events, how many changed, gained or lost and by how much |
 | `muon_stops` | `sim.*.TargetStops.*.art` (or PolyStops / IPAStops) | where (z, radius), when and with what momentum at ST_In the muons stopped: metrics, plots, ROOT histograms |
+| `edep_occupancy` | dts art file(s) of ONE pileup component | detector occupancy and dose per microbunch, and the peak channel rates (straw, straw row over six panels, crystal, crystal-centre radius per calo disk) in kHz and MeV/s, with plots; needs an Offline with the EdepAna occupancy histograms |
+| `edep_occupancy_combine` | `occupancy_per_microbunch.root` file(s) from `edep_occupancy` | the same metrics for the sum of the components (channel by channel, not a sum of peaks), and each component's share of the peak channels |
 | `total_edep_per_pot` | none: parameters only (earlier `edep` and `muon_stop_rate` metrics) | the early electron-beam flash, early muon-beam flash and muon-stop pileup depositions per POT, their total and each one's share |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
@@ -1248,6 +1254,111 @@ On the Run1B `CeEndpointMix1BB-KL` dataset, `occupancy_reco` (50 events of
 749 straw digis, 54 calo hits and 5.7 clusters, CRV and background
 branches all zero.
 
+## edep_occupancy and edep_occupancy_combine
+
+How busy are the detectors in the pileup, and how busy is the busiest
+channel? `edep_occupancy` runs EdepAna over the dts files of ONE pileup
+component and reads the `EDepAna/occupancy/` histograms the module fills for
+every StrawGasStep and CaloShowerStep (a `<name>_occ` step count and a
+`<name>_edep` deposited energy per observable, plus "hit" histograms of steps
+above the step energy threshold and at or after the step time minimum, with
+the time folded into the microbunch). The job itself is `edep`'s: the same
+fcl, per-run step parameters and Offline probe, so a step parameter means
+here what it means there. **It needs an Offline whose EdepAna has the
+occupancy histograms** (Offline PR #2097, `edepana-occupancy`, not yet in a release);
+on any other it returns an error that says so.
+
+Per event becomes per microbunch and then a rate:
+
+```
+per microbunch = per event * events_per_microbunch
+rate           = per microbunch / microbunch_ns     (kHz for hits, MeV/s for dose)
+```
+
+`events_per_microbunch` is the mean number of dts events of this component per
+microbunch (POT per microbunch times the component's events per POT). It
+defaults to 1, so without it every number is per event. At 1.58e7 POT per
+microbunch (SimEfficiencies2 Sim_best v1_1, Run 1A) it is 92.78 for
+EleBeamFlashCat, 173.25 for MuBeamFlashCat, 226.57 for MuStopPileupCat, 3746.4
+for EarlyEleBeamFlashCat and 276.6 for EarlyMuBeamFlashCat. Run each component
+with its own value and give it a `label`.
+
+**Dose needs different samples than occupancy.** The regular
+`dts.mu2e.EleBeamFlashCat` and `MuBeamFlashCat` are time-filtered
+(DetStepFilter keeps events with a step folded after 250 ns or before 10 ns),
+so they miss the prompt flash. Their hit metrics are right, their `*_edep_*`
+metrics are not. Dose needs the `Early*FlashCat` samples, which are
+unfiltered and prescaled: their events per POT are the stage efficiencies
+times the prescale (1000 / 30 / 20), which is why the values above differ.
+
+**Metrics** (all also in `list_analyses`; `*_err` is the statistical error):
+
+| group | metrics |
+|---|---|
+| totals per microbunch | `trk_steps_per_ub`, `trk_edep_mev_per_ub`, `trk_hits_per_ub`, and `calo_*` likewise (a hit is a step above threshold and in the folded time window; tracker edep is StrawGasStep `ionizingEdep`, calo is `energyDepG4`, the true deposit) |
+| tracker straw | `trk_peak_straw_hit_rate_khz` and the straw it is (`trk_peak_straw_plane/panel/straw`), `trk_mean_straw_hit_rate_khz` (over all 20736), `trk_peak_straw_edep_rate_mev_per_s` |
+| tracker row | `trk_peak_row_hit_rate_khz` (+ `plane`, `straw`, `radius_mm`), `trk_peak_row_edep_rate_mev_per_s` |
+| calorimeter crystal | `calo_peak_crystal_hit_rate_khz` (+ `id`, `disk`), `calo_peak_crystal_edep_rate_mev_per_s` |
+| calorimeter radial | `calo_disk{0,1}_peak_radial_hit_rate_khz` (+ `hit_r_mm`), `calo_disk{0,1}_peak_radial_edep_rate_mev_per_s` (+ `edep_r_mm`), per crystal |
+
+The peak channel of the dose (where the edep peak is) can differ from the hit
+peak; it is in the result's `peak_channels` metadata.
+
+**Averaging over phi.** The peak of ~20000 straws or ~1350 crystals with few
+counts each is biased high and noisy, so the phi-averaged peaks are the ones to
+quote for a trend. A tracker **row** is one plane and one straw number in all
+six panels: panels are rotated copies, so those straws sit at the same radius
+(r = 380 + 3.125 x straw mm in every plane, checked on `geom_common.txt`;
+panel faces differ only in z, by 13.9 mm), and the row rate is their mean. The
+calorimeter has no z structure inside a crystal, so its average is radial: per
+disk, in 35 mm bins of the **crystal-centre** radius (385-665 mm, so every bin
+holds crystals), divided by the crystals in the bin (EdepAna fills
+`calo_disk<d>_ncrystals_r` once from the geometry).
+
+**Uncertainties** are the square root of the summed squared weights of the
+bins, scaled to the microbunch. They treat steps as independent. The steps of
+one event are correlated, so they underestimate the true error.
+
+**Artifacts** (`files`): EdepAna's own file, `occupancy_per_microbunch.root`
+(the scaled histograms, with variances, and a JSON of the settings), and four
+PNGs: `occupancy_trk_row_hit_rate.png` (plane vs straw radius),
+`occupancy_calo_radial_rate.png`, `occupancy_folded_time.png`,
+`occupancy_rz.png` (per-microbunch r vs z, occupancy and dose).
+
+`edep_occupancy_combine` adds components. The busiest channel of the sum is
+not the sum of the components' busiest channels, so it adds the per-channel
+histograms of each component's `occupancy_per_microbunch.root` (already scaled
+to a microbunch, so it needs no per-file factors), and reports the same
+metrics, plus `n_components`, for the total. The result's `components`
+metadata gives, per component, its totals, its rate in the channel where the
+SUM peaks, and its share there, for the straw, row, crystal and radial peaks.
+Its own output, `occupancy_total_per_microbunch.root`, can be combined again.
+Files made with different step cuts or microbunch periods are refused.
+
+On Run 1A MDC2025ac dts (EleBeamFlashCat 795k events, MuBeamFlashCat 2.05M,
+MuStopPileupCat 2.24M, all events, regular samples, defaults) the total is
+829.6 tracker steps and 350.2 hits per microbunch, a peak straw of 40.46 +- 1.5
+kHz (unique straw 2784: plane 4, panel 5, straw 0; MuStopPileup 21.5, MuBeamFlash
+15.8, EleBeamFlash 3.2), a mean straw of 9.96 kHz, a peak row of 31.7 +- 0.6 kHz
+(plane 2, straw 0, r = 380 mm), a peak crystal (hit rate) of 392 kHz (crystal 2,
+disk 0 inner ring) and radial peaks of 256 kHz (disk 0) and 154 kHz (disk 1) per
+crystal at r = 402 mm. **Statistics matter for the peak straw**: the same
+analysis on the first 300k events of each gives 55 kHz, because the maximum of
+20736 noisy straws is biased high. The phi-averaged row (34.5 kHz at 300k) is
+less affected, the radial calo peaks hardly at all; use the row and radial
+numbers, or many events, for the peak.
+
+```python
+for name, per_ub in (("MuStopPileupCat", 226.57), ("MuBeamFlashCat", 173.25),
+                     ("EleBeamFlashCat", 92.78)):
+    run_analysis(analysis="edep_occupancy", dataset=f"dts.mu2e.{name}.MDC2025ac.art",
+                 output_dir=f"/scratch/occ/{name}", max_files=3,
+                 parameters={"events_per_microbunch": per_ub, "label": name})
+run_analysis(analysis="edep_occupancy_combine", output_dir="/scratch/occ/total",
+             data_files=[f"/scratch/occ/{n}/occupancy_per_microbunch.root"
+                         for n in ("MuStopPileupCat", "MuBeamFlashCat", "EleBeamFlashCat")])
+```
+
 ## total_edep_per_pot
 
 The dose from the three beam-related sources, per POT. Each source is
@@ -1395,7 +1506,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-231 tests, none of which start a mu2e job or reach SAM or metacat (the
+250 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 

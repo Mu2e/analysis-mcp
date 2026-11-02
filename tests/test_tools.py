@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import math
 import numpy as np
 from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
@@ -51,6 +52,8 @@ from tools.analyses import occupancy_reco as occ_reco
 from tools.analyses.trigger_rate import duty_factor, rate_metrics
 from tools.analyses.trigger_timing import timing_metrics
 from tools.analyses import total_edep_per_pot as dose
+from tools.analyses import edep_occupancy as eocc
+from tools.analyses import edep_occupancy_combine as eoccc
 from tools.mu2e_env import EnvError, Mu2eEnv, configure, current
 from tools.mu2e_job import (build_input_args, root_snapshot,
                             validate_input_paths, written_root_files)
@@ -233,7 +236,8 @@ SAMPLE_STDOUT = {"edep": SAMPLE_EDEP_STDOUT,
                  "trigger_timing": SAMPLE_TRIGGER_STDOUT,
                  "muon_stops": SAMPLE_MUON_STOPS_STDOUT,
                  "occupancy_digi": SAMPLE_OCCUPANCY_DIGI_STDOUT,
-                 "occupancy_reco": SAMPLE_OCCUPANCY_RECO_STDOUT}
+                 "occupancy_reco": SAMPLE_OCCUPANCY_RECO_STDOUT,
+                 "edep_occupancy": SAMPLE_EDEP_STEPS_STDOUT}
 
 
 # --- the edep parser ---------------------------------------------------------
@@ -3455,6 +3459,302 @@ def test_list_analyses_describes_the_parameters_kind():
 
 # --- the registry (loops over every analysis) --------------------------------
 
+# --- edep_occupancy and edep_occupancy_combine ---------------------------------
+
+_NCRY_PER_RBIN = [64, 78, 84, 106, 104, 102, 116, 20]
+
+
+def _occ_hist(values, edges=None):
+    values = np.asarray(values, dtype=float)
+    if edges is None:
+        edges = [np.arange(n + 1.0) for n in values.shape]
+    return eocc.Hist(values, np.abs(values), edges)
+
+
+def _occ_hists(straw=((3, 2, 40), 10.0), others=2.0, crystals=((10, 20.0),),
+               radial_hits=None):
+    """Per-event occupancy histograms with a known hot straw (and a row whose
+    other five panels hold `others` hits), hot crystals and a radial profile."""
+    hits = np.zeros(eocc.N_PLANES * eocc.N_PANELS * eocc.N_STRAWS)
+    (plane, panel, istraw), value = straw
+    for p in range(eocc.N_PANELS):
+        hits[(plane * eocc.N_PANELS + p) * eocc.N_STRAWS + istraw] = (
+            value if p == panel else others)
+    hits[5] = 1.0                                     # a quiet straw elsewhere
+    chits = np.zeros(1348)
+    for cid, v in crystals:
+        chits[cid] = v
+    ncry = np.array(_NCRY_PER_RBIN, dtype=float)
+    r_edges = np.linspace(385.0, 665.0, 9)
+    h = {"trk_straw_hits": _occ_hist(hits), "trk_straw_occ": _occ_hist(3 * hits),
+         "trk_straw_edep": _occ_hist(0.001 * 3 * hits),
+         "calo_crystal_hits": _occ_hist(chits), "calo_crystal_occ": _occ_hist(2 * chits),
+         "calo_crystal_edep": _occ_hist(5 * chits)}
+    for det in ("trk", "calo"):
+        for kind in ("occ", "edep", "ecut"):
+            h[f"{det}_time_folded_{kind}"] = _occ_hist(
+                np.ones(100), [np.linspace(0, 1695.0, 101)])
+        for kind in ("occ", "edep"):
+            h[f"{det}_rz_{kind}"] = _occ_hist(np.ones((4, 3)),
+                                              [np.arange(5.0), np.arange(4.0)])
+    for d in range(2):
+        rh = np.array(radial_hits if radial_hits is not None
+                      else [1, 1, 1, 1, 1, 6, 1, 1], dtype=float) * ncry * 0.1
+        h[f"calo_disk{d}_ncrystals_r"] = _occ_hist(ncry, [r_edges])
+        h[f"calo_disk{d}_rcrys_hits"] = _occ_hist(rh, [r_edges])
+        h[f"calo_disk{d}_rcrys_occ"] = _occ_hist(2 * rh, [r_edges])
+        h[f"calo_disk{d}_rcrys_edep"] = _occ_hist(5 * rh, [r_edges])
+    return h
+
+
+def _write_raw_occupancy(path, hists, n_events):
+    """An EdepAna file as the Offline module writes it: occupancy/ hists per event."""
+    import uproot
+    with uproot.recreate(path) as f:
+        for name, hist in hists.items():
+            eocc._write_hist(f, f"{eocc.OCCUPANCY_DIR}/{name}", hist)
+        eocc._write_hist(f, f"{eocc.OCCUPANCY_DIR}/nevents", _occ_hist([n_events], [np.array([0.0, 1.0])]))
+
+
+def _run_edep_occupancy(tmp_dir, hists=None, n_events=1000.0, parameters=None,
+                        has_steps=True, name="comp"):
+    """edep_occupancy with edep's job replaced by a file the test wrote."""
+    from tools.spec import RunContext
+    outdir = Path(tmp_dir) / name
+    outdir.mkdir(parents=True, exist_ok=True)
+    raw = outdir / "nts.owner.edep.test.root"
+    if hists is not None:
+        _write_raw_occupancy(raw, hists, n_events)
+    else:
+        import uproot
+        with uproot.recreate(raw) as f:
+            f["other"] = "not an EdepAna file"
+    seen = {}
+
+    def fake_edep(context):
+        seen["params"] = context.params
+        return RunOutcome(metrics={"n_events": n_events}, files=[str(raw)],
+                          extra={"selection": "", "job_fcl": "x"})
+    from tools.spec import RunOutcome
+    saved = edep_mod.run, edep_mod.module_accepts
+    edep_mod.run, edep_mod.module_accepts = fake_edep, lambda *a, **k: has_steps
+    try:
+        params = ANALYSES["edep_occupancy"].resolve_params(parameters)
+        outcome = eocc.run(RunContext(input_paths=[Path(tmp_dir) / "in.art"], outdir=outdir,
+                                      params=params, timeout_s=60))
+    finally:
+        edep_mod.run, edep_mod.module_accepts = saved
+    return outcome, seen
+
+
+def test_edep_occupancy_scales_to_microbunch_and_finds_the_peaks(tmp_dir):
+    outcome, seen = _run_edep_occupancy(
+        tmp_dir, _occ_hists(crystals=((10, 20.0), (700, 6.0))), n_events=1000.0,
+        parameters={"events_per_microbunch": 100.0, "label": "MuBeamFlash"})
+    assert outcome.error is None, outcome.error
+    m = outcome.metrics
+    assert tuple(m) == ANALYSES["edep_occupancy"].metrics
+    assert seen["params"]["selection"] == ""            # edep's job, no selection
+    k = 100.0 / 1000.0                                   # per event -> per microbunch
+    assert m["events_per_microbunch"] == 100.0 and m["n_events_analyzed"] == 1000.0
+    khz = lambda x: x * k / 1695.0 * 1e6
+    assert abs(m["trk_peak_straw_hit_rate_khz"] - khz(10.0)) < 1e-9
+    assert (m["trk_peak_straw_plane"], m["trk_peak_straw_panel"],
+            m["trk_peak_straw_straw"]) == (3.0, 2.0, 40.0)
+    # the row averages the hot straw with the five other panels
+    assert abs(m["trk_peak_row_hit_rate_khz"] - khz((10.0 + 5 * 2.0) / 6)) < 1e-9
+    assert (m["trk_peak_row_plane"], m["trk_peak_row_straw"]) == (3.0, 40.0)
+    assert m["trk_peak_row_radius_mm"] == 380.0 + 3.125 * 40
+    # mean over all straws: (10 + 5*2 + 1) hits over 20736 straws
+    assert abs(m["trk_mean_straw_hit_rate_khz"] - khz(21.0 / 20736)) < 1e-12
+    assert abs(m["trk_hits_per_ub"] - 21.0 * k) < 1e-9
+    assert abs(m["trk_steps_per_ub"] - 63.0 * k) < 1e-9
+    assert abs(m["trk_peak_straw_edep_rate_mev_per_s"]
+               - 0.001 * 3 * 10.0 * k / 1695.0 * 1e9) < 1e-6
+    # statistical error: variance of a bin is its raw content, scaled by k^2
+    assert abs(m["trk_peak_straw_hit_rate_khz_err"]
+               - math.sqrt(10.0 * k * k) / 1695.0 * 1e6) < 1e-9
+    assert m["calo_peak_crystal_id"] == 10.0 and m["calo_peak_crystal_disk"] == 0.0
+    assert abs(m["calo_peak_crystal_hit_rate_khz"] - khz(20.0)) < 1e-9
+    assert abs(m["calo_hits_per_ub"] - 26.0 * k) < 1e-9
+    # radial: bin 5 is six times busier per crystal; rate per crystal = hits / crystals
+    per_crystal = 6 * 0.1
+    assert abs(m["calo_disk0_peak_radial_hit_rate_khz"] - khz(per_crystal)) < 1e-9
+    assert m["calo_disk1_peak_radial_hit_r_mm"] == 0.5 * (385.0 + 35 * 5 + 385.0 + 35 * 6)
+    # artifacts: the scaled file is re-readable, and the plots exist
+    scaled = Path(outcome.files[1])
+    assert scaled.name == eocc.SCALED_FILE
+    hists, meta = eocc.read_scaled_file(scaled)
+    assert meta["label"] == "MuBeamFlash" and meta["n_events"] == 1000.0
+    assert abs(hists["trk_straw_hits"].values.max() - 10.0 * k) < 1e-12
+    assert abs(hists["trk_straw_hits"].variances.max() - 10.0 * k * k) < 1e-12
+    assert [Path(f).name for f in outcome.files[2:]] == list(eocc.PLOT_FILES)
+    assert all(Path(f).stat().st_size > 1000 for f in outcome.files[2:])
+    assert "peak_channels" in outcome.extra and "independent" in outcome.extra["error_note"]
+
+
+def test_edep_occupancy_defaults_to_per_event(tmp_dir):
+    outcome, _ = _run_edep_occupancy(tmp_dir, _occ_hists(), n_events=1000.0)
+    assert outcome.error is None, outcome.error
+    # events_per_microbunch = 1: the numbers are per event (21 hits over 1000 events)
+    assert outcome.metrics["events_per_microbunch"] == 1.0
+    assert abs(outcome.metrics["trk_hits_per_ub"] - 21.0 / 1000.0) < 1e-12
+
+
+def test_edep_occupancy_is_unchanged_by_hadd_of_several_jobs(tmp_dir):
+    # hadd of 3 jobs triples every histogram, the crystal counts included
+    one, _ = _run_edep_occupancy(tmp_dir, _occ_hists(), n_events=1000.0, name="one")
+    tripled = {n: h.scaled(3.0) for n, h in _occ_hists().items()}
+    three, _ = _run_edep_occupancy(tmp_dir, tripled, n_events=3000.0, name="three")
+    assert one.error is None and three.error is None, (one.error, three.error)
+    for key in ("calo_disk0_peak_radial_hit_rate_khz", "trk_peak_row_hit_rate_khz",
+                "calo_peak_crystal_hit_rate_khz", "trk_hits_per_ub"):
+        assert abs(one.metrics[key] - three.metrics[key]) < 1e-9 * max(1.0, one.metrics[key]), key
+
+
+def test_edep_occupancy_says_what_an_old_offline_needs(tmp_dir):
+    outcome, _ = _run_edep_occupancy(tmp_dir, _occ_hists(), has_steps=False)
+    assert "occupancy histograms" in outcome.error and "edepana-occupancy" in outcome.error
+    # a new enough EdepAna without the occupancy directory, or with an old one
+    outcome, _ = _run_edep_occupancy(tmp_dir, None)
+    assert "no EDepAna/occupancy directory" in outcome.error
+    assert "occupancy histograms" in outcome.error
+    old = _occ_hists()
+    del old["calo_crystal_hits"]
+    outcome, _ = _run_edep_occupancy(tmp_dir, old, name="old")
+    assert "lacks calo_crystal_hits" in outcome.error
+
+
+def test_edep_occupancy_warns_when_the_microbunch_differs_from_the_folding(tmp_dir):
+    outcome, _ = _run_edep_occupancy(tmp_dir, _occ_hists(),
+                                     parameters={"microbunch_ns": 1000.0})
+    assert outcome.error is None
+    assert "folded" in outcome.extra["warnings"][0]
+
+
+def test_edep_occupancy_through_the_real_edep_job_reports_a_file_without_histograms(tmp_dir):
+    """edep.run itself (fake job, a tree file with no occupancy/) is what runs."""
+    from tools.spec import RunContext
+    fake, calls = _fake_edep_job(tmp_dir)
+    real = edep_mod.run_mu2e_job, edep_mod.module_accepts
+    edep_mod.run_mu2e_job, edep_mod.module_accepts = fake, lambda *a, **k: True
+    try:
+        outcome = eocc.run(RunContext(
+            input_paths=[Path(tmp_dir) / "in.art"], outdir=Path(tmp_dir) / "o",
+            params=ANALYSES["edep_occupancy"].resolve_params(
+                {"trk_step_time_min_ns": 400.0}), timeout_s=60))
+    finally:
+        edep_mod.run_mu2e_job, edep_mod.module_accepts = real
+    assert len(calls) == 1 and "TrkStepTimeMin : 400.0" in calls.fcl[0].read_text()
+    assert "no EDepAna/occupancy directory" in outcome.error, outcome.error
+
+
+def test_tracker_rows_average_the_six_panels():
+    hits = np.zeros(eocc.N_PLANES * eocc.N_PANELS * eocc.N_STRAWS)
+    for panel in range(6):
+        hits[(7 * 6 + panel) * 96 + 12] = panel + 1.0
+    rows = eocc.tracker_rows(_occ_hist(hits))
+    assert rows.values.shape == (36, 96) and rows.values[7, 12] == 3.5
+    assert abs(rows.variances[7, 12] - 21.0 / 36) < 1e-12
+
+
+def _combine_inputs(tmp_dir):
+    """Two components peaking in different channels, as scaled files."""
+    paths = []
+    for name, kwargs, n_per_ub in (
+            ("A", dict(straw=((3, 2, 40), 10.0), others=0.0, crystals=((10, 20.0),)), 50.0),
+            ("B", dict(straw=((9, 1, 7), 8.0), others=1.0, crystals=((10, 5.0), (700, 9.0))), 20.0)):
+        outcome, _ = _run_edep_occupancy(
+            tmp_dir, _occ_hists(**kwargs), n_events=100.0, name=name,
+            parameters={"events_per_microbunch": n_per_ub, "label": name})
+        assert outcome.error is None, outcome.error
+        paths.append(Path(outcome.files[1]))
+    return paths
+
+
+def test_combine_sums_channels_so_the_peak_is_not_the_sum_of_peaks(tmp_dir):
+    a, b = _combine_inputs(tmp_dir)
+    result = run_analysis(analysis="edep_occupancy_combine", data_files=[str(a), str(b)],
+                          output_dir=str(Path(tmp_dir) / "tot"))
+    assert result.status == "success", result.message
+    m = result.metadata
+    ka, kb = 50.0 / 100.0, 20.0 / 100.0
+    # both components run on the same straw only if their hot straws coincide; here
+    # they differ, so the total peak is the larger single straw, not 10*ka + 8*kb
+    straw_a, straw_b = 10.0 * ka, 8.0 * kb
+    assert abs(m["trk_peak_straw_hit_rate_khz"] - straw_a / 1695.0 * 1e6) < 1e-9
+    assert m["trk_peak_straw_hit_rate_khz"] < (straw_a + straw_b) / 1695.0 * 1e6
+    assert (m["trk_peak_straw_plane"], m["trk_peak_straw_straw"]) == (3.0, 40.0)
+    # crystal 10 holds 20*ka + 5*kb in the sum
+    assert m["calo_peak_crystal_id"] == 10.0
+    assert abs(m["calo_peak_crystal_hit_rate_khz"]
+               - (20.0 * ka + 5.0 * kb) / 1695.0 * 1e6) < 1e-9
+    assert m["n_components"] == 2.0 and m["events_per_microbunch"] == 70.0
+    assert tuple(k for k in m if k in ANALYSES["edep_occupancy_combine"].metrics) \
+        == ANALYSES["edep_occupancy_combine"].metrics
+    # shares of the crystal where the sum peaks
+    comp = m["components"]
+    sa = comp["A"]["calo_peak_crystal_hit_share"]
+    sb = comp["B"]["calo_peak_crystal_hit_share"]
+    assert abs(sa + sb - 1.0) < 1e-12 and abs(sa - 20.0 * ka / (20.0 * ka + 5.0 * kb)) < 1e-12
+    assert comp["A"]["trk_peak_straw_hit_share"] == 1.0
+    assert comp["B"]["trk_peak_straw_hit_share"] == 0.0
+    assert abs(comp["A"]["trk_straw_hits"] - 11.0 * ka) < 1e-9   # hot straw + the quiet one
+    # the total file can itself be combined with another component
+    total = Path(result.files[0])
+    assert total.name == eoccc.TOTAL_FILE
+    again = run_analysis(analysis="edep_occupancy_combine",
+                         data_files=[str(total), str(a)], output_dir=str(Path(tmp_dir) / "t2"))
+    assert again.status == "success", again.message
+
+
+def test_combine_refuses_mismatched_cuts_and_raw_edep_files(tmp_dir):
+    a, _ = _combine_inputs(tmp_dir)
+    c, _ = _run_edep_occupancy(tmp_dir, _occ_hists(), name="C",
+                               parameters={"trk_step_energy_threshold_mev": 0.002})
+    result = run_analysis(analysis="edep_occupancy_combine",
+                          data_files=[str(a), c.files[1]], output_dir=str(Path(tmp_dir) / "x"))
+    assert result.status == "error" and "step_cuts" in result.message
+    raw = Path(tmp_dir) / "C" / "nts.owner.edep.test.root"
+    result = run_analysis(analysis="edep_occupancy_combine",
+                          data_files=[str(a), str(raw)], output_dir=str(Path(tmp_dir) / "y"))
+    assert result.status == "error" and "per-microbunch occupancy file" in result.message
+
+
+def test_combine_tolerates_rounded_geometry_and_reports_mismatched_binning(tmp_dir):
+    a, b = _combine_inputs(tmp_dir)
+    hists, meta = eocc.read_scaled_file(b)
+
+    def variant(name, change):
+        path = Path(tmp_dir) / f"{name}.root"
+        eocc.write_scaled_file(path, {**hists, **change}, meta)
+        return run_analysis(analysis="edep_occupancy_combine", data_files=[str(a), str(path)],
+                            output_dir=str(Path(tmp_dir) / name))
+
+    geom = eocc.GEOMETRY_HIST_NAMES[0]
+    # a merged file's crystal counts, scaled back to one geometry, round off
+    rounded = variant("rounded", {geom: hists[geom].scaled(1.0 - 2.0 ** -52)})
+    assert rounded.status == "success", rounded.message
+    moved = hists[geom].values.copy()
+    moved[0], moved[1] = moved[0] - 1.0, moved[1] + 1.0
+    other = variant("other", {geom: eocc.Hist(moved, moved.copy(), hists[geom].edges)})
+    assert other.status == "error" and "calorimeter geometry" in other.message
+    short = hists["calo_crystal_hits"]
+    short = eocc.Hist(short.values[:-1], short.variances[:-1], [short.edges[0][:-1]])
+    binning = variant("binning", {"calo_crystal_hits": short})
+    assert binning.status == "error" and "channel by channel" in binning.message
+
+
+def test_edep_occupancy_documents_the_dose_samples():
+    entry = list_analyses().metadata["analyses"]["edep_occupancy"]
+    text = entry["parameters"]["events_per_microbunch"]["description"]
+    assert "Early" in text and "DetStepFilter" in text and "3746.4" in text
+    assert entry["parameters"]["events_per_microbunch"]["default"] == 1.0
+    assert "takes_data_files" in entry and entry["takes_data_files"] is True
+    comb = list_analyses().metadata["analyses"]["edep_occupancy_combine"]
+    assert comb["takes_data_files"] is True and comb["produced_by"] == ["edep_occupancy"]
+
+
 def test_registry_includes_every_analysis():
     assert {"edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
             "stop_materials", "fullsim_sensitivity"} <= set(ANALYSES)
@@ -3525,6 +3825,11 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
         elif name == "trigger_timing":
             # its numbers come from the timing database, not stdout
             assert tuple(timing_metrics(np.array([0.01, 0.02]))) == spec.metrics
+        elif name == "edep_occupancy":
+            # EdepAna's stdout is parsed by edep; the metrics come from its histograms
+            hists = _occ_hists()
+            meta = {"microbunch_ns": 1695.0, "n_events": 10.0, "events_per_microbunch": 1.0}
+            assert tuple(eocc.metrics_from(hists, meta)[0]) == spec.metrics
         elif name in ("occupancy_digi", "occupancy_reco"):
             # the table's metrics, then what the per-event tree adds
             names = (occ_digi if name == "occupancy_digi" else occ_reco).COLLECTIONS
