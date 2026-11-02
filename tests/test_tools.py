@@ -3703,6 +3703,30 @@ def test_combine_refuses_mismatched_cuts_and_raw_edep_files(tmp_dir):
     assert result.status == "error" and "per-microbunch occupancy file" in result.message
 
 
+def test_combine_tolerates_rounded_geometry_and_reports_mismatched_binning(tmp_dir):
+    a, b = _combine_inputs(tmp_dir)
+    hists, meta = eocc.read_scaled_file(b)
+
+    def variant(name, change):
+        path = Path(tmp_dir) / f"{name}.root"
+        eocc.write_scaled_file(path, {**hists, **change}, meta)
+        return run_analysis(analysis="edep_occupancy_combine", data_files=[str(a), str(path)],
+                            output_dir=str(Path(tmp_dir) / name))
+
+    geom = eocc.GEOMETRY_HIST_NAMES[0]
+    # a merged file's crystal counts, scaled back to one geometry, round off
+    rounded = variant("rounded", {geom: hists[geom].scaled(1.0 - 2.0 ** -52)})
+    assert rounded.status == "success", rounded.message
+    moved = hists[geom].values.copy()
+    moved[0], moved[1] = moved[0] - 1.0, moved[1] + 1.0
+    other = variant("other", {geom: eocc.Hist(moved, moved.copy(), hists[geom].edges)})
+    assert other.status == "error" and "calorimeter geometry" in other.message
+    short = hists["calo_crystal_hits"]
+    short = eocc.Hist(short.values[:-1], short.variances[:-1], [short.edges[0][:-1]])
+    binning = variant("binning", {"calo_crystal_hits": short})
+    assert binning.status == "error" and "channel by channel" in binning.message
+
+
 def test_edep_occupancy_documents_the_dose_samples():
     entry = list_analyses().metadata["analyses"]["edep_occupancy"]
     text = entry["parameters"]["events_per_microbunch"]["description"]

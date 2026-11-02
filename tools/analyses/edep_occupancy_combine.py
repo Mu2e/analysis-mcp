@@ -24,10 +24,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
 from ..spec import AnalysisSpec, RunContext, RunOutcome
 from . import edep_occupancy as occ
 
 TOTAL_FILE = "occupancy_total_per_microbunch.root"
+# crystals per radial bin that still count as the same geometry
+GEOMETRY_ATOL = 1.0e-6
 
 
 def _labels(metas: list[dict], paths: list[Path]) -> list[str]:
@@ -58,16 +62,27 @@ def run(context: RunContext) -> RunOutcome:
                 "with the same parameters for every component"))
     labels = _labels(metas, context.input_paths)
     components = [(label, hists) for label, (hists, _) in zip(labels, loaded)]
-    total = {name: hist for name, hist in components[0][1].items()}
-    for _, hists in components[1:]:
-        for name in total:
-            total[name] = total[name] if name in occ.GEOMETRY_HIST_NAMES \
-                else total[name].plus(hists[name])
+    # The crystal counts of a merged file are scaled back to one geometry in
+    # floating point (64 crystals can read 63.99999999999999), so compare them
+    # to a tolerance well below one crystal.
+    first = components[0][1]
     for _, hists in components[1:]:
         for name in occ.GEOMETRY_HIST_NAMES:
-            if (hists[name].values != components[0][1][name].values).any():
+            if hists[name].values.shape != first[name].values.shape or not np.allclose(
+                    hists[name].values, first[name].values, rtol=0.0, atol=GEOMETRY_ATOL):
                 return RunOutcome(error="the files have different calorimeter "
                                         "geometry (crystals per radial bin)")
+    total = dict(first)
+    try:
+        for _, hists in components[1:]:
+            for name in total:
+                if name not in occ.GEOMETRY_HIST_NAMES:
+                    total[name] = total[name].plus(hists[name])
+    except occ.OccupancyError as exc:
+        return RunOutcome(error=(
+            f"the files cannot be added channel by channel ({exc}): they were "
+            "made with different detector channel counts or histogram binning. "
+            "Rerun 'edep_occupancy' on the same Offline geometry for every component"))
     n_events = sum(m["n_events"] for m in metas)
     meta = {"label": "total", "microbunch_ns": metas[0]["microbunch_ns"],
             "events_per_microbunch": sum(m["events_per_microbunch"] for m in metas),
