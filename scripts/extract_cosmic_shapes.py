@@ -419,6 +419,11 @@ def main(argv=None):
             chi2, ndf, _, _ = chi2_vs_marginals(hist2d(v[a], v[b], v["w"], ex, ey)[0])
             row.update(chi2=chi2, ndf=ndf, chi2_per_ndf=chi2 / ndf)
     ref = reference_cuts(v)
+    if not ref["combined"] > 0.0:
+        sys.exit("No selected track passes all the Run-1A reference cuts together "
+                 f"({ref['cuts']}), so the loose/tight yield ratio the box mode "
+                 "normalizes with is undefined: check --input, --particles and the "
+                 "momentum window.")
     summary = {
         "input": args.input, "tree": args.tree, "selection": sel,
         "n_selected": int(len(v["w"])), "sum_weights": float(v["w"].sum()),

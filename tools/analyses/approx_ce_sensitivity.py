@@ -32,14 +32,17 @@ cosmic-electron rate for the LOOSE selection the cosmic shapes were extracted
 with (ConvAna set 81: e-, APR/CPR trigger, upstream-reflection and multi-track
 vetoes, 100 < p < 110 MeV/c; no t0, cos, R(max) or d0 cut): the box's cosmic
 count is that rate summed over the momentum window times the box's cosmic time
-efficiency (flat over the shapes' t0 range) and geometry efficiency (a fixed
-sample drawn from the shapes), with no further scaling. Its default is the
+efficiency (flat over the shapes' t0 range) and geometry efficiency in that
+window (a fixed sample drawn from the shapes, each track with its own momentum,
+since R(max) and d0 depend on it), with no further scaling. The box's momentum
+window is kept inside the shapes' momentum range, where the rate is defined. Its default is the
 Run-1A rate 10/7.8e5 times the loose/tight yield ratio from the shapes file
 (`reference_cuts.combined`, the fraction of the loose set passing the tight
 Run-1A cuts 540 < t0 < 1650 ns, 0.525 < cos < 0.649, 482 < R(max) < 642.6 mm).
 In momentum mode it is the rate after whatever fixed selection the result is meant to represent, applied as-is. Box mode assumes
 time is separable from momentum and geometry for CE and cosmics, and
-momentum and (rc, cos) separable for cosmics. The CE is NOT taken as separable
+momentum and (rc, cos) separable for cosmics (R(max) and d0 are not: they are
+worked out per track from its momentum). The CE is NOT taken as separable
 in momentum and geometry: each CE event keeps its own signal bin and the box's
 signal is the smeared spectrum of the events passing the geometry cuts (see
 `BoxModel`), since a d0 or R(max) cut removes low-energy-loss events more than
@@ -144,6 +147,14 @@ COSMIC_SAMPLE_SEED = 20261101
 # R[mm] = p[MeV/c] sin(theta) / (C_LIGHT B[T])
 C_LIGHT_MEV_PER_MM_T = 0.299792458
 
+# The optional fast-sim TSDA veto (tsda_veto = 1). Reco extrapolates each
+# track upstream and vetoes it if it reaches the TS downstream absorber (an
+# annulus, KinKalGeomMaker's TSDA) instead of reflecting in the DS gradient.
+# Rough nominal fields, no map: B_z at the tracker front and at the TSDA.
+TRACKER_BZ_T = 1.0
+TSDA_BZ_T = 2.0
+TSDA_RADII_MM = (235.0, 525.0)
+
 # Coordinate-ascent grids and stopping rule. A cut variable's candidate edges:
 # (low, high, step); time's range is the base time cut instead.
 TIME_STEP_NS = 5.0
@@ -176,6 +187,30 @@ PLOT_P_RANGE_MEV = (95.0, 110.0)
 # The EdepAna columns box mode reads, for the selected events at the tracker front.
 HELIX_COLUMNS = {"rmax": "primary_trk_front_rmax", "d0": "primary_trk_front_d0",
                  "cos": "primary_trk_front_cos"}
+
+
+def tsda_hit_fraction(rmax, d0, cos):
+    """The chance a track at the tracker front hits the TSDA, from its helix
+    center rc = (rmax + d0)/2, radius R = (rmax - d0)/2 and cos(theta).
+
+    Adiabatically (p_T^2/B conserved) it reaches the TSDA only if
+    sin^2(theta) x TSDA_BZ_T / TRACKER_BZ_T < 1; otherwise it reflects in the
+    gradient. On the way the helix center and radius both shrink by
+    k = sqrt(TRACKER_BZ_T / TSDA_BZ_T), so at the TSDA the track is at radius
+    k sqrt(rc^2 + R^2 + 2 rc R cos(phi)), and with the phase phi unknown the
+    chance is the fraction of the turn inside TSDA_RADII_MM. NaN never hits.
+    Works on arrays."""
+    rmax, d0, cos = (np.asarray(x, dtype=np.float64) for x in (rmax, d0, cos))
+    ratio = TRACKER_BZ_T / TSDA_BZ_T
+    reaches = (1.0 - cos ** 2) < ratio
+    center, radius = (rmax + d0) / 2.0, (rmax - d0) / 2.0
+    inner, outer = TSDA_RADII_MM
+    with np.errstate(divide="ignore", invalid="ignore"):
+        base, twice = center ** 2 + radius ** 2, 2.0 * center * radius
+        low = np.clip((inner ** 2 / ratio - base) / twice, -1.0, 1.0)
+        high = np.clip((outer ** 2 / ratio - base) / twice, -1.0, 1.0)
+        fraction = np.maximum(np.arccos(low) - np.arccos(high), 0.0) / np.pi
+    return np.where(reaches & np.isfinite(fraction), fraction, 0.0)
 
 
 class SensitivityError(RuntimeError):
@@ -366,12 +401,21 @@ class GeometryPopulation:
     cos: np.ndarray
     weights: np.ndarray
     norm: float
-    # CE only: each track's bin in the rebinned, unsmeared signal histogram,
-    # -1 where it has none (see `signal_bins`).
+    # The chance each track survives a veto that does not depend on the cuts
+    # (the TSDA veto), None for no veto. It scales what passes, not `norm`.
+    survival: np.ndarray | None = None
+    # Each track's momentum bin: for the CE its bin in the rebinned, unsmeared
+    # signal histogram, -1 where it has none (see `signal_bins`); for cosmics
+    # the bin its sampled momentum is in.
     bins: np.ndarray | None = None
 
     def column(self, name: str) -> np.ndarray:
         return getattr(self, name)
+
+    @property
+    def kept(self) -> np.ndarray:
+        """The weights after the veto."""
+        return self.weights if self.survival is None else self.weights * self.survival
 
     def passing(self, cuts: dict[str, tuple[float, float]],
                 skip: str | None = None) -> np.ndarray:
@@ -388,16 +432,34 @@ class GeometryPopulation:
         return keep
 
     def efficiency(self, cuts: dict[str, tuple[float, float]]) -> float:
-        return float(self.weights[self.passing(cuts)].sum() / self.norm)
+        return float(self.kept[self.passing(cuts)].sum() / self.norm)
 
 
-def cosmic_geometry_sample(shapes: CosmicShapes, n: int = COSMIC_SAMPLE_SIZE,
+def cosmic_p_bins(axis: Spectrum, shapes: CosmicShapes) -> tuple[int, int]:
+    """The first and last bins of `axis` wholly inside the shapes' momentum
+    range: where the loose cosmic rate and shapes are defined, so where a box's
+    momentum window may lie."""
+    edges = axis.edges()
+    tol = 1.0e-6 * axis.width
+    low = int(np.searchsorted(edges, shapes.p_edges[0] - tol))
+    high = int(np.searchsorted(edges, shapes.p_edges[-1] + tol, side="right")) - 2
+    if not low <= high:
+        raise SensitivityError(
+            f"the cosmic shapes' momentum range {shapes.p_edges[0]:g}-"
+            f"{shapes.p_edges[-1]:g} MeV/c holds no whole signal bin")
+    return low, high
+
+
+def cosmic_geometry_sample(shapes: CosmicShapes, axis: Spectrum,
+                           p_bins: tuple[int, int], n: int = COSMIC_SAMPLE_SIZE,
                            seed: int = COSMIC_SAMPLE_SEED) -> GeometryPopulation:
     """A fixed-seed sample of cosmic tracks.
 
     (rc, cos) is drawn from `rc_vs_cos` (a bin by its content, uniform inside
-    it) and p from the `p` histogram the same way, taking the two as
-    independent; then R = p sin(theta)/(c B), rmax = rc + R, d0 = rc - R.
+    it) and p uniformly over `axis`'s bins p_bins[0]..p_bins[1] (cosmics are
+    flat in momentum), taking the two as independent; then R = p sin(theta)/(c
+    B), rmax = rc + R, d0 = rc - R. Each track keeps its momentum bin, so the
+    geometry efficiency is counted in the box's own momentum window.
     """
     rng = np.random.default_rng(seed)
 
@@ -410,10 +472,11 @@ def cosmic_geometry_sample(shapes: CosmicShapes, n: int = COSMIC_SAMPLE_SIZE,
         return out
 
     rc, cos = draw(shapes.rc_vs_cos, shapes.rc_edges, shapes.cos_edges)
-    (p,) = draw(shapes.p_counts, shapes.p_edges)
+    bins = rng.integers(p_bins[0], p_bins[1] + 1, size=n)
+    p = axis.edges()[bins] + rng.random(n) * axis.width
     radius = p * np.sqrt(1.0 - cos ** 2) / (C_LIGHT_MEV_PER_MM_T * shapes.b_eff_t)
     return GeometryPopulation(rmax=rc + radius, d0=rc - radius, cos=cos,
-                              weights=np.ones(n), norm=float(n))
+                              weights=np.ones(n), norm=float(n), bins=bins)
 
 
 def scan_bins(signal: np.ndarray, dio: np.ndarray, cosmic: np.ndarray,
@@ -491,7 +554,10 @@ class BoxModel:
 
     The DIO and cosmic momentum spectra are rates over the whole microbunch
     and acceptance, with no time or geometry cut; a box multiplies them by its
-    efficiencies (see `rates`).
+    efficiencies (see `rates`). The cosmic geometry efficiency is that of the
+    sampled tracks in the momentum window (`cosmic_event`), since a track's
+    R(max) and d0 follow from its momentum; the window stays inside
+    `cosmic_p_bins`, the bins the sample covers.
 
     The CE signal is not a spectrum times an efficiency. Geometry cuts are
     correlated with the energy loss, so each CE event in `ce_geometry` carries
@@ -513,6 +579,7 @@ class BoxModel:
     time_max_ns: float
     cosmic_t_range: tuple[float, float]     # where cosmics are flat in time
     first_bin: int              # lowest allowed momentum bin (SIGNAL_BOX_MIN_MEV)
+    cosmic_p_bins: tuple[int, int]  # the bins the cosmic sample covers uniformly
 
     def event_signal(self, bins: tuple[int, int]) -> np.ndarray:
         """Each CE event's signal in the momentum window, weight and
@@ -521,13 +588,34 @@ class BoxModel:
         pop = self.ce_geometry
         window = self.response[a:b + 1].sum(axis=0)
         return np.where(pop.bins >= 0, window[pop.bins], 0.0) \
-            * pop.weights * self.signal_scale
+            * pop.kept * self.signal_scale
+
+    def cosmic_event(self, bins: tuple[int, int]) -> np.ndarray:
+        """Each cosmic track's count in the momentum window, before any time or
+        geometry cut: its bin's cosmic rate times its share of the sample's
+        weight in that bin, 0 outside the window. Summed over all tracks it is
+        the window's cosmic count exactly."""
+        a, b = bins
+        pop = self.cosmic_geometry
+        inside = (pop.bins >= a) & (pop.bins <= b)
+        index = np.clip(pop.bins, 0, self.cosmic.nbins - 1)
+        per_bin = np.bincount(index, weights=pop.weights,
+                              minlength=self.cosmic.nbins)
+        return np.where(inside, self.cosmic.values[index] / per_bin[index], 0.0) \
+            * pop.kept
+
+    def cosmic_spectrum(self, keep: np.ndarray) -> np.ndarray:
+        """The cosmic momentum spectrum of the sampled tracks in `keep`."""
+        pop = self.cosmic_geometry
+        return np.bincount(pop.bins[keep],
+                           weights=self.cosmic_event(self.cosmic_p_bins)[keep],
+                           minlength=self.cosmic.nbins)
 
     def signal_spectrum(self, keep: np.ndarray) -> np.ndarray:
         """The smeared signal spectrum of the CE events in `keep`."""
         pop = self.ce_geometry
         used = keep & (pop.bins >= 0)
-        hist = np.bincount(pop.bins[used], weights=pop.weights[used],
+        hist = np.bincount(pop.bins[used], weights=pop.kept[used],
                            minlength=self.signal.nbins)
         return self.response @ hist * self.signal_scale
 
@@ -544,14 +632,16 @@ class BoxModel:
         ce_t = float(ce_time_efficiency(t1, t2, self.lifetime_ns))
         cos_t = float(cosmic_time_efficiency(t1, t2, self.cosmic_t_range))
         ce_g = self.ce_geometry.efficiency(cuts)
-        cos_g = self.cosmic_geometry.efficiency(cuts)
         s, d, c = self.window_sums(cuts["p"])
+        cosmic_window = float(self.cosmic_event(cuts["p"])[
+            self.cosmic_geometry.passing(cuts)].sum())
+        cos_g = cosmic_window / c if c > 0.0 else 0.0     # in the p window
         ce_eff = ce_t * ce_g
         cos_eff = cos_t * cos_g
         in_box = self.ce_geometry.passing(cuts)
         signal = float(self.event_signal(cuts["p"])[in_box].sum()) * ce_t
         dio = d * ce_eff        # the CE's momentum-integrated efficiency
-        cosmic = c * cos_eff
+        cosmic = cos_t * cosmic_window
         background = dio + cosmic
         return {"signal": signal, "dio": dio, "cosmic": cosmic,
                 "background": background,
@@ -575,16 +665,19 @@ class BoxModel:
         t1, t2 = cuts["t"]
         ce_t = float(ce_time_efficiency(t1, t2, self.lifetime_ns))
         cos_t = float(cosmic_time_efficiency(t1, t2, self.cosmic_t_range))
-        _, d, c = self.window_sums(cuts["p"])
+        _, d, _ = self.window_sums(cuts["p"])
         ce_g = self.ce_geometry.efficiency(cuts)    # DIO's, as in `rates`
         event = self.event_signal(cuts["p"])
+        cosmic_event = self.cosmic_event(cuts["p"])
         if variable == "p":
-            ce_eff = ce_t * ce_g
-            cos_eff = cos_t * self.cosmic_geometry.efficiency(cuts)
-            found = scan_bins(self.signal_spectrum(self.ce_geometry.passing(cuts))
-                              * ce_t,
-                              self.dio.values * ce_eff,
-                              self.cosmic.values * cos_eff, self.first_bin)
+            # only inside the bins the cosmic sample covers
+            low, high = self.cosmic_p_bins
+            cosmic = self.cosmic_spectrum(self.cosmic_geometry.passing(cuts))
+            found = scan_bins(
+                (self.signal_spectrum(self.ce_geometry.passing(cuts))
+                 * ce_t)[:high + 1],
+                (self.dio.values * ce_t * ce_g)[:high + 1],
+                (cosmic * cos_t)[:high + 1], max(self.first_bin, low))
             return (None if found is None else
                     ((found["a"], found["b"]), found["fom"]))
         if variable == "t":
@@ -592,10 +685,10 @@ class BoxModel:
             ce_bins = ce_time_efficiency(edges[:-1], edges[1:], self.lifetime_ns)
             cos_bins = cosmic_time_efficiency(edges[:-1], edges[1:],
                                              self.cosmic_t_range)
-            cos_g = self.cosmic_geometry.efficiency(cuts)
+            cos_c = float(cosmic_event[self.cosmic_geometry.passing(cuts)].sum())
             ce_s = float(event[self.ce_geometry.passing(cuts)].sum())
             found = scan_bins(ce_s * ce_bins, d * ce_g * ce_bins,
-                              c * cos_g * cos_bins)
+                              cos_c * cos_bins)
             if found is None:
                 return None
             return ((float(edges[found["a"]]), float(edges[found["b"] + 1])),
@@ -607,13 +700,14 @@ class BoxModel:
         edges = np.concatenate(([-np.inf], grid, [np.inf]))
         hists = []
         # The CE is histogrammed twice: by weight (the efficiency DIO takes)
-        # and by signal in the window (the signal count itself).
+        # and by signal in the window (the signal count itself); the cosmics
+        # by their count in the window.
         for pop, per_event in ((self.ce_geometry, None),
                                (self.ce_geometry, event),
-                               (self.cosmic_geometry, None)):
+                               (self.cosmic_geometry, cosmic_event)):
             keep = pop.passing(cuts, skip=variable)
             values = pop.column(variable)[keep]
-            weights = (pop.weights[keep] / pop.norm if per_event is None
+            weights = (pop.kept[keep] / pop.norm if per_event is None
                        else per_event[keep])
             finite = np.isfinite(values)
             index = np.searchsorted(grid, values[finite], side="right")
@@ -621,7 +715,7 @@ class BoxModel:
                                      minlength=edges.size - 1))
         ce_eff_hist, ce_signal_hist, cos_hist = hists
         found = scan_bins(ce_t * ce_signal_hist, d * ce_t * ce_eff_hist,
-                          c * cos_t * cos_hist,
+                          cos_t * cos_hist,
                           first=1 if variable == "rmax" else 0)
         if found is None:
             return None
@@ -629,17 +723,25 @@ class BoxModel:
                 found["fom"])
 
     def start_cuts(self, p_bins: tuple[int, int]) -> dict:
-        """The starting box: the momentum-only window, the reference cuts
-        (time clipped to the base window) and no d0 cut."""
+        """The starting box: the momentum-only window (clipped to the cosmic
+        sample's bins), the reference cuts (time clipped to the base window)
+        and no d0 cut."""
         low = max(REFERENCE_TIME_NS[0], self.time_min_ns)
         high = min(REFERENCE_TIME_NS[1], self.time_max_ns)
         if not low < high:
             low, high = self.time_min_ns, self.time_max_ns
-        return {"p": p_bins, "t": (low, high), "rmax": REFERENCE_RMAX_MM,
+        p_low = max(p_bins[0], self.cosmic_p_bins[0], self.first_bin)
+        p_high = min(p_bins[1], self.cosmic_p_bins[1])
+        if not p_low <= p_high:
+            p_low = max(self.cosmic_p_bins[0], self.first_bin)
+            p_high = self.cosmic_p_bins[1]
+        return {"p": (p_low, p_high), "t": (low, high), "rmax": REFERENCE_RMAX_MM,
                 "d0": (-np.inf, np.inf), "cos": REFERENCE_COS}
 
     def optimize(self, p_bins: tuple[int, int]) -> tuple[dict, dict, list[dict], dict]:
-        """Coordinate ascent on the Punzi FoM from `start_cuts`.
+        """Coordinate ascent on the Punzi FoM from `start_cuts`, or from open
+        geometry when no CE passes the reference geometry cuts (a step moves
+        one variable, so it could not leave a start with no signal).
 
         Each step re-optimizes one variable's (low, high) jointly with the
         others held, and is kept only if it does not lower the FoM (the
@@ -649,6 +751,9 @@ class BoxModel:
         """
         cuts = self.start_cuts(p_bins)
         fom = self.rates(cuts)["fom"]
+        if not fom > 0.0:
+            cuts.update({name: (-np.inf, np.inf) for name in GEOMETRY_VARIABLES})
+            fom = self.rates(cuts)["fom"]
         start = {"cuts": dict(cuts), "fom": fom}
         sweeps = []
         for number in range(1, MAX_SWEEPS + 1):
@@ -765,7 +870,8 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
 
     Counts are expected events in the box's normalization (the box rate
     formula with the cuts left out). "nominal" has only the base selection:
-    the time window and PLOT_P_RANGE_MEV, no box cuts. "after" has every
+    the time window and PLOT_P_RANGE_MEV (inside the cosmic sample's bins), no
+    box cuts. "after" has every
     optimized cut but the variable's own. The CE counts ("ce_nominal",
     "ce_after") are the correlated per-event signal in the same windows; in
     momentum it is the smeared spectrum of the passing events, in time the
@@ -774,16 +880,20 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     """
     pop = model.cosmic_geometry
     centers = model.cosmic.centers()
+    bins = np.arange(centers.size)
     in_range = np.flatnonzero((centers >= PLOT_P_RANGE_MEV[0])
-                              & (centers <= PLOT_P_RANGE_MEV[1]))
+                              & (centers <= PLOT_P_RANGE_MEV[1])
+                              & (bins >= model.cosmic_p_bins[0])
+                              & (bins <= model.cosmic_p_bins[1]))
     p_range = (int(in_range[0]), int(in_range[-1]))
     cosmic_nominal = model.window_sums(p_range)[2]
-    cosmic_cut = model.window_sums(cuts["p"])[2]
+    cosmic_event_nominal = model.cosmic_event(p_range)
+    cosmic_event_cut = model.cosmic_event(cuts["p"])
     t1, t2 = cuts["t"]
     time_nominal = float(cosmic_time_efficiency(
         model.time_min_ns, model.time_max_ns, model.cosmic_t_range))
     time_cut = float(cosmic_time_efficiency(t1, t2, model.cosmic_t_range))
-    geometry_cut = pop.efficiency(cuts)
+    cosmic_in_cut = pop.passing(cuts)
     open_geometry = {name: (-np.inf, np.inf) for name in GEOMETRY_VARIABLES}
     no_geometry = {**cuts, **open_geometry}
     ce = model.ce_geometry
@@ -796,7 +906,7 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     ce_in_cut = ce.passing(cuts)
 
     panels = []
-    # momentum: flat per bin
+    # momentum: flat per bin before the geometry cuts, the passing sample after
     p_edges = model.cosmic.edges()[p_range[0]:p_range[1] + 2]
     p_values = model.cosmic.values[p_range[0]:p_range[1] + 1]
     centers_low = centers[cuts["p"][0]]
@@ -804,7 +914,8 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     panels.append({
         "name": "p", "edges": p_edges,
         "nominal": p_values * time_nominal,
-        "after": p_values * time_cut * geometry_cut,
+        "after": time_cut * model.cosmic_spectrum(
+            cosmic_in_cut)[p_range[0]:p_range[1] + 1],
         "ce_nominal": ce_time_nominal * model.signal_spectrum(
             ce_in_nominal)[p_range[0]:p_range[1] + 1],
         "ce_after": ce_time_cut * model.signal_spectrum(
@@ -818,7 +929,7 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     panels.append({
         "name": "t", "edges": t_edges,
         "nominal": cosmic_nominal * widths,
-        "after": cosmic_cut * geometry_cut * widths,
+        "after": cosmic_event_cut[cosmic_in_cut].sum() * widths,
         "ce_nominal": ce_event_nominal[ce_in_nominal].sum() * ce_widths,
         "ce_after": ce_event_cut[ce_in_cut].sum() * ce_widths,
         "band": (float(t1), float(t2))})
@@ -826,13 +937,14 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
         grid = grid_edges(GEOMETRY_GRIDS[name])
         values = pop.column(name)
         counts, ce_counts = [], []
-        for scale, geometry, event, ce_time in (
-                (cosmic_nominal * time_nominal, no_geometry, ce_event_nominal,
-                 ce_time_nominal),
-                (cosmic_cut * time_cut, cuts, ce_event_cut, ce_time_cut)):
+        for time, cosmic_event, geometry, event, ce_time in (
+                (time_nominal, cosmic_event_nominal, no_geometry,
+                 ce_event_nominal, ce_time_nominal),
+                (time_cut, cosmic_event_cut, cuts, ce_event_cut, ce_time_cut)):
             keep = pop.passing(geometry, skip=name)
-            hist, _ = np.histogram(values[keep], bins=grid)
-            counts.append(hist * scale / pop.norm)
+            hist, _ = np.histogram(values[keep], bins=grid,
+                                   weights=cosmic_event[keep])
+            counts.append(hist * time)
             keep = ce.passing(geometry, skip=name)
             hist, _ = np.histogram(ce.column(name)[keep], bins=grid,
                                    weights=event[keep])
@@ -947,7 +1059,8 @@ def signal_efficiency(variables: dict[str, np.ndarray], mask: np.ndarray,
 
 BOX_CUT_METRICS = ("time_low_ns", "time_high_ns", "rmax_low_mm", "rmax_high_mm",
                    "d0_low_mm", "d0_high_mm", "cos_low", "cos_high",
-                   "ce_box_efficiency", "cosmic_box_efficiency")
+                   "ce_box_efficiency", "cosmic_box_efficiency",
+                   "ce_tsda_survival", "cosmic_tsda_survival")
 NO_BOX_METRICS = {name: -1.0 for name in BOX_CUT_METRICS}
 
 
@@ -980,14 +1093,23 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
             "there is no CE geometry to cut on")
 
     shapes = load_cosmic_shapes()
+    p_bins_cosmic = cosmic_p_bins(signal, shapes)
+    cosmic_geometry = cosmic_geometry_sample(shapes, signal, p_bins_cosmic)
+    tsda = bool(params["tsda_veto"])
+    if tsda:
+        ce_geometry = replace(ce_geometry, survival=1.0 - tsda_hit_fraction(
+            ce_geometry.rmax, ce_geometry.d0, ce_geometry.cos))
+        cosmic_geometry = replace(cosmic_geometry, survival=1.0 - tsda_hit_fraction(
+            cosmic_geometry.rmax, cosmic_geometry.d0, cosmic_geometry.cos))
     model = BoxModel(
         signal=signal, dio=dio, cosmic=cosmic, ce_geometry=ce_geometry,
-        cosmic_geometry=cosmic_geometry_sample(shapes),
+        cosmic_geometry=cosmic_geometry,
         response=smearing_matrix(signal, kernel), signal_scale=signal_scale,
         lifetime_ns=params["muon_lifetime_ns"],
         time_min_ns=params["time_min_ns"], time_max_ns=params["time_max_ns"],
         cosmic_t_range=shapes.t_range,
-        first_bin=int(np.searchsorted(signal.centers(), SIGNAL_BOX_MIN_MEV)))
+        first_bin=int(np.searchsorted(signal.centers(), SIGNAL_BOX_MIN_MEV)),
+        cosmic_p_bins=p_bins_cosmic)
     centers = signal.centers()
     p_bins = (int(np.argmin(np.abs(centers - momentum_best["low_mev"]))),
               int(np.argmin(np.abs(centers - momentum_best["high_mev"]))))
@@ -1014,6 +1136,11 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
     # time x momentum-integrated geometry, as before the correlation was kept
     metrics["ce_box_efficiency"] = rates["ce_efficiency"]
     metrics["cosmic_box_efficiency"] = rates["cosmic_efficiency"]
+    # before any box cut; -1 without the veto
+    ce_tsda = float(ce_geometry.kept.sum() / ce_geometry.norm) if tsda else -1.0
+    cosmic_tsda = float(cosmic_geometry.kept.sum() / cosmic_geometry.norm) if tsda else -1.0
+    metrics["ce_tsda_survival"] = ce_tsda
+    metrics["cosmic_tsda_survival"] = cosmic_tsda
 
     def span(name: str, unit: str) -> str:
         low, high = reported(name)
@@ -1039,7 +1166,8 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
         "(the difference is the energy-loss correlation, which the signal keeps)",
         f"  cosmic efficiency time {rates['cosmic_time']:.4g} (flat over "
         f"{shapes.t_range[0]:g}-{shapes.t_range[1]:g} ns) x geometry "
-        f"{rates['cosmic_geometry']:.4g} = {rates['cosmic_efficiency']:.4g}",
+        f"{rates['cosmic_geometry']:.4g} = {rates['cosmic_efficiency']:.4g}"
+        " (geometry in the momentum window)",
         "  cosmic_rate_per_s_per_mev is the rate for the loose selection of the "
         "cosmic shapes (e-, 100 < p < 110 MeV/c, no t0, cos, R(max) or d0 cut)",
         f"  loose/tight Run-1A yield ratio {shapes.loose_to_tight_ratio:.4g} "
@@ -1047,6 +1175,11 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
         f"{REFERENCE_COS[0]:g} < cos < {REFERENCE_COS[1]:g}, "
         f"{REFERENCE_RMAX_MM[0]:g} < R(max) < {REFERENCE_RMAX_MM[1]:g} mm); "
         "applied to the default rate only",
+        (f"  TSDA veto (fast sim: reaches it if sin^2(theta) x {TSDA_BZ_T:g} T / "
+         f"{TRACKER_BZ_T:g} T < 1, hits {TSDA_RADII_MM[0]:g}-{TSDA_RADII_MM[1]:g} mm "
+         f"averaged over the helix phase): CE survival {ce_tsda:.4g}, cosmic "
+         f"survival {cosmic_tsda:.4g} before the box cuts; DIO takes the CE's"
+         if tsda else "  TSDA veto: not applied (tsda_veto = 0)"),
         f"  S = {rates['signal']:.3g}, DIO = {rates['dio']:.3g}, "
         f"cosmic = {rates['cosmic']:.3g} -> B = {rates['background']:.3g}, "
         f"S/sqrt(B) = {rates['sensitivity']:.4g}, Punzi FoM = {rates['fom']:.4g} "
@@ -1078,6 +1211,13 @@ def run(context: RunContext) -> RunOutcome:
             f"time_min_ns ({time_min_ns:g}) must be below time_max_ns "
             f"({time_max_ns:g}): they are the base time window the box "
             "optimization scans inside"))
+    if context.params["tsda_veto"] not in (0, 1):
+        return RunOutcome(error=(
+            f"tsda_veto must be 0 or 1, got {context.params['tsda_veto']:g}"))
+    if context.params["tsda_veto"] and cut_mode != "box":
+        return RunOutcome(error=(
+            "tsda_veto = 1 needs cut_mode='box': the veto is worked out from "
+            "the tracker-front helix, which momentum mode does not read"))
     sig_eff = context.params["sig_eff"]
     stops_per_pot = context.params["stops_per_pot"]
     if np.isnan(sig_eff) or np.isnan(stops_per_pot):
@@ -1093,14 +1233,15 @@ def run(context: RunContext) -> RunOutcome:
     npot = context.params["npot"]
     cosmic_rate_per_s_per_mev = context.params["cosmic_rate_per_s_per_mev"]
     cosmic_rate_source = "user" if cosmic_rate_per_s_per_mev > 0.0 else "mode default"
-    if cosmic_rate_source == "mode default":
-        cosmic_rate_per_s_per_mev = recommended_cosmic_rate(cut_mode)
     mean_pot_per_event = context.params["mean_pot_per_event"]
     selection = context.params["selection"]
     outdir = context.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
     try:
+        if cosmic_rate_source == "mode default":
+            # box mode reads the cosmic shapes, which may be missing
+            cosmic_rate_per_s_per_mev = recommended_cosmic_rate(cut_mode)
         variables = read_edep_tree(context.input_path)
         if cut_mode == "box" and HELIX_COLUMNS["rmax"] not in variables:
             raise SensitivityError(
@@ -1426,6 +1567,22 @@ SPEC = AnalysisSpec(
                         "optimization only tightens it. Ignored in momentum "
                         "mode.",
             default=TIME_MAX_NS, minimum=0.0, maximum=MICROBUNCH_NS,
+        ),
+        ParamSpec(
+            name="tsda_veto",
+            description="1 applies a fast-sim TSDA veto in cut_mode 'box' "
+                        "(0, the default, does not): reco vetoes a track whose "
+                        "upstream extrapolation reaches the TS downstream "
+                        "absorber instead of reflecting in the DS gradient. "
+                        "A track reaches it if sin^2(theta) x 2 T / 1 T < 1 "
+                        "(rough nominal fields at the TSDA and the tracker "
+                        "front); its chance of hitting the 235-525 mm annulus "
+                        "is the fraction of its helix turn there, center and "
+                        "radius shrunk by sqrt(1 T / 2 T). It weights CE and "
+                        "cosmic tracks alike, DIO takes the CE's efficiency, "
+                        "and ce_tsda_survival / cosmic_tsda_survival report "
+                        "the surviving fractions (-1 when off).",
+            default=0, minimum=0, maximum=1,
         ),
         ParamSpec(
             name="selection",

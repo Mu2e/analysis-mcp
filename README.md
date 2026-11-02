@@ -939,6 +939,20 @@ lifetime in aluminum), `time_min_ns` / `time_max_ns` (default 525 / 1650: the
 base time cut, which the time optimization may only tighten). In momentum mode
 the time window is **not** applied.
 
+`tsda_veto` (box mode only, default 0) set to 1 adds a fast-sim version of the
+reco TSDA veto, which rejects a track whose upstream extrapolation reaches the
+TS downstream absorber (an annulus, 235 < r < 525 mm) instead of reflecting
+in the DS gradient. With rough nominal fields, 1 T at the tracker front and
+2 T at the TSDA (no field map), a track reaches it if
+sin^2(theta) x 2 T / 1 T < 1 (cos(theta) > 0.707, from p_T^2/B conserved). Its
+helix center rc = (R(max) + d0)/2 and radius R = (R(max) - d0)/2 shrink by
+sqrt(1/2) on the way, and with the phase at the TSDA unknown its chance of
+hitting is the fraction of the turn inside the annulus. Each CE event and
+cosmic sample point is weighted by 1 - that chance; DIO takes the CE's
+efficiency. `ce_tsda_survival` and `cosmic_tsda_survival` report the
+surviving fractions before the box cuts (-1 when off). A box whose cos cut
+stays below 0.707 is unaffected, since nothing in it reaches the TSDA.
+
 Model. For the cosmics, momentum, time and the (helix-center radius rc, cos)
 distribution are taken as mutually separable; for the CE only time is separable
 from the rest, momentum and geometry are not (see S below). For a box [p1,p2] x [t1,t2] x
@@ -951,9 +965,13 @@ R(max) x d0 x cos:
 - CE geometry is counted per event: the weighted fraction of the selected
   events that reached the tracker front whose (R(max), d0, cos) pass.
 - Cosmic geometry is a fixed-seed sample (200k points) drawn from the shapes
-  file's `rc_vs_cos` (bin by content, uniform inside it) with p drawn from its
-  `p` histogram (100-110 MeV/c) and R = p sin(theta) / (0.299792458 B), B the
-  effective field 1.036 T; R(max) = rc + R, d0 = rc - R.
+  file's `rc_vs_cos` (bin by content, uniform inside it) with p flat over the
+  signal bins inside the shapes' momentum range (100-110 MeV/c) and
+  R = p sin(theta) / (0.299792458 B), B the effective field 1.036 T;
+  R(max) = rc + R, d0 = rc - R. Each point keeps its momentum bin, so the
+  geometry efficiency is counted in the box's own p window (R(max) and d0 grow
+  with p: a high R(max) cut passes only high-momentum cosmics). The p window is
+  therefore kept inside 100-110 MeV/c, where the loose rate is defined.
 - S = eps_CE,t x the sum, over the CE events passing the geometry cuts, of
   weight x W(bin) x (the signal's per-entry normalization), W(j) being the
   fraction of a unit entry in signal bin j that the tracker-resolution smearing
@@ -969,8 +987,10 @@ R(max) x d0 x cos:
   momentum-integrated geometry efficiency: **a known first-order
   approximation**, the DIO's time and geometry efficiencies are taken equal to
   the CE's; DIO is a different momentum spectrum, so the CE's in-window
-  correlation does not transfer. Cosmic = (cosmic spectrum summed over the p window) x eps_cos,t x
-  eps_cos,geom, with no further scaling. Window sums are direct slice sums.
+  correlation does not transfer. Cosmic = eps_cos,t x the sum over the p
+  window of (cosmic spectrum in the bin) x (the sample's geometry efficiency
+  in that bin), with no further scaling; `cosmic_box_efficiency` is eps_cos,t
+  x the geometry efficiency in the window. Window sums are direct slice sums.
 - Because the box applies the time/R(max)/d0/cos cuts explicitly, `sig_eff`
   must **not** include their efficiency (nor may `selection`, when
   `stops_per_pot` takes the acceptance from it).
@@ -991,13 +1011,15 @@ reports the ratio). In box mode `momentum_only_sensitivity` is computed with
 this loose-selection rate, so it is not the number momentum mode gives by
 default.
 
-Optimization. It starts from the momentum-only window, the tight Run-1A cuts
-(time clipped to the base window) and no d0 cut. Each step re-optimizes one
+Optimization. It starts from the momentum-only window (clipped to the cosmic
+sample's 100-110 MeV/c), the tight Run-1A cuts (time clipped to the base
+window) and no d0 cut; if no CE passes those geometry cuts it starts from open
+geometry instead, since a step that moves one variable could not leave it. Each step re-optimizes one
 variable's (low, high) pair jointly on a grid with the others fixed, by
 histogramming the variable for the events/sample points passing the other cuts
 and using cumulative sums outward from each lower edge (O(N + G^2)); a step is
 kept only if it does not lower the FoM. Order p, t, R(max), d0, cos.
-Grids: p = the spectrum bins (>= 50 MeV), t 5 ns steps inside the base window,
+Grids: p = the spectrum bins in 100-110 MeV/c, t 5 ns steps inside the base window,
 R(max) 400-1100 mm in 5 mm, d0 -700..700 mm in 5 mm, cos 0..1 in 0.005 (the
 d0 and cos grids have under/overflow bins, so a cut at a grid end is open on
 that side). R(max) is never open below: a track needs R(max) > 400 mm to have
@@ -1017,7 +1039,7 @@ or box in both modes. The log lists the final cuts, efficiencies, the
 loose/tight ratio and each sweep's FoM. Box mode adds one PNG per
 variable in `figures/` (`box_p.png`, `box_t.png`, `box_rmax.png`,
 `box_d0.png`, `box_cos.png`): the cosmic distribution as expected counts per
-bin in the optimized configuration, "nominal" (base time window, p in 95-110
+bin in the optimized configuration, "nominal" (base time window, p in 100-110
 MeV/c, no box cuts) and "after the other cuts" (all optimized cuts but this
 variable's), with the selected range shaded. The CE signal is overlaid on a
 right-hand axis ("Expected CE counts / bin", dashed blue for "after", dotted
