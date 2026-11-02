@@ -150,6 +150,13 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   from each window's own edge, never as differences of prefix sums: the DIO
   spectrum spans ~18 orders of magnitude, and cancellation silently zeroes
   the background. A test locks this in.
+- **`approx_ce_sensitivity`'s `cut_mode="box"`** needs the tracker-front
+  helix branches (Offline PR #2092, not yet in a Musing); the default
+  `"momentum"` mode must keep reproducing the old numbers (a test locks
+  them). Box mode optimizes the Punzi FoM, not S/sqrt(B), which diverges
+  as the background is cut to zero. Its cosmic shapes ship in `data/`
+  (`cosmic_shapes.root`/`.json`): regenerate them with
+  `scripts/extract_cosmic_shapes.py`, never edit them by hand.
 
 ## Style
 

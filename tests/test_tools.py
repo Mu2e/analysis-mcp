@@ -9,6 +9,8 @@ covered by them as soon as it is added to registry.py.
 """
 
 import contextlib
+import tempfile
+from dataclasses import replace
 import sys
 from pathlib import Path
 
@@ -16,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import math
 import numpy as np
-
 from tools import ANALYSES, list_analyses, run_analysis
 from tools.analyses import approx_ce_sensitivity as sens
 from tools.analyses import edep as edep_mod
@@ -865,8 +866,12 @@ def test_edep_optional_step_branches_are_variables_only_where_present(tmp_dir):
 
 
 def _write_edep_tree(path: Path, n: int = 4000, ngen_total: int | None = None,
-                     with_steps: bool = False) -> None:
+                     with_steps: bool = False, with_helix: bool = False) -> None:
     """A CE-like EdepAna tree: ~105 MeV electrons losing a little on the way.
+
+    `with_helix` adds the tracker-front helix branches: cos ~ 0.45-0.75, helix
+    centers around 330 mm, with the EdepAna sentinels (-1, and cos 0) on every
+    20th event, which has no front step and so no helix.
 
     `ngen` is EdepAna's running generated-event count, raised at each subrun;
     with `ngen_total` it climbs to that over the file, else it is n throughout.
@@ -895,6 +900,19 @@ def _write_edep_tree(path: Path, n: int = 4000, ngen_total: int | None = None,
         for det in ("calo", "trk"):
             for cut in ("", "_ecut", "_ecut_tcut"):
                 tree[f"event_{det}_nsteps{cut}"] = np.arange(n, dtype=np.int32)
+    if with_helix:
+        hrng = np.random.default_rng(2)
+        cos = hrng.uniform(0.45, 0.75, n)
+        radius = 104.0 * np.sqrt(1.0 - cos ** 2) / (0.299792458 * 1.036)
+        rc = hrng.normal(330.0, 40.0, n)
+        nofront = np.arange(n) % 20 == 0
+        tree["primary_trk_front_p"] = one(np.where(nofront, 0.0, front).astype(np.float32))
+        tree["primary_trk_front_energy"] = tree["primary_trk_front_p"]
+        for name, values, sentinel in (
+                ("r_center", rc, -1.0), ("radius", radius, -1.0),
+                ("cos", cos, 0.0), ("time", hrng.uniform(600, 1600, n), -1.0)):
+            tree[f"primary_trk_front_{name}"] = one(
+                np.where(nofront, sentinel, values).astype(np.float32))
     zeros = np.zeros(n, dtype=np.float32)
     for name in ("x", "y", "z", "px", "py", "pz", "m"):
         tree[f"primary_start_{name}"] = one(zeros)
@@ -3858,7 +3876,7 @@ def test_list_analyses_reports_every_registered_analysis():
     assert ce["parameters"]["npot"]["required"] is False
     cosmic = ce["parameters"]["cosmic_rate_per_s_per_mev"]
     assert cosmic["required"] is False
-    assert cosmic["default"] == sens.COSMIC_RATE_PER_SECOND_PER_MEV
+    assert cosmic["default"] == 0.0     # 0: the recommended rate for cut_mode
     # the normalization a result was built on is reported with it
     assert {"npot", "cosmic_rate_per_s_per_mev"} <= set(ce["metrics"])
     assert ce["units"]["npot"] == "POT"
@@ -3909,7 +3927,8 @@ def test_unknown_parameter_is_reported(tmp_dir):
 def test_cosmic_rate_defaults_to_the_modules_assumption():
     spec = ANALYSES["approx_ce_sensitivity"]
     params = spec.resolve_params({"sig_eff": 0.1})
-    assert params["cosmic_rate_per_s_per_mev"] == sens.COSMIC_RATE_PER_SECOND_PER_MEV
+    assert params["cosmic_rate_per_s_per_mev"] == 0.0     # resolved by cut_mode
+    assert sens.recommended_cosmic_rate("momentum") == sens.COSMIC_RATE_PER_SECOND_PER_MEV
     # and a supplied value is what reaches the run
     params = spec.resolve_params({"sig_eff": 0.1, "cosmic_rate_per_s_per_mev": 5.0e-3})
     assert params["cosmic_rate_per_s_per_mev"] == 5.0e-3
@@ -4506,6 +4525,612 @@ def test_unknown_analysis_is_rejected(tmp_dir):
     except Exception:
         return  # pydantic rejected it, as intended
     raise AssertionError("unknown analysis name was not rejected")
+
+
+# --- approx_ce_sensitivity: box cuts and the tracker-front helix ----------------
+
+NEW_BOX_METRICS = ("time_low_ns", "time_high_ns", "rmax_low_mm", "rmax_high_mm",
+                   "d0_low_mm", "d0_high_mm", "cos_low", "cos_high",
+                   "ce_box_efficiency", "cosmic_box_efficiency")
+
+
+def _helix_branches():
+    """_edep_branches() plus the helix branches: event 2 has a front step
+    (r_center 300, R 250, cos 0.6), event 1 none (EdepAna's sentinels), and
+    event 0 no primary at all."""
+    branches = _edep_branches()
+    def per_event(*values):
+        out = np.empty(len(values), dtype=object)
+        out[:] = [np.asarray(v, dtype=np.float32) for v in values]
+        return out
+    branches["primary_trk_front_r_center"] = per_event([], [-1.0], [300.0, 0.0])
+    branches["primary_trk_front_radius"] = per_event([], [-1.0], [250.0, 0.0])
+    branches["primary_trk_front_cos"] = per_event([], [0.0], [0.6, 0.0])
+    branches["primary_trk_front_time"] = per_event([], [-1.0], [900.0, 0.0])
+    return branches
+
+
+def test_edep_helix_variables_are_derived_and_undefined_is_nan():
+    v = edep_mod.edep_variables(_helix_branches())
+    assert set(v) == (set(edep_mod.EDEP_VARIABLES)
+                      | set(edep_mod.HELIX_EDEP_VARIABLES))
+    assert v["primary_trk_front_rmax"][2] == 550.0           # rc + R
+    assert v["primary_trk_front_d0"][2] == 50.0              # rc - R = rmax - 2R
+    assert abs(v["primary_trk_front_cos"][2] - 0.6) < 1e-6
+    assert v["primary_trk_front_time"][2] == 900.0
+    for name in edep_mod.HELIX_EDEP_VARIABLES:               # no primary, no front
+        assert np.isnan(v[name][0]) and np.isnan(v[name][1]), name
+    # a defined front with an undefined helix (neutral, zero field) is NaN too
+    branches = _helix_branches()
+    branches["primary_trk_front_radius"][2][0] = -1.0
+    v = edep_mod.edep_variables(branches)
+    assert np.isnan(v["primary_trk_front_rmax"][2]) and np.isnan(v["primary_trk_front_d0"][2])
+    assert v["primary_trk_front_r_center"][2] == 300.0
+    for name in v:                      # every advertised variable is usable
+        edep_mod.select_events(v, f"{name} == {name}")
+
+
+def test_edep_helix_branches_are_optional_when_reading(tmp_dir):
+    plain = Path(tmp_dir) / "nts.owner.edep.plain.root"
+    helix = Path(tmp_dir) / "nts.owner.edep.helix.root"
+    _write_edep_tree(plain, n=40)
+    _write_edep_tree(helix, n=40, with_helix=True)
+    assert set(edep_mod.read_edep_tree(plain)) == set(edep_mod.EDEP_VARIABLES)
+    new = edep_mod.read_edep_tree(helix)
+    assert set(new) == set(edep_mod.EDEP_VARIABLES) | set(edep_mod.HELIX_EDEP_VARIABLES)
+    assert np.isnan(new["primary_trk_front_rmax"][0])        # event 0 has no front
+    assert np.isfinite(new["primary_trk_front_rmax"][1:20]).all()
+    assert (new["primary_trk_front_cos"][1:20] > 0.4).all()
+    for name in edep_mod.HELIX_EDEP_VARIABLES:
+        edep_mod.select_events(new, f"{name} == {name}")
+    # a mixed set of files has them for neither
+    assert set(edep_mod.read_edep_tree([plain, helix])) == set(edep_mod.EDEP_VARIABLES)
+    # naming one on a file without them is a plain error
+    try:
+        edep_mod.select_events(edep_mod.read_edep_tree(plain),
+                               "primary_trk_front_rmax > 400")
+        raise AssertionError("no error")
+    except edep_mod.EdepTreeError as exc:
+        assert "helix" in str(exc) and "primary_trk_front_rmax" in str(exc)
+
+
+def test_box_time_efficiencies_match_hand_values():
+    tau, big_t = 864.0, sens.MICROBUNCH_NS
+    assert np.isclose(sens.MICROBUNCH_NS, sens.ONSPILL_SECONDS_PER_EVENT * 1e9)
+    full = sens.ce_time_efficiency(0.0, big_t, tau)
+    assert np.isclose(full, 1.0)
+    hand = (np.exp(-525.0 / tau) - np.exp(-1650.0 / tau)) / (1.0 - np.exp(-big_t / tau))
+    assert np.isclose(sens.ce_time_efficiency(525.0, 1650.0, tau), hand)
+    assert abs(hand - 0.4614) < 1e-3                         # value worked by hand
+    # additive over adjacent windows
+    assert np.isclose(sens.ce_time_efficiency(500.0, 700.0, tau)
+                      + sens.ce_time_efficiency(700.0, 900.0, tau),
+                      sens.ce_time_efficiency(500.0, 900.0, tau))
+    # cosmics: flat over the shapes' time range (400-1700 ns), overlap / width
+    rng = (400.0, 1700.0)
+    assert np.isclose(sens.cosmic_time_efficiency(525.0, 1650.0, rng), 1125.0 / 1300.0)
+    assert sens.cosmic_time_efficiency(0.0, 300.0, rng) == 0.0
+    assert np.isclose(sens.cosmic_time_efficiency(0.0, 1695.0, rng), 1295.0 / 1300.0)
+    assert np.allclose(sens.cosmic_time_efficiency(np.array([400.0, 1000.0]),
+                                                   np.array([1000.0, 1700.0]), rng),
+                       [600.0 / 1300.0, 700.0 / 1300.0])
+
+
+def test_cosmic_shapes_load_from_the_repo_and_sample_deterministically():
+    shapes = sens.load_cosmic_shapes()
+    assert sens.COSMIC_SHAPES_ROOT.parent == Path(sens.__file__).resolve().parents[2] / "data"
+    assert np.isclose(shapes.b_eff_t, 1.036, atol=1e-3)
+    assert shapes.t_range == (400.0, 1700.0)
+    assert np.isclose(shapes.loose_to_tight_ratio, 1.0 / 0.0320292, rtol=1e-4)
+    axis = Spectrum(np.zeros(750), 0.0, 0.2)       # the rebinned signal axis
+    p_bins = sens.cosmic_p_bins(axis, shapes)
+    assert p_bins == (500, 549)                     # 100-110 MeV/c, whole bins
+    one = sens.cosmic_geometry_sample(shapes, axis, p_bins, n=50_000)
+    two = sens.cosmic_geometry_sample(shapes, axis, p_bins, n=50_000)
+    for name in ("rmax", "d0", "cos", "bins"):
+        assert np.array_equal(one.column(name), two.column(name)), name
+    # p is flat over the bins, each track in its own
+    counts = np.bincount(one.bins - 500, minlength=50)
+    assert counts.size == 50 and counts.min() > 0.8 * counts.mean()
+    # cos reproduces the histogram's marginal; rc = (rmax + d0)/2 its other axis
+    marginal = shapes.rc_vs_cos.sum(axis=0)
+    drawn, _ = np.histogram(one.cos, bins=shapes.cos_edges)
+    assert np.abs(drawn / drawn.sum() - marginal / marginal.sum()).max() < 0.01
+    rc_marginal = shapes.rc_vs_cos.sum(axis=1)
+    rc_drawn, _ = np.histogram((one.rmax + one.d0) / 2.0, bins=shapes.rc_edges)
+    assert np.abs(rc_drawn / rc_drawn.sum() - rc_marginal / rc_marginal.sum()).max() < 0.01
+    # R = (rmax - d0)/2 follows R = p sin(theta)/(c B), p inside its own bin
+    radius = (one.rmax - one.d0) / 2.0
+    p = radius * 0.299792458 * shapes.b_eff_t / np.sqrt(1.0 - one.cos ** 2)
+    assert np.all(np.abs(p - (100.1 + 0.2 * (one.bins - 500))) <= 0.1 + 1e-9)
+
+
+def test_scan_bins_maximizes_punzi_fom_and_sums_from_each_edge():
+    n = 200
+    centers = 50.0 + 0.2 * (np.arange(n) + 0.5)
+    sig = np.where(np.abs(centers - 70.0) < 0.5, 100.0, 0.0)
+    dio = np.logspace(14, -4, n)          # 18 orders of magnitude
+    cos = np.full(n, 0.01)
+    found = sens.scan_bins(sig, dio, cos)
+    # brute force over every window, each summed directly
+    brute = max((sens.punzi_fom(sig[a:b + 1].sum(), dio[a:b + 1].sum() + cos[a:b + 1].sum()), a, b)
+                for a in range(n) for b in range(a, n) if sig[a:b + 1].sum() > 0.0)
+    assert np.isclose(found["fom"], brute[0])
+    assert (found["a"], found["b"]) == brute[1:]
+    assert found["dio"] > 0.0 and np.isclose(found["dio"], dio[found["a"]:found["b"] + 1].sum())
+    # zero background stays finite: the FoM is S/(a/2), not a division by zero
+    zero = sens.scan_bins(sig, np.zeros(n), np.zeros(n))
+    assert np.isclose(zero["fom"], sig.sum() / (sens.PUNZI_A / 2))
+    # nothing usable: no signal
+    assert sens.scan_bins(np.zeros(n), dio, cos) is None
+
+
+def test_momentum_mode_is_unchanged_from_the_pre_box_code(tmp_dir):
+    """Values the code before cut_mode produced for this file (all defaults
+    but sig_eff), recorded then; momentum mode is the default."""
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"sig_eff": 0.5})
+    assert result.status == "success", result.message
+    m = result.metadata
+    assert m["cut_mode"] == "momentum" and m["cosmic_rate_source"] == "mode default"
+    old = {"sensitivity": 12613.71099771596, "signal_box_low_mev": 104.7,
+           "signal_box_high_mev": 105.10000000000001,
+           "signal_rate": 12627.233815454798,
+           "dio_background": 0.1872414489880054,
+           "cosmic_background": 0.814903846153846,
+           "total_background": 1.0021452951418515,
+           "cosmic_rate_per_s_per_mev": 1.282051282051282e-05}
+    for name, value in old.items():
+        assert m[name] == value, (name, m[name], value)
+    # the new metrics are always reported: -1 here, and the momentum-only FoM
+    for name in NEW_BOX_METRICS:
+        assert m[name] == -1.0, name
+    assert m["momentum_only_sensitivity"] == old["sensitivity"]
+    assert set(NEW_BOX_METRICS) | {"momentum_only_sensitivity"} <= set(
+        ANALYSES["approx_ce_sensitivity"].metrics)
+    assert "optimized box" not in result.message
+    figures = {Path(f).name for f in result.files}
+    assert not any(name.startswith("box_") for name in figures)
+
+
+def test_cut_mode_rejects_other_values_and_resolves_the_cosmic_rate(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path, n=500)
+    bad = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir,
+                       parameters={"sig_eff": 0.5, "cut_mode": "boxes"})
+    assert bad.status == "error" and "cut_mode" in bad.message and "'box'" in bad.message
+    bad = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir,
+                       parameters={"sig_eff": 0.5, "cut_mode": "box",
+                                   "time_min_ns": 900.0, "time_max_ns": 800.0})
+    assert bad.status == "error" and "time_min_ns" in bad.message
+    # the default rate follows the mode: the Run-1A rate, times the loose/tight
+    # yield ratio in box mode
+    ratio = sens.load_cosmic_shapes().loose_to_tight_ratio
+    assert sens.recommended_cosmic_rate("momentum") == sens.COSMIC_RATE_PER_SECOND_PER_MEV
+    assert sens.recommended_cosmic_rate("box") == sens.COSMIC_RATE_PER_SECOND_PER_MEV * ratio
+    assert 4.0e-4 < sens.recommended_cosmic_rate("box") < 4.01e-4
+    spec = ANALYSES["approx_ce_sensitivity"]
+    assert spec.resolve_params({"sig_eff": 0.1})["cut_mode"] == "momentum"
+    assert spec.resolve_params({"sig_eff": 0.1})["muon_lifetime_ns"] == 864.0
+    assert spec.resolve_params({"sig_eff": 0.1})["time_min_ns"] == 525.0
+    assert spec.resolve_params({"sig_eff": 0.1})["time_max_ns"] == 1650.0
+    helix = Path(tmp_dir) / "nts.owner.edep.helix.root"
+    _write_edep_tree(helix, n=500, with_helix=True)
+    seen = {}
+    for mode in ("momentum", "box"):
+        for given in (0.0, 3.0e-5):
+            result = run_analysis(
+                analysis="approx_ce_sensitivity", data_file=str(helix),
+                output_dir=str(Path(tmp_dir) / f"{mode}{given}"),
+                parameters={"sig_eff": 0.5, "cut_mode": mode,
+                            "cosmic_rate_per_s_per_mev": given})
+            assert result.status == "success", result.message
+            seen[mode, given] = result.metadata
+    assert seen["momentum", 0.0]["cosmic_rate_per_s_per_mev"] == sens.COSMIC_RATE_PER_SECOND_PER_MEV
+    assert seen["box", 0.0]["cosmic_rate_per_s_per_mev"] == sens.recommended_cosmic_rate("box")
+    assert seen["box", 0.0]["cosmic_rate_source"] == "mode default"
+    assert seen["box", 0.0]["cosmic_loose_to_tight_ratio"] == ratio
+    for mode in ("momentum", "box"):                # an explicit value overrides
+        assert seen[mode, 3.0e-5]["cosmic_rate_per_s_per_mev"] == 3.0e-5
+        assert seen[mode, 3.0e-5]["cosmic_rate_source"] == "user"
+    log = (Path(tmp_dir) / "box0.0" / "approx_ce_sensitivity.log").read_text()
+    assert "(mode default)" in log and "loose/tight" in log
+
+
+def test_box_mode_needs_the_helix_branches_but_momentum_mode_does_not(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.plain.root"
+    _write_edep_tree(path, n=500)
+    box = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir,
+                       parameters={"sig_eff": 0.5, "cut_mode": "box"})
+    assert box.status == "error"
+    assert "helix" in box.message and "cut_mode='momentum'" in box.message
+    assert "Offline" in box.message
+    mom = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir, parameters={"sig_eff": 0.5})
+    assert mom.status == "success", mom.message
+
+
+def test_box_mode_optimizes_every_cut_inside_its_grid(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.helix.root"
+    _write_edep_tree(path, n=3000, with_helix=True)
+    params = {"sig_eff": 0.5, "cut_mode": "box"}
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters=params)
+    assert result.status == "success", result.message
+    m = result.metadata
+    for name in ("sensitivity", "momentum_only_sensitivity", "punzi_fom",
+                 "signal_rate", "dio_background", "cosmic_background",
+                 "total_background", *NEW_BOX_METRICS):
+        assert name in m, name
+    assert 525.0 <= m["time_low_ns"] < m["time_high_ns"] <= 1650.0
+    assert sens.RMAX_MIN_MM == 400.0
+    assert 400.0 <= m["rmax_low_mm"] < m["rmax_high_mm"] <= 1100.0
+    assert -700.0 <= m["d0_low_mm"] < m["d0_high_mm"] <= 700.0
+    assert 0.0 <= m["cos_low"] < m["cos_high"] <= 1.0
+    assert sens.SIGNAL_BOX_MIN_MEV <= m["signal_box_low_mev"] <= m["signal_box_high_mev"]
+    for name in ("ce_box_efficiency", "cosmic_box_efficiency"):
+        assert 0.0 < m[name] <= 1.0, name
+    assert np.isclose(m["total_background"], m["dio_background"] + m["cosmic_background"])
+    assert np.isclose(m["sensitivity"], m["signal_rate"] / np.sqrt(m["total_background"]))
+    # coordinate ascent on the Punzi FoM never lowers it from its start, and
+    # the sweeps rise
+    assert np.isclose(m["punzi_fom"], m["signal_rate"]
+                      / (sens.PUNZI_A / 2 + np.sqrt(m["total_background"])))
+    assert m["punzi_fom"] >= m["box_start_fom"] * (1 - 1e-9)
+    assert np.isclose(m["punzi_fom"], m["box_sweeps"][-1])
+    sweeps = m["box_sweeps"]
+    assert 1 <= len(sweeps) <= sens.MAX_SWEEPS
+    assert all(b >= a * (1 - 1e-12) for a, b in zip(sweeps, sweeps[1:]))
+    # the CE (helix center ~330, cos 0.45-0.75) is cut much less than cosmics are
+    assert m["ce_box_efficiency"] > m["cosmic_box_efficiency"]
+    names = {Path(f).name for f in result.files}
+    assert {f"box_{v}.png" for v in sens.BOX_VARIABLES} <= names
+    log = (Path(tmp_dir) / "approx_ce_sensitivity.log").read_text()
+    assert "Box cuts" in log and "sweep  1" in log and "loose/tight" in log
+    assert "optimized box" in result.message
+    # the same file in momentum mode keeps the momentum-only number (same
+    # cosmic rate given, so the two modes are comparable)
+    both = {}
+    for mode in ("momentum", "box"):
+        both[mode] = run_analysis(
+            analysis="approx_ce_sensitivity", data_file=str(path),
+            output_dir=str(Path(tmp_dir) / mode),
+            parameters={**params, "cut_mode": mode,
+                        "cosmic_rate_per_s_per_mev": 1.0e-4}).metadata
+    assert (both["box"]["momentum_only_sensitivity"]
+            == both["momentum"]["momentum_only_sensitivity"]
+            == both["momentum"]["sensitivity"])
+
+
+def test_box_mode_rates_use_the_box_efficiencies():
+    """Hand check of BoxModel.rates on a model whose efficiencies are known."""
+    n = 10
+    spec = lambda v: Spectrum(np.full(n, v), 100.0, 1.0)
+    # an identity response: a unit entry in bin j stays in bin j. The events
+    # sit in bins 2, 3 (inside the window below), 3 and 9, so the two that pass
+    # the geometry cuts are 2 bin-entries in the window.
+    ce = sens.GeometryPopulation(
+        rmax=np.array([500.0, 600.0, 700.0, np.nan]),
+        d0=np.array([0.0, 50.0, 100.0, np.nan]),
+        cos=np.array([0.55, 0.6, 0.7, np.nan]), weights=np.ones(4), norm=4.0,
+        bins=np.array([2, 3, 3, 9]))
+    # cosmics sampled over bins 2-3, one track in each: the passing one in
+    # bin 2, the failing one (cos) in bin 3
+    cos = sens.GeometryPopulation(
+        rmax=np.array([500.0, 600.0]), d0=np.array([0.0, 0.0]),
+        cos=np.array([0.55, 0.9]), weights=np.ones(2), norm=2.0,
+        bins=np.array([2, 3]))
+    model = sens.BoxModel(signal=spec(2.0), dio=spec(0.5), cosmic=spec(0.25),
+                          ce_geometry=ce, cosmic_geometry=cos,
+                          response=np.eye(n), signal_scale=1.5, lifetime_ns=864.0,
+                          time_min_ns=525.0, time_max_ns=1650.0,
+                          cosmic_t_range=(400.0, 1700.0), first_bin=0,
+                          cosmic_p_bins=(2, 3))
+    cuts = {"p": (2, 3), "t": (525.0, 1650.0), "rmax": (400.0, 650.0),
+            "d0": (-np.inf, np.inf), "cos": (0.5, 0.65)}
+    r = model.rates(cuts)
+    assert r["ce_geometry"] == 0.5 and r["cosmic_geometry"] == 0.5   # NaN never passes
+    ce_t = float(sens.ce_time_efficiency(525.0, 1650.0, 864.0))
+    cos_t = 1125.0 / 1300.0
+    assert np.isclose(r["signal"], 2 * 1.5 * ce_t)      # per-event, not s x efficiency
+    assert np.isclose(r["dio"], 2 * 0.5 * ce_t * 0.5)   # DIO: the integrated efficiency
+    assert np.isclose(r["cosmic"], 2 * 0.25 * cos_t * 0.5)          # no further scaling
+    assert np.isclose(r["cosmic_efficiency"], cos_t * 0.5)
+    # the geometry efficiency is the window's own: no cosmic passes in bin 3
+    r = model.rates({**cuts, "p": (3, 3)})
+    assert r["cosmic"] == 0.0 and r["cosmic_geometry"] == 0.0
+
+
+def _correlated_model(seed=7, n=3000):
+    """A CE sample whose low-energy events (< 103.5 MeV) have a large d0, with
+    the signal built as `run` builds it. Returns the model, the raw columns,
+    the normalization and the kernel."""
+    rng = np.random.default_rng(seed)
+    energy = rng.uniform(100.0, 105.0, n)
+    energy[:20] = np.nan                         # no front energy: no bin
+    energy[20:40] = 200.0                        # off the axis
+    d0 = np.where(energy < 103.5, 150.0, 0.0) + rng.normal(0.0, 20.0, n)
+    weights = rng.uniform(0.5, 1.5, n)
+    columns = dict(rmax=np.full(n, 560.0), d0=d0, cos=np.full(n, 0.6))
+    fill = np.isfinite(energy)
+    scale = 1.0e3 / fill.sum()                   # entries count every finite fill
+
+    def spectrum(keep):
+        hist = Spectrum.from_values(energy[keep & fill], *sens.BINNING[sens.SIGNAL_VAR],
+                                    weights=weights[keep & fill])
+        return hist.rebin(sens.SIGNAL_REBIN).scaled(scale)
+
+    kernel = Kernel.gaussian(0.2, sens.TRK_RESOLUTION_SIGMA_MEV)
+    raw = spectrum(np.ones(n, dtype=bool))
+    reco = raw.smear(kernel)
+    flat = lambda v: replace(reco, values=np.full(reco.nbins, v))
+    ce = sens.GeometryPopulation(weights=weights, norm=float(weights.sum()),
+                                 bins=sens.signal_bins(energy), **columns)
+    shapes = sens.load_cosmic_shapes()
+    model = sens.BoxModel(
+        signal=reco, dio=flat(1e-3), cosmic=flat(1e-3), ce_geometry=ce,
+        cosmic_geometry=sens.cosmic_geometry_sample(
+            shapes, reco, sens.cosmic_p_bins(reco, shapes), n=20_000),
+        response=sens.smearing_matrix(reco, kernel), signal_scale=scale,
+        lifetime_ns=864.0, time_min_ns=525.0, time_max_ns=1650.0,
+        cosmic_t_range=shapes.t_range, first_bin=0,
+        cosmic_p_bins=sens.cosmic_p_bins(reco, shapes))
+    return model, energy, weights, columns, scale, kernel, spectrum
+
+
+def test_box_signal_response_matrix_reproduces_the_smeared_signal():
+    model, energy, weights, _, scale, kernel, spectrum = _correlated_model()
+    # the events' bins are where the rebinned histogram put them
+    raw = spectrum(np.ones(energy.size, dtype=bool))
+    binned = np.bincount(model.ce_geometry.bins[model.ce_geometry.bins >= 0],
+                         weights=weights[model.ce_geometry.bins >= 0],
+                         minlength=raw.nbins)
+    assert np.allclose(binned * scale, raw.values, rtol=1e-12, atol=0.0)
+    assert (model.ce_geometry.bins[:40] == -1).all()
+    # and M @ h is signal_reco, the same smear
+    assert np.allclose(model.response @ (raw.values / scale) * scale,
+                       model.signal.values, rtol=1e-10, atol=1e-14 * raw.values.max())
+    assert np.allclose(model.signal_spectrum(np.ones(energy.size, dtype=bool)),
+                       model.signal.values, rtol=1e-10, atol=1e-14 * raw.values.max())
+
+
+def test_box_signal_with_open_geometry_is_the_separable_result():
+    model, _, _, _, _, _, _ = _correlated_model()
+    open_cuts = {"p": (500, 540), "t": (540.0, 1650.0), "rmax": (-np.inf, np.inf),
+                 "d0": (-np.inf, np.inf), "cos": (-np.inf, np.inf)}
+    ce_t = float(sens.ce_time_efficiency(540.0, 1650.0, 864.0))
+    s = model.window_sums(open_cuts["p"])[0]
+    r = model.rates(open_cuts)
+    assert model.ce_geometry.efficiency(open_cuts) == 1.0
+    assert np.isclose(r["signal"], s * ce_t, rtol=1e-12)
+    assert np.isclose(r["ce_window_geometry"], 1.0, rtol=1e-12)
+
+
+def test_box_signal_follows_the_events_that_pass_the_geometry_cuts():
+    model, energy, weights, columns, scale, kernel, spectrum = _correlated_model()
+    cuts = {"p": (520, 540), "t": (540.0, 1650.0), "rmax": (-np.inf, np.inf),
+            "d0": (-np.inf, 60.0), "cos": (-np.inf, np.inf)}
+    ce_t = float(sens.ce_time_efficiency(540.0, 1650.0, 864.0))
+    passing = columns["d0"] < 60.0
+    # brute force: histogram only the passing events, scaled with the FULL
+    # sample's normalization, smeared, summed over the window
+    brute = spectrum(passing).smear(kernel).values[520:541].sum() * ce_t
+    r = model.rates(cuts)
+    assert np.isclose(r["signal"], brute, rtol=1e-10)
+    # the cut removes the low-energy events, which sit mostly below the window,
+    # so the window loses less than the separable product says
+    separable = model.window_sums(cuts["p"])[0] * ce_t * r["ce_geometry"]
+    assert r["signal"] > separable * 1.05
+    assert r["ce_window_geometry"] > r["ce_geometry"] + 0.05
+    # DIO keeps the integrated CE efficiency
+    assert np.isclose(r["dio"], model.window_sums(cuts["p"])[1] * ce_t * r["ce_geometry"])
+
+
+def test_box_steps_report_the_figure_of_merit_rates_computes():
+    model, *_ = _correlated_model()
+    cuts = {"p": (505, 540), "t": (540.0, 1650.0), "rmax": (400.0, 700.0),
+            "d0": (-np.inf, 60.0), "cos": (0.3, 0.8)}
+    for variable in sens.BOX_VARIABLES:
+        found = model.step(cuts, variable)
+        assert found is not None, variable
+        moved = {**cuts, variable: found[0]}
+        assert np.isclose(model.rates(moved)["fom"], found[1], rtol=1e-9), variable
+
+
+def test_box_cosmic_geometry_follows_the_momentum_window():
+    """R(max) and d0 grow with p, so a high R(max) cut passes cosmics only at
+    high momentum: the count must follow the window, not the p-averaged
+    efficiency (Copilot's example: rc = 300 mm, cos = 0.6 needs p >= ~104.8
+    MeV/c for R(max) >= 570 mm)."""
+    model, *_ = _correlated_model()
+    pop = model.cosmic_geometry
+    p = (pop.rmax - pop.d0) / 2.0 * sens.C_LIGHT_MEV_PER_MM_T * 1.036 \
+        / np.sqrt(1.0 - pop.cos ** 2)
+    cuts = {"p": (500, 504), "t": (540.0, 1650.0), "rmax": (-np.inf, np.inf),
+            "d0": (-np.inf, np.inf), "cos": (-np.inf, np.inf)}
+    # a cut on rc + R that only tracks above ~105 MeV/c pass, at a fixed rc
+    pop.rmax[:] = 300.0 + p * 0.8 / (sens.C_LIGHT_MEV_PER_MM_T * 1.036)
+    pop.cos[:] = 0.6
+    threshold = 300.0 + 105.0 * 0.8 / (sens.C_LIGHT_MEV_PER_MM_T * 1.036)
+    high = {**cuts, "rmax": (threshold, np.inf)}
+    assert model.rates(high)["cosmic"] == 0.0             # 100.0-101.0 MeV/c
+    above = model.rates({**high, "p": (530, 549)})        # 106-110 MeV/c
+    assert above["cosmic"] > 0.0 and np.isclose(above["cosmic_geometry"], 1.0)
+    # and the steps count it the same way rates does
+    for variable in sens.BOX_VARIABLES:
+        found = model.step(high, variable)
+        if found is not None:
+            assert np.isclose(model.rates({**high, variable: found[0]})["fom"],
+                              found[1], rtol=1e-9), variable
+
+
+def test_box_optimization_starts_from_open_geometry_when_the_reference_has_no_signal():
+    model, *_ = _correlated_model()
+    model.ce_geometry.rmax[:] = 750.0            # outside the reference R(max)
+    model.ce_geometry.cos[:] = 0.8               # and cos windows
+    assert model.rates(model.start_cuts((515, 530)))["signal"] == 0.0
+    cuts, rates, sweeps, start = model.optimize((515, 530))
+    assert rates["signal"] > 0.0 and rates["fom"] > 0.0
+    assert start["fom"] > 0.0 and cuts["rmax"][1] > 750.0
+
+
+def test_box_mode_missing_cosmic_shapes_is_an_error_not_a_raise(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.helix.root"
+    _write_edep_tree(path, n=500, with_helix=True)
+    original = sens.recommended_cosmic_rate
+
+    def missing(cut_mode):
+        raise sens.SensitivityError("cosmic shapes file not found: x")
+    sens.recommended_cosmic_rate = missing
+    try:
+        result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                              output_dir=tmp_dir,
+                              parameters={"sig_eff": 0.5, "cut_mode": "box"})
+    finally:
+        sens.recommended_cosmic_rate = original
+    assert result.status == "error" and "cosmic shapes" in result.message
+
+
+def test_tsda_hit_fraction_mirrors_in_the_gradient_and_averages_the_phase():
+    assert (sens.TRACKER_BZ_T, sens.TSDA_BZ_T, sens.TSDA_RADII_MM) == (1.0, 2.0, (235.0, 525.0))
+    # sin^2 = 0.64 > 1 T / 2 T: reflects before the TSDA, whatever the geometry
+    assert sens.tsda_hit_fraction(600.0, 0.0, 0.6) == 0.0
+    # rc = R = 300 mm, cos 0.8 reaches; at the TSDA r^2 = 90000 (1 + cos phi),
+    # inside 235-525 mm for cos phi >= 235^2/90000 - 1
+    expected = np.arccos(235.0 ** 2 / 90000.0 - 1.0) / np.pi
+    assert np.isclose(sens.tsda_hit_fraction(600.0, 0.0, 0.8), expected)
+    # all inside the hole, all beyond the annulus, NaN: never
+    assert sens.tsda_hit_fraction(300.0, 100.0, 0.9) == 0.0      # r <= 212 mm
+    assert sens.tsda_hit_fraction(1600.0, 1000.0, 0.9) == 0.0    # r >= 707 mm
+    assert sens.tsda_hit_fraction(np.nan, 0.0, 0.9) == 0.0
+    fractions = sens.tsda_hit_fraction(np.array([600.0, 600.0]), np.zeros(2),
+                                       np.array([0.6, 0.8]))
+    assert np.allclose(fractions, [0.0, expected])
+
+
+def test_tsda_veto_weights_the_box_and_needs_box_mode(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.helix.root"
+    _write_edep_tree(path, n=2000, with_helix=True)
+    bad = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir, parameters={"sig_eff": 0.5, "tsda_veto": 1})
+    assert bad.status == "error" and "cut_mode='box'" in bad.message
+    seen = {}
+    for veto in (0, 1):
+        result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                              output_dir=str(Path(tmp_dir) / f"veto{veto}"),
+                              parameters={"sig_eff": 0.5, "cut_mode": "box",
+                                          "tsda_veto": veto})
+        assert result.status == "success", result.message
+        seen[veto] = result.metadata
+    assert seen[0]["ce_tsda_survival"] == seen[0]["cosmic_tsda_survival"] == -1.0
+    for name in ("ce_tsda_survival", "cosmic_tsda_survival"):
+        assert 0.0 < seen[1][name] <= 1.0, name
+        assert name in ANALYSES["approx_ce_sensitivity"].metrics
+    # it removes signal (it removes cosmics too, so the FoM may go either way)
+    assert seen[1]["ce_tsda_survival"] < 1.0
+    log = (Path(tmp_dir) / "veto1" / "approx_ce_sensitivity.log").read_text()
+    assert "TSDA veto (fast sim" in log
+
+
+def test_front_time_cut_folds_into_the_microbunch_and_conditions_the_time_model():
+    times = np.array([100.0, 499.0, 500.0, 1600.0, 1695.0 + 450.0, 1695.0 + 900.0, np.nan])
+    assert sens.front_time_kept(times, 500.0).tolist() == [
+        False, False, True, True, False, True, True]
+    assert sens.front_time_kept(times, 0.0).all()
+    model = _correlated_model()[0]
+    tau = model.lifetime_ns
+    # no floor: the plain exponential; a floor: its share above the floor
+    assert np.isclose(model.ce_time(525.0, 1650.0), sens.ce_time_efficiency(525.0, 1650.0, tau))
+    floored = replace(model, ce_time_floor_ns=500.0)
+    above = sens.ce_time_efficiency(500.0, sens.MICROBUNCH_NS, tau)
+    assert np.isclose(floored.ce_time(525.0, 1650.0),
+                      sens.ce_time_efficiency(525.0, 1650.0, tau) / above)
+    assert np.isclose(floored.ce_time(0.0, sens.MICROBUNCH_NS), 1.0)
+    assert np.isclose(floored.ce_time(300.0, 700.0), floored.ce_time(500.0, 700.0))
+    cuts = {"p": (505, 540), "t": (540.0, 1650.0), "rmax": (-np.inf, np.inf),
+            "d0": (-np.inf, np.inf), "cos": (-np.inf, np.inf)}
+    assert np.isclose(floored.rates(cuts)["signal"], model.rates(cuts)["signal"] / above)
+
+
+def test_front_time_cut_drops_early_ce_in_box_mode_only(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.helix.root"
+    _write_edep_tree(path, n=2000, with_helix=True)     # front times 600-1600 ns
+    seen = {}
+    for mode, cut in (("box", 0.0), ("box", 1100.0), ("momentum", 1100.0)):
+        result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                              output_dir=str(Path(tmp_dir) / f"{mode}{cut:g}"),
+                              parameters={"stops_per_pot": 1e-3, "cut_mode": mode,
+                                          "front_time_min_ns": cut})
+        assert result.status == "success", result.message
+        seen[mode, cut] = result.metadata
+    assert seen["box", 0.0]["ce_front_time_survival"] == 1.0
+    assert 0.4 < seen["box", 1100.0]["ce_front_time_survival"] < 0.6
+    assert np.isclose(seen["box", 1100.0]["ce_acceptance"],
+                      seen["box", 0.0]["ce_acceptance"]
+                      * seen["box", 1100.0]["ce_front_time_survival"])
+    # momentum mode has no time model: the cut is ignored and reported as -1
+    assert seen["momentum", 1100.0]["ce_front_time_survival"] == -1.0
+    assert seen["momentum", 1100.0]["ce_acceptance"] == seen["box", 0.0]["ce_acceptance"]
+    assert "ce_front_time_survival" in ANALYSES["approx_ce_sensitivity"].metrics
+    log = (Path(tmp_dir) / "box1100" / "approx_ce_sensitivity.log").read_text()
+    assert "front-time cut: folded tracker-front time >= 1100 ns" in log
+    bad = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir, parameters={"sig_eff": 0.5, "cut_mode": "box",
+                                                       "front_time_min_ns": 1695.0})
+    assert bad.status == "error" and "front_time_min_ns" in bad.message
+
+
+def test_box_rmax_never_goes_below_400_mm_and_plots_carry_the_ce_signal():
+    model, energy, weights, columns, scale, kernel, spectrum = _correlated_model()
+    model.ce_geometry.rmax[:300] = 350.0         # no hits in the tracker
+    model.cosmic_geometry.rmax[:1000] = 350.0
+    open_cuts = {"p": (505, 540), "t": (540.0, 1650.0), "rmax": (-np.inf, np.inf),
+                 "d0": (-np.inf, np.inf), "cos": (-np.inf, np.inf)}
+    for pop in (model.ce_geometry, model.cosmic_geometry):
+        assert not pop.passing(open_cuts)[:300].any()
+        assert sens.RMAX_GRID_MM[0] == sens.RMAX_MIN_MM
+    found = model.step({**open_cuts, "rmax": (500.0, 700.0)}, "rmax")
+    assert found is not None and found[0][0] >= 400.0
+    panels = {p["name"]: p for p in sens.box_panels(model, {**open_cuts, "rmax": found[0]})}
+    assert set(panels) == set(sens.BOX_VARIABLES)
+    for panel in panels.values():
+        assert len(panel["ce_nominal"]) == len(panel["ce_after"]) == len(panel["nominal"])
+        assert panel["ce_nominal"].sum() >= panel["ce_after"].sum() > 0.0
+    # N-1 time panel: the CE counts add up to the box signal / its time efficiency
+    cuts = {**open_cuts, "rmax": found[0]}
+    t1, t2 = cuts["t"]
+    edges = panels["t"]["edges"]
+    inside = (edges[:-1] >= t1) & (edges[1:] <= t2)
+    assert np.isclose(panels["t"]["ce_after"][inside].sum(),
+                      model.rates(cuts)["signal"], rtol=1e-9)
+    with tempfile.TemporaryDirectory() as tmp:
+        written = sens._write_box_plots(Path(tmp), list(panels.values()))
+        assert len(written) == 5 and all(Path(f).stat().st_size > 0 for f in written)
+
+
+def test_box_plot_nominal_cosmics_carry_the_tsda_veto():
+    model = _correlated_model()[0]
+    pop = model.cosmic_geometry
+    survival = np.linspace(0.2, 1.0, pop.weights.size)
+    vetoed = replace(model, cosmic_geometry=replace(pop, survival=survival))
+    cuts = {"p": (505, 540), "t": (540.0, 1650.0), "rmax": (-np.inf, np.inf),
+            "d0": (-np.inf, np.inf), "cos": (-np.inf, np.inf)}
+    plain = {p["name"]: p for p in sens.box_panels(model, cuts)}
+    panels = {p["name"]: p for p in sens.box_panels(vetoed, cuts)}
+    # without a veto the momentum panel is the flat rate itself
+    assert np.allclose(plain["p"]["nominal"], plain["p"]["nominal"][0])
+    # with one, the momentum and time panels hold the same veto-weighted total,
+    # below the unvetoed one as the geometry panels are
+    total = panels["t"]["nominal"].sum()
+    assert np.isclose(panels["p"]["nominal"].sum(), total, rtol=1e-9)
+    assert np.isclose(plain["p"]["nominal"].sum(), plain["t"]["nominal"].sum(), rtol=1e-9)
+    for name in sens.BOX_VARIABLES:
+        assert panels[name]["nominal"].sum() < 0.9 * plain[name]["nominal"].sum(), name
 
 
 def main() -> int:
