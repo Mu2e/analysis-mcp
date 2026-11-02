@@ -4808,6 +4808,26 @@ def test_box_rmax_never_goes_below_400_mm_and_plots_carry_the_ce_signal():
         assert len(written) == 5 and all(Path(f).stat().st_size > 0 for f in written)
 
 
+def test_box_plot_nominal_cosmics_carry_the_tsda_veto():
+    model = _correlated_model()[0]
+    pop = model.cosmic_geometry
+    survival = np.linspace(0.2, 1.0, pop.weights.size)
+    vetoed = replace(model, cosmic_geometry=replace(pop, survival=survival))
+    cuts = {"p": (505, 540), "t": (540.0, 1650.0), "rmax": (-np.inf, np.inf),
+            "d0": (-np.inf, np.inf), "cos": (-np.inf, np.inf)}
+    plain = {p["name"]: p for p in sens.box_panels(model, cuts)}
+    panels = {p["name"]: p for p in sens.box_panels(vetoed, cuts)}
+    # without a veto the momentum panel is the flat rate itself
+    assert np.allclose(plain["p"]["nominal"], plain["p"]["nominal"][0])
+    # with one, the momentum and time panels hold the same veto-weighted total,
+    # below the unvetoed one as the geometry panels are
+    total = panels["t"]["nominal"].sum()
+    assert np.isclose(panels["p"]["nominal"].sum(), total, rtol=1e-9)
+    assert np.isclose(plain["p"]["nominal"].sum(), plain["t"]["nominal"].sum(), rtol=1e-9)
+    for name in sens.BOX_VARIABLES:
+        assert panels[name]["nominal"].sum() < 0.9 * plain[name]["nominal"].sum(), name
+
+
 def main() -> int:
     import tempfile
     import traceback

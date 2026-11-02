@@ -897,8 +897,8 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     formula with the cuts left out). "nominal" has only the base selection:
     the time window and PLOT_P_RANGE_MEV (inside the cosmic sample's bins), no
     box cuts. "after" has every
-    optimized cut but the variable's own. The CE counts ("ce_nominal",
-    "ce_after") are the correlated per-event signal in the same windows; in
+    optimized cut but the variable's own. Both include the TSDA veto, if any.
+    The CE counts ("ce_nominal", "ce_after") are the correlated per-event signal in the same windows; in
     momentum it is the smeared spectrum of the passing events, in time the
     lifetime model binned on the time axis. Each panel: name, bin edges, the
     count arrays and the selected (low, high).
@@ -911,7 +911,6 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
                               & (bins >= model.cosmic_p_bins[0])
                               & (bins <= model.cosmic_p_bins[1]))
     p_range = (int(in_range[0]), int(in_range[-1]))
-    cosmic_nominal = model.window_sums(p_range)[2]
     cosmic_event_nominal = model.cosmic_event(p_range)
     cosmic_event_cut = model.cosmic_event(cuts["p"])
     t1, t2 = cuts["t"]
@@ -930,9 +929,11 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     ce_in_cut = ce.passing(cuts)
 
     panels = []
-    # momentum: flat per bin before the geometry cuts, the passing sample after
+    # momentum: flat per bin before the geometry cuts (times the veto's
+    # survival in the bin), the passing sample after
     p_edges = model.cosmic.edges()[p_range[0]:p_range[1] + 2]
-    p_values = model.cosmic.values[p_range[0]:p_range[1] + 1]
+    p_values = model.cosmic_spectrum(
+        np.ones(pop.weights.size, dtype=bool))[p_range[0]:p_range[1] + 1]
     centers_low = centers[cuts["p"][0]]
     centers_high = centers[cuts["p"][1]]
     panels.append({
@@ -952,7 +953,7 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     ce_widths = model.ce_time(t_edges[:-1], t_edges[1:])
     panels.append({
         "name": "t", "edges": t_edges,
-        "nominal": cosmic_nominal * widths,
+        "nominal": cosmic_event_nominal.sum() * widths,
         "after": cosmic_event_cut[cosmic_in_cut].sum() * widths,
         "ce_nominal": ce_event_nominal[ce_in_nominal].sum() * ce_widths,
         "ce_after": ce_event_cut[ce_in_cut].sum() * ce_widths,
