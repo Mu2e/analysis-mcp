@@ -9,3 +9,6 @@ __pycache__/
 *.save
 filelist.txt
 output/
+
+# Shipped analysis inputs (made by scripts/extract_cosmic_shapes.py)
+!data/*.root

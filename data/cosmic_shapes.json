@@ -1,0 +1,142 @@
+{
+  "input": "/exp/mu2e/data/projects/run1a/mumep_ana/histograms/ConvAna.cnv_ana.cry4ab1s5r0101.m1.root",
+  "tree": "Ana/Hist/trs_81/tree",
+  "selection": "|trk_mc_pdg| == 11, 100 < trk_p < 110 MeV/c",
+  "n_selected": 25227,
+  "sum_weights": 25227.0,
+  "B_eff": {
+    "median_T": 1.0359292751133309,
+    "p16_T": 1.0316848702196102,
+    "p84_T": 1.0397658591262866
+  },
+  "separability": {
+    "rc,cos": {
+      "spearman_rho": 0.5277491842596005,
+      "mi_nats": 0.3680305427596309,
+      "mi_bias_nats": 0.01680875307714803,
+      "mi_bias_std": 0.0006204213169508159,
+      "mi_minus_bias": 0.35122178968248285,
+      "chi2": 16567.56655659991,
+      "ndf": 253,
+      "chi2_per_ndf": 65.48445279288502
+    },
+    "rmax,cos": {
+      "spearman_rho": -0.10036825940101364,
+      "mi_nats": 0.060797161683736736,
+      "mi_bias_nats": 0.0162547750354887,
+      "mi_bias_std": 0.0010408472092457537,
+      "mi_minus_bias": 0.044542386648248035,
+      "chi2": 2319.85764049908,
+      "ndf": 202,
+      "chi2_per_ndf": 11.48444376484693
+    },
+    "d0,cos": {
+      "spearman_rho": 0.7918082330524996,
+      "mi_nats": 0.6933664103746102,
+      "mi_bias_nats": 0.01670845704702837,
+      "mi_bias_std": 0.0005366363273710629,
+      "mi_minus_bias": 0.6766579533275818,
+      "chi2": 33325.52699541397,
+      "ndf": 224,
+      "chi2_per_ndf": 148.77467408666953
+    },
+    "rc,radius": {
+      "spearman_rho": -0.5315898687015549,
+      "mi_nats": 0.3819344842380553,
+      "mi_bias_nats": 0.017093524900978714,
+      "mi_bias_std": 0.0007946534140288203,
+      "mi_minus_bias": 0.3648409593370766,
+      "chi2": 15493.285615519124,
+      "ndf": 120,
+      "chi2_per_ndf": 129.11071346265936
+    },
+    "rmax,d0": {
+      "spearman_rho": 0.46584234998968005,
+      "mi_nats": 0.2074152593037837,
+      "mi_bias_nats": 0.017293357526825336,
+      "mi_bias_std": 0.0009651852979559293,
+      "mi_minus_bias": 0.19012190177695837,
+      "chi2": 8897.218660590393,
+      "ndf": 106,
+      "chi2_per_ndf": 83.93602509990937
+    },
+    "t0,cos": {
+      "spearman_rho": 0.03358385507141504,
+      "mi_nats": 0.022648027251241903,
+      "mi_bias_nats": 0.016658163146586476,
+      "mi_bias_std": 0.0006104372549234151,
+      "mi_minus_bias": 0.005989864104655428,
+      "chi2": 791.0335367350256,
+      "ndf": 467,
+      "chi2_per_ndf": 1.6938619630300333
+    },
+    "t0,rc": {
+      "spearman_rho": 0.02792758992419561,
+      "mi_nats": 0.01780085235235286,
+      "mi_bias_nats": 0.01667883348136237,
+      "mi_bias_std": 0.000666228302952793,
+      "mi_minus_bias": 0.0011220188709904905,
+      "chi2": 442.66156559893204,
+      "ndf": 333,
+      "chi2_per_ndf": 1.3293140108076038
+    }
+  },
+  "reference_cuts": {
+    "cuts": {
+      "cos": [
+        0.525,
+        0.649
+      ],
+      "rmax": [
+        482.0,
+        642.6
+      ],
+      "t0": [
+        540.0,
+        1650.0
+      ]
+    },
+    "individual": {
+      "cos": 0.13656003488326,
+      "rmax": 0.5024378641931264,
+      "t0": 0.8742220636619495
+    },
+    "combined": 0.032029175090181154,
+    "factorized": 0.05998293923500755,
+    "factorization_ratio": 1.8727594159424943,
+    "cos_rmax_joint": 0.04213739247631506,
+    "cos_rmax_joint_times_t0": 0.036837438207977656,
+    "rmax_eff_given_cos_cut": 0.30856313497822935
+  },
+  "out_of_range_fraction": {
+    "t0": {
+      "below": 0.0,
+      "above": 0.0
+    },
+    "cos": {
+      "below": 0.0,
+      "above": 0.0
+    },
+    "rc": {
+      "below": 0.0,
+      "above": 0.0
+    },
+    "rmax": {
+      "below": 0.0,
+      "above": 0.0
+    },
+    "d0": {
+      "below": 0.0,
+      "above": 0.0
+    },
+    "radius": {
+      "below": 0.0,
+      "above": 0.0
+    },
+    "p": {
+      "below": 0.0,
+      "above": 0.0
+    }
+  },
+  "recommendation": "rc-cos is correlated (Spearman +0.53) and d0-cos strongly so: never factorize them. eff(t0)*eff(rmax)*eff(cos) does NOT reproduce the combined reference-cut efficiency (product/combined = 1.87), although the rmax-cos Spearman rho is only -0.10: the rmax shape depends on cos inside the cut window. Even joint(rmax, cos)*eff(t0) is off (ratio 1.15): use the full event list."
+}
