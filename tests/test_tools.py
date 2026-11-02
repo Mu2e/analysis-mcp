@@ -4732,6 +4732,54 @@ def test_tsda_veto_weights_the_box_and_needs_box_mode(tmp_dir):
     assert "TSDA veto (fast sim" in log
 
 
+def test_front_time_cut_folds_into_the_microbunch_and_conditions_the_time_model():
+    times = np.array([100.0, 499.0, 500.0, 1600.0, 1695.0 + 450.0, 1695.0 + 900.0, np.nan])
+    assert sens.front_time_kept(times, 500.0).tolist() == [
+        False, False, True, True, False, True, True]
+    assert sens.front_time_kept(times, 0.0).all()
+    model = _correlated_model()[0]
+    tau = model.lifetime_ns
+    # no floor: the plain exponential; a floor: its share above the floor
+    assert np.isclose(model.ce_time(525.0, 1650.0), sens.ce_time_efficiency(525.0, 1650.0, tau))
+    floored = replace(model, ce_time_floor_ns=500.0)
+    above = sens.ce_time_efficiency(500.0, sens.MICROBUNCH_NS, tau)
+    assert np.isclose(floored.ce_time(525.0, 1650.0),
+                      sens.ce_time_efficiency(525.0, 1650.0, tau) / above)
+    assert np.isclose(floored.ce_time(0.0, sens.MICROBUNCH_NS), 1.0)
+    assert np.isclose(floored.ce_time(300.0, 700.0), floored.ce_time(500.0, 700.0))
+    cuts = {"p": (505, 540), "t": (540.0, 1650.0), "rmax": (-np.inf, np.inf),
+            "d0": (-np.inf, np.inf), "cos": (-np.inf, np.inf)}
+    assert np.isclose(floored.rates(cuts)["signal"], model.rates(cuts)["signal"] / above)
+
+
+def test_front_time_cut_drops_early_ce_in_box_mode_only(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.helix.root"
+    _write_edep_tree(path, n=2000, with_helix=True)     # front times 600-1600 ns
+    seen = {}
+    for mode, cut in (("box", 0.0), ("box", 1100.0), ("momentum", 1100.0)):
+        result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                              output_dir=str(Path(tmp_dir) / f"{mode}{cut:g}"),
+                              parameters={"stops_per_pot": 1e-3, "cut_mode": mode,
+                                          "front_time_min_ns": cut})
+        assert result.status == "success", result.message
+        seen[mode, cut] = result.metadata
+    assert seen["box", 0.0]["ce_front_time_survival"] == 1.0
+    assert 0.4 < seen["box", 1100.0]["ce_front_time_survival"] < 0.6
+    assert np.isclose(seen["box", 1100.0]["ce_acceptance"],
+                      seen["box", 0.0]["ce_acceptance"]
+                      * seen["box", 1100.0]["ce_front_time_survival"])
+    # momentum mode has no time model: the cut is ignored and reported as -1
+    assert seen["momentum", 1100.0]["ce_front_time_survival"] == -1.0
+    assert seen["momentum", 1100.0]["ce_acceptance"] == seen["box", 0.0]["ce_acceptance"]
+    assert "ce_front_time_survival" in ANALYSES["approx_ce_sensitivity"].metrics
+    log = (Path(tmp_dir) / "box1100" / "approx_ce_sensitivity.log").read_text()
+    assert "front-time cut: folded tracker-front time >= 1100 ns" in log
+    bad = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir, parameters={"sig_eff": 0.5, "cut_mode": "box",
+                                                       "front_time_min_ns": 1695.0})
+    assert bad.status == "error" and "front_time_min_ns" in bad.message
+
+
 def test_box_rmax_never_goes_below_400_mm_and_plots_carry_the_ce_signal():
     model, energy, weights, columns, scale, kernel, spectrum = _correlated_model()
     model.ce_geometry.rmax[:300] = 350.0         # no hits in the tracker

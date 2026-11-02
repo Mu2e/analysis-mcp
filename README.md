@@ -953,6 +953,19 @@ efficiency. `ce_tsda_survival` and `cosmic_tsda_survival` report the
 surviving fractions before the box cuts (-1 when off). A box whose cos cut
 stays below 0.707 is unaffected, since nothing in it reaches the TSDA.
 
+`front_time_min_ns` (box mode only, default 500; 0 turns it off) models the
+production's digitization window: a CE event whose tracker-front time
+(EdepAna `primary_trk_front_time`), folded into the 1695 ns microbunch, is
+below it is dropped from the selection, so from the CE acceptance, the signal
+shape and the DIO response alike. The events' own times carry the stopped
+muons' arrival times, which shift with the stopping target (the alternate
+designs' CEs arrive ~25-35 ns earlier, and the production keeps ~3% fewer of
+them), something the exponential time model cannot see. To not count the
+early loss twice, the box's CE time efficiency is then the exponential's share
+of [t1, t2] above the cut, eps_t / eps(front_time_min_ns, T).
+`ce_front_time_survival` reports the kept fraction of the selection (-1 in
+momentum mode, which ignores the parameter).
+
 Model. For the cosmics, momentum, time and the (helix-center radius rc, cos)
 distribution are taken as mutually separable; for the CE only time is separable
 from the rest, momentum and geometry are not (see S below). For a box [p1,p2] x [t1,t2] x
@@ -960,6 +973,9 @@ R(max) x d0 x cos:
 
 - CE time follows the muon lifetime over one 1695 ns microbunch, density
   exp(-t/tau): eps_t = (e^(-t1/tau) - e^(-t2/tau)) / (1 - e^(-T/tau)).
+  With `front_time_min_ns` = t_f > 0 this becomes the share above t_f,
+  eps_t(max(t1, t_f), max(t2, t_f)) / eps_t(t_f, T), on top of the per-event
+  front-time cut.
   Cosmic time is flat over the time range of the loose cosmic shapes (the `t0`
   axis of the shapes file, 400-1700 ns): eps_t = overlap / width.
 - CE geometry is counted per event: the weighted fraction of the selected

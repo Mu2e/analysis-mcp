@@ -129,6 +129,13 @@ MUON_LIFETIME_NS = 864.0
 # The base time cut, which the time optimization may only tighten.
 TIME_MIN_NS = 525.0
 TIME_MAX_NS = 1650.0
+# The production's time window (box mode): a CE whose time at the tracker front,
+# folded into the microbunch, is below this is dropped before reconstruction
+# (digitization keeps hits after ~500 ns). Cut per event on EdepAna's
+# primary_trk_front_time, it follows the stopped muons' real arrival times,
+# which depend on the stopping target (the exponential model above does not);
+# the exponential then only sets the shape above it (`BoxModel.ce_time`).
+FRONT_TIME_MIN_NS = 500.0
 
 # The tight Run-1A cuts (no d0 cut): the optimization's starting point, and
 # the selection whose yield relative to the shapes' loose selection is
@@ -321,6 +328,13 @@ def ce_time_efficiency(t1: float, t2: float,
     norm = -np.expm1(-MICROBUNCH_NS / lifetime_ns)
     return (np.exp(-np.asarray(t1) / lifetime_ns)
             - np.exp(-np.asarray(t2) / lifetime_ns)) / norm
+
+
+def front_time_kept(front_time: np.ndarray, floor_ns: float) -> np.ndarray:
+    """The events the production time window keeps: those whose tracker-front
+    time, folded into the microbunch, is at or above `floor_ns`. An event with
+    no front time (NaN) is left to the selection."""
+    return ~(np.mod(front_time, MICROBUNCH_NS) < floor_ns)
 
 
 def cosmic_time_efficiency(t1, t2, t_range: tuple[float, float]):
@@ -580,6 +594,17 @@ class BoxModel:
     cosmic_t_range: tuple[float, float]     # where cosmics are flat in time
     first_bin: int              # lowest allowed momentum bin (SIGNAL_BOX_MIN_MEV)
     cosmic_p_bins: tuple[int, int]  # the bins the cosmic sample covers uniformly
+    ce_time_floor_ns: float = 0.0   # front-time cut the CE events already passed
+
+    def ce_time(self, t1, t2):
+        """CE fraction in [t1, t2) ns among the CEs the front-time cut kept:
+        the exponential's share of [t1, t2) above the floor over its share above
+        the floor, since the events' own times already set the fraction below
+        it. Works on arrays; with no floor it is `ce_time_efficiency`."""
+        floor = self.ce_time_floor_ns
+        return (ce_time_efficiency(np.maximum(t1, floor), np.maximum(t2, floor),
+                                   self.lifetime_ns)
+                / ce_time_efficiency(floor, MICROBUNCH_NS, self.lifetime_ns))
 
     def event_signal(self, bins: tuple[int, int]) -> np.ndarray:
         """Each CE event's signal in the momentum window, weight and
@@ -629,7 +654,7 @@ class BoxModel:
     def rates(self, cuts: dict) -> dict[str, float]:
         """Signal, DIO and cosmic in the box, and the efficiencies behind them."""
         t1, t2 = cuts["t"]
-        ce_t = float(ce_time_efficiency(t1, t2, self.lifetime_ns))
+        ce_t = float(self.ce_time(t1, t2))
         cos_t = float(cosmic_time_efficiency(t1, t2, self.cosmic_t_range))
         ce_g = self.ce_geometry.efficiency(cuts)
         s, d, c = self.window_sums(cuts["p"])
@@ -663,7 +688,7 @@ class BoxModel:
         cuts) and every window then comes from cumulative sums, O(N + G^2).
         """
         t1, t2 = cuts["t"]
-        ce_t = float(ce_time_efficiency(t1, t2, self.lifetime_ns))
+        ce_t = float(self.ce_time(t1, t2))
         cos_t = float(cosmic_time_efficiency(t1, t2, self.cosmic_t_range))
         _, d, _ = self.window_sums(cuts["p"])
         ce_g = self.ce_geometry.efficiency(cuts)    # DIO's, as in `rates`
@@ -682,7 +707,7 @@ class BoxModel:
                     ((found["a"], found["b"]), found["fom"]))
         if variable == "t":
             edges = time_edges(self.time_min_ns, self.time_max_ns)
-            ce_bins = ce_time_efficiency(edges[:-1], edges[1:], self.lifetime_ns)
+            ce_bins = self.ce_time(edges[:-1], edges[1:])
             cos_bins = cosmic_time_efficiency(edges[:-1], edges[1:],
                                              self.cosmic_t_range)
             cos_c = float(cosmic_event[self.cosmic_geometry.passing(cuts)].sum())
@@ -897,9 +922,8 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     open_geometry = {name: (-np.inf, np.inf) for name in GEOMETRY_VARIABLES}
     no_geometry = {**cuts, **open_geometry}
     ce = model.ce_geometry
-    ce_time_nominal = float(ce_time_efficiency(
-        model.time_min_ns, model.time_max_ns, model.lifetime_ns))
-    ce_time_cut = float(ce_time_efficiency(t1, t2, model.lifetime_ns))
+    ce_time_nominal = float(model.ce_time(model.time_min_ns, model.time_max_ns))
+    ce_time_cut = float(model.ce_time(t1, t2))
     ce_event_nominal = model.event_signal(p_range)
     ce_event_cut = model.event_signal(cuts["p"])
     ce_in_nominal = ce.passing(no_geometry)
@@ -925,7 +949,7 @@ def box_panels(model: BoxModel, cuts: dict) -> list[dict]:
     t_edges = time_edges(model.time_min_ns, model.time_max_ns)
     widths = cosmic_time_efficiency(t_edges[:-1], t_edges[1:],
                                     model.cosmic_t_range)
-    ce_widths = ce_time_efficiency(t_edges[:-1], t_edges[1:], model.lifetime_ns)
+    ce_widths = model.ce_time(t_edges[:-1], t_edges[1:])
     panels.append({
         "name": "t", "edges": t_edges,
         "nominal": cosmic_nominal * widths,
@@ -1060,7 +1084,8 @@ def signal_efficiency(variables: dict[str, np.ndarray], mask: np.ndarray,
 BOX_CUT_METRICS = ("time_low_ns", "time_high_ns", "rmax_low_mm", "rmax_high_mm",
                    "d0_low_mm", "d0_high_mm", "cos_low", "cos_high",
                    "ce_box_efficiency", "cosmic_box_efficiency",
-                   "ce_tsda_survival", "cosmic_tsda_survival")
+                   "ce_tsda_survival", "cosmic_tsda_survival",
+                   "ce_front_time_survival")
 NO_BOX_METRICS = {name: -1.0 for name in BOX_CUT_METRICS}
 
 
@@ -1068,10 +1093,12 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
                  signal: Spectrum, dio: Spectrum, cosmic: Spectrum,
                  momentum_best: dict[str, float],
                  params: dict[str, float | str], kernel: Kernel,
-                 signal_scale: float) -> dict:
+                 signal_scale: float, front_survival: float = 1.0) -> dict:
     """Optimize the box from the momentum-only result and the selected events'
     helix geometry; `kernel` and `signal_scale` are what turned the signal
-    histogram into `signal` (smearing, normalization per entry). Returns the headline numbers, metrics, log lines, plot
+    histogram into `signal` (smearing, normalization per entry), and
+    `front_survival` is the share of the selection the front-time cut
+    (params["front_time_min_ns"], already in `mask`) kept. Returns the headline numbers, metrics, log lines, plot
     panels and sweep records `run` reports."""
     front = mask & variables["has_trk_front"]
     weights = variables["weight"][front]
@@ -1109,7 +1136,8 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
         time_min_ns=params["time_min_ns"], time_max_ns=params["time_max_ns"],
         cosmic_t_range=shapes.t_range,
         first_bin=int(np.searchsorted(signal.centers(), SIGNAL_BOX_MIN_MEV)),
-        cosmic_p_bins=p_bins_cosmic)
+        cosmic_p_bins=p_bins_cosmic,
+        ce_time_floor_ns=params["front_time_min_ns"])
     centers = signal.centers()
     p_bins = (int(np.argmin(np.abs(centers - momentum_best["low_mev"]))),
               int(np.argmin(np.abs(centers - momentum_best["high_mev"]))))
@@ -1141,6 +1169,7 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
     cosmic_tsda = float(cosmic_geometry.kept.sum() / cosmic_geometry.norm) if tsda else -1.0
     metrics["ce_tsda_survival"] = ce_tsda
     metrics["cosmic_tsda_survival"] = cosmic_tsda
+    metrics["ce_front_time_survival"] = front_survival
 
     def span(name: str, unit: str) -> str:
         low, high = reported(name)
@@ -1180,6 +1209,12 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
          f"averaged over the helix phase): CE survival {ce_tsda:.4g}, cosmic "
          f"survival {cosmic_tsda:.4g} before the box cuts; DIO takes the CE's"
          if tsda else "  TSDA veto: not applied (tsda_veto = 0)"),
+        (f"  front-time cut: folded tracker-front time >= "
+         f"{params['front_time_min_ns']:g} ns kept {front_survival:.4g} of the "
+         "selected CEs (in the acceptance and shapes); the box time "
+         "efficiency is the exponential's share above it"
+         if params["front_time_min_ns"] > 0.0 else
+         "  front-time cut: not applied (front_time_min_ns = 0)"),
         f"  S = {rates['signal']:.3g}, DIO = {rates['dio']:.3g}, "
         f"cosmic = {rates['cosmic']:.3g} -> B = {rates['background']:.3g}, "
         f"S/sqrt(B) = {rates['sensitivity']:.4g}, Punzi FoM = {rates['fom']:.4g} "
@@ -1214,6 +1249,11 @@ def run(context: RunContext) -> RunOutcome:
     if context.params["tsda_veto"] not in (0, 1):
         return RunOutcome(error=(
             f"tsda_veto must be 0 or 1, got {context.params['tsda_veto']:g}"))
+    front_time_min_ns = context.params["front_time_min_ns"]
+    if not 0.0 <= front_time_min_ns < MICROBUNCH_NS:
+        return RunOutcome(error=(
+            f"front_time_min_ns must be in [0, {MICROBUNCH_NS:g}) ns (the "
+            f"microbunch), got {front_time_min_ns:g}"))
     if context.params["tsda_veto"] and cut_mode != "box":
         return RunOutcome(error=(
             "tsda_veto = 1 needs cut_mode='box': the veto is worked out from "
@@ -1252,6 +1292,14 @@ def run(context: RunContext) -> RunOutcome:
                 "with such a build, or use cut_mode='momentum', which works on "
                 "this file")
         mask = select_events(variables, selection)
+        front_survival = -1.0     # box mode only: momentum mode has no time model
+        if cut_mode == "box":
+            selected = float(variables["weight"][mask].sum())
+            if front_time_min_ns > 0.0:
+                mask = mask & front_time_kept(variables["primary_trk_front_time"],
+                                              front_time_min_ns)
+            front_survival = (float(variables["weight"][mask].sum()) / selected
+                              if selected > 0.0 else 0.0)
         if stops_per_pot > 0.0:
             run_record = read_run_record(context.input_path)
             if run_record is not None and run_record["max_events"] is not None:
@@ -1319,7 +1367,8 @@ def run(context: RunContext) -> RunOutcome:
         box = None
         if cut_mode == "box":
             box = optimize_box(variables, mask, signal_reco, dio_reco, cosmic,
-                               best, context.params, signal_kernel, signal_scale)
+                               best, context.params, signal_kernel, signal_scale,
+                               front_survival)
     except (SensitivityError, EdepTreeError, SelectionError) as exc:
         return RunOutcome(error=str(exc), extra={"selection": selection})
 
@@ -1583,6 +1632,20 @@ SPEC = AnalysisSpec(
                         "and ce_tsda_survival / cosmic_tsda_survival report "
                         "the surviving fractions (-1 when off).",
             default=0, minimum=0, maximum=1,
+        ),
+        ParamSpec(
+            name="front_time_min_ns",
+            description="Box mode: drop CE events whose time at the tracker "
+                        "front (EdepAna primary_trk_front_time, folded into the "
+                        "1695 ns microbunch) is below this, as the "
+                        "production's digitization window does (default "
+                        f"{FRONT_TIME_MIN_NS:g} ns; 0 turns it off). It reduces "
+                        "the CE acceptance by the events' own times, which "
+                        "shift with the stopping target, and the box's CE "
+                        "time efficiency becomes the exponential's share "
+                        "above it; ce_front_time_survival reports the kept "
+                        "fraction (-1 in momentum mode, where it is ignored).",
+            default=FRONT_TIME_MIN_NS, minimum=0.0, maximum=MICROBUNCH_NS,
         ),
         ParamSpec(
             name="selection",
