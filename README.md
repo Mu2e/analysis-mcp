@@ -77,6 +77,10 @@ tools/
     occupancy_digi.py          digi occupancy of dig files
     occupancy_reco.py          hit/cluster occupancy of mcs/rec files
     occupancy_ntuple.py        the same counts read from an EventNtuple
+    edep_occupancy.py          EdepAna's occupancy histograms: per-microbunch
+                               scaling, peak channel rates, plots; reuses
+                               edep.py's job and fcl
+    edep_occupancy_combine.py  adds those histograms over pileup components
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
       cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
@@ -118,7 +122,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event, the events passing a `selection`, and (with an Offline that has the step counts) approximate calo/tracker hit counts from detector steps |
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
-| `approx_ce_sensitivity` | `nts.*.root` from `edep`, optionally a `reference_file` from another configuration | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts; with a reference, the same for it and overlay plots |
+| `approx_ce_sensitivity` | `nts.*.root` from `edep`, optionally a `reference_file` from another configuration | `S/sqrt(B)` for the best momentum window (or, with `cut_mode="box"`, the best momentum/time/R(max)/d0/cos box), with the cuts and its signal/DIO/cosmic counts; with a reference, the same for it and overlay plots |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
 | `fullsim_sensitivity` | reconstructed CE-mixed-with-pileup EventNtuple `nts.*.root` file(s), e.g. CeMLeadingLogMix1BB | `S/sqrt(B)` for the best momentum window, as `approx_ce_sensitivity`, with the signal efficiency and detector response measured after the CE-like cuts |
 | `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
@@ -131,6 +135,8 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `calo_cluster_resolution_ntuple` | simulated EventNtuple file(s) (calo MC truth) | calorimeter cluster dE (reco minus true energy) and dT (reco time minus earliest true deposit) for clusters passing a selection: plots, histograms, mean/rms/median/sigma68 |
 | `variable_comparison_ntuple` | two sets of EventNtuple file(s): the input (new) and a `reference_file(s)` (baseline) | one track or cluster variable compared: overlaid distributions with ratio, shifts and a KS test, and, for the same events, how many changed, gained or lost and by how much |
 | `muon_stops` | `sim.*.TargetStops.*.art` (or PolyStops / IPAStops) | where (z, radius), when and with what momentum at ST_In the muons stopped: metrics, plots, ROOT histograms |
+| `edep_occupancy` | dts art file(s) of ONE pileup component | detector occupancy and dose per microbunch, and the peak channel rates (straw, straw row over six panels, crystal, crystal-centre radius per calo disk) in kHz and MeV/s, with plots; needs an Offline with the EdepAna occupancy histograms |
+| `edep_occupancy_combine` | `occupancy_per_microbunch.root` file(s) from `edep_occupancy` | the same metrics for the sum of the components (channel by channel, not a sum of peaks), and each component's share of the peak channels |
 | `total_edep_per_pot` | none: parameters only (earlier `edep` and `muon_stop_rate` metrics) | the early electron-beam flash, early muon-beam flash and muon-stop pileup depositions per POT, their total and each one's share |
 
 `approx_ce_sensitivity` declares `produced_by = ["edep"]`, so chaining is
@@ -180,6 +186,13 @@ Six more variables, the per-event step counts `event_{calo,trk}_nsteps`,
 a tree written by an EdepAna with the step counts. They are read only where the
 file has them; a selection naming one against a tree without them is refused
 with a plain error (for `edep` on an older Offline, before the job runs).
+
+Likewise six helix variables exist only in a tree from an Offline with PR
+#2092 (not yet in a Musing): `primary_trk_front_r_center`, `_radius`, `_cos` and
+`_time` (read only if all four branches are in every file; EdepAna's -1 and
+"no front step" values are NaN), and the derived `primary_trk_front_rmax`
+(= r_center + radius) and `primary_trk_front_d0` (= r_center - radius, signed;
+Mu2e's d0 = rmax - 2R). `approx_ce_sensitivity`'s `cut_mode="box"` needs them.
 
 The defaults reproduce the fixed cuts the module's histograms and summary had:
 `event_calo_edep_vis > 50` for `edep` (so `n_events_selected` equals
@@ -919,6 +932,154 @@ momentum window:
 4. **Window scan** — every `[x1, x2]` with `x1 >= 50 MeV`, keeping the best
    S/sqrt(B). The top 10 windows go to the log.
 
+### Box cuts (`cut_mode="box"`)
+
+`cut_mode="momentum"` (the default) is everything above: the momentum window
+alone, with no time or geometry cut, and every number as it was before the box
+option existed. `cut_mode="box"` also optimizes cuts on **time, R(max), d0 and
+cos(theta)** next to the momentum window, by coordinate ascent on the Punzi
+figure of merit S/(a/2 + sqrt(B)) with a = 1.28 (90% CL). Not S/sqrt(B): with
+five cut variables the background can be cut to ~0 while keeping a sliver of
+signal, where S/sqrt(B) diverges; the expected limit scales roughly as
+1/FoM. It
+needs a tree with the tracker-front helix branches (see the selection section;
+an Offline with PR #2092, not yet in a Musing) and otherwise returns an error
+saying so and that `cut_mode="momentum"` works on the file.
+
+New parameters: `cut_mode`, `muon_lifetime_ns` (default 864, the bound-muon
+lifetime in aluminum), `time_min_ns` / `time_max_ns` (default 525 / 1650: the
+base time cut, which the time optimization may only tighten). In momentum mode
+the time window is **not** applied.
+
+`tsda_veto` (box mode only, default 0) set to 1 adds a fast-sim version of the
+reco TSDA veto, which rejects a track whose upstream extrapolation reaches the
+TS downstream absorber (an annulus, 235 < r < 525 mm) instead of reflecting
+in the DS gradient. With rough nominal fields, 1 T at the tracker front and
+2 T at the TSDA (no field map), a track reaches it if
+sin^2(theta) x 2 T / 1 T < 1 (cos(theta) > 0.707, from p_T^2/B conserved). Its
+helix center rc = (R(max) + d0)/2 and radius R = (R(max) - d0)/2 shrink by
+sqrt(1/2) on the way, and with the phase at the TSDA unknown its chance of
+hitting is the fraction of the turn inside the annulus. Each CE event and
+cosmic sample point is weighted by 1 - that chance; DIO takes the CE's
+efficiency. `ce_tsda_survival` and `cosmic_tsda_survival` report the
+surviving fractions before the box cuts (-1 when off). A box whose cos cut
+stays below 0.707 is unaffected, since nothing in it reaches the TSDA.
+
+`front_time_min_ns` (box mode only, default 500; 0 turns it off) models the
+production's digitization window: a CE event whose tracker-front time
+(EdepAna `primary_trk_front_time`), folded into the 1695 ns microbunch, is
+below it is dropped from the selection, so from the CE acceptance, the signal
+shape and the DIO response alike. The events' own times carry the stopped
+muons' arrival times, which shift with the stopping target (the alternate
+designs' CEs arrive ~25-35 ns earlier, and the production keeps ~3% fewer of
+them), something the exponential time model cannot see. To not count the
+early loss twice, the box's CE time efficiency is then the exponential's share
+of [t1, t2] above the cut, eps_t / eps(front_time_min_ns, T).
+`ce_front_time_survival` reports the kept fraction of the selection (-1 in
+momentum mode, which ignores the parameter).
+
+Model. For the cosmics, momentum, time and the (helix-center radius rc, cos)
+distribution are taken as mutually separable; for the CE only time is separable
+from the rest, momentum and geometry are not (see S below). For a box [p1,p2] x [t1,t2] x
+R(max) x d0 x cos:
+
+- CE time follows the muon lifetime over one 1695 ns microbunch, density
+  exp(-t/tau): eps_t = (e^(-t1/tau) - e^(-t2/tau)) / (1 - e^(-T/tau)).
+  With `front_time_min_ns` = t_f > 0 this becomes the share above t_f,
+  eps_t(max(t1, t_f), max(t2, t_f)) / eps_t(t_f, T), on top of the per-event
+  front-time cut.
+  Cosmic time is flat over the time range of the loose cosmic shapes (the `t0`
+  axis of the shapes file, 400-1700 ns): eps_t = overlap / width.
+- CE geometry is counted per event: the weighted fraction of the selected
+  events that reached the tracker front whose (R(max), d0, cos) pass.
+- Cosmic geometry is a fixed-seed sample (200k points) drawn from the shapes
+  file's `rc_vs_cos` (bin by content, uniform inside it) with p flat over the
+  signal bins inside the shapes' momentum range (100-110 MeV/c) and
+  R = p sin(theta) / (0.299792458 B), B the effective field 1.036 T;
+  R(max) = rc + R, d0 = rc - R. Each point keeps its momentum bin, so the
+  geometry efficiency is counted in the box's own p window (R(max) and d0 grow
+  with p: a high R(max) cut passes only high-momentum cosmics). The p window is
+  therefore kept inside 100-110 MeV/c, where the loose rate is defined.
+- S = eps_CE,t x the sum, over the CE events passing the geometry cuts, of
+  weight x W(bin) x (the signal's per-entry normalization), W(j) being the
+  fraction of a unit entry in signal bin j that the tracker-resolution smearing
+  puts in the p window (a response matrix built with the same `Spectrum.smear`
+  as the signal). That is the smeared signal spectrum of only the passing
+  events: a d0 or R(max) cut removes low-energy-loss events preferentially, so
+  the in-window fraction is not the momentum-integrated one. With open geometry
+  it is the plain window sum. The log reports the in-window geometry
+  efficiency (signal with the geometry cuts / without) next to the
+  momentum-integrated one; `ce_box_efficiency` stays time x the
+  momentum-integrated geometry efficiency.
+  DIO = (DIO summed over the p window) x eps_CE,t x the CE's
+  momentum-integrated geometry efficiency: **a known first-order
+  approximation**, the DIO's time and geometry efficiencies are taken equal to
+  the CE's; DIO is a different momentum spectrum, so the CE's in-window
+  correlation does not transfer. Cosmic = eps_cos,t x the sum over the p
+  window of (cosmic spectrum in the bin) x (the sample's geometry efficiency
+  in that bin), with no further scaling; `cosmic_box_efficiency` is eps_cos,t
+  x the geometry efficiency in the window. Window sums are direct slice sums.
+- Because the box applies the time/R(max)/d0/cos cuts explicitly, `sig_eff`
+  must **not** include their efficiency (nor may `selection`, when
+  `stops_per_pot` takes the acceptance from it).
+
+**The cosmic rate.** In box mode `cosmic_rate_per_s_per_mev` is the
+cosmic-electron rate for the *loose* selection the shapes were extracted with
+(ConvAna set 81: e-, APR/CPR trigger, upstream-reflection and multi-track
+vetoes, 100 < p < 110 MeV/c; no t0, cos, R(max) or d0 cut). Its default (0
+means "the recommended rate for `cut_mode`") is the Run-1A rate 10/7.8e5 times
+the loose/tight yield ratio of the shapes file (`reference_cuts.combined`:
+0.0320 of the loose set passes the tight Run-1A cuts 540 < t0 < 1650 ns,
+0.525 < cos < 0.649, 482 < R(max) < 642.6 mm, so about 31x, ~4.0e-4 per s per
+MeV/c). In momentum mode the default is 10/7.8e5, applied as-is: the rate after
+whatever fixed selection the result is meant to represent. A value you pass
+overrides either; the metric and log report the value used, and the run's
+`cosmic_rate_source` says `mode default` or `user` (`cosmic_loose_to_tight_ratio`
+reports the ratio). In box mode `momentum_only_sensitivity` is computed with
+this loose-selection rate, so it is not the number momentum mode gives by
+default.
+
+Optimization. It starts from the momentum-only window (clipped to the cosmic
+sample's 100-110 MeV/c), the tight Run-1A cuts (time clipped to the base
+window) and no d0 cut; if no CE passes those geometry cuts it starts from open
+geometry instead, since a step that moves one variable could not leave it. Each step re-optimizes one
+variable's (low, high) pair jointly on a grid with the others fixed, by
+histogramming the variable for the events/sample points passing the other cuts
+and using cumulative sums outward from each lower edge (O(N + G^2)); a step is
+kept only if it does not lower the FoM. Order p, t, R(max), d0, cos.
+Grids: p = the spectrum bins in 100-110 MeV/c, t 5 ns steps inside the base window,
+R(max) 400-1100 mm in 5 mm, d0 -700..700 mm in 5 mm, cos 0..1 in 0.005 (the
+d0 and cos grids have under/overflow bins, so a cut at a grid end is open on
+that side). R(max) is never open below: a track needs R(max) > 400 mm to have
+hits in the tracker, so `RMAX_MIN_MM` is the floor of its lower cut for CE and
+cosmics alike (applied wherever the geometry is counted, so `ce_geometry` is
+relative to all selected events, including those below 400 mm). Sweeps stop when one gains < 1e-6 relative or after 20.
+
+Metrics. In box mode `sensitivity`, `signal_box_low_mev` / `_high_mev` (bin
+centers, as in momentum mode), `signal_rate`, `dio_background`,
+`cosmic_background` and `total_background` describe the optimized box. The new
+metrics are always reported, -1 in momentum mode: `time_low_ns`,
+`time_high_ns`, `rmax_low_mm`, `rmax_high_mm`, `d0_low_mm`, `d0_high_mm`,
+`cos_low`, `cos_high`, `ce_box_efficiency` (eps_CE,t x eps_CE,geom) and
+`cosmic_box_efficiency`; `momentum_only_sensitivity` is the momentum-only
+result in both modes, and `punzi_fom` is the Punzi FoM of the headline window
+or box in both modes. The log lists the final cuts, efficiencies, the
+loose/tight ratio and each sweep's FoM. Box mode adds one PNG per
+variable in `figures/` (`box_p.png`, `box_t.png`, `box_rmax.png`,
+`box_d0.png`, `box_cos.png`): the cosmic distribution as expected counts per
+bin in the optimized configuration, "nominal" (base time window, p in 100-110
+MeV/c, no box cuts) and "after the other cuts" (all optimized cuts but this
+variable's), with the selected range shaded. The CE signal is overlaid on a
+right-hand axis ("Expected CE counts / bin", dashed blue for "after", dotted
+for "nominal") in the same normalization as `signal_rate`: the smeared
+spectrum of the passing events for p, the lifetime model binned in time, and
+for the geometry variables the events' in-window signal.
+
+The cosmic shapes are `data/cosmic_shapes.json` and `data/cosmic_shapes.root`,
+found relative to the module. Regenerate them with
+`scripts/extract_cosmic_shapes.py` (read its docstring for the input and
+options).
+
 The numbers are rough by construction: this is a figure of merit for comparing
 beamline configurations, not a sensitivity calculation. Note it needs a **CE
 signal** sample — given a file where no event passes the selection and
@@ -1126,6 +1287,111 @@ On the Run1B `CeEndpointMix1BB-KL` dataset, `occupancy_reco` (50 events of
 749 straw digis, 54 calo hits and 5.7 clusters, CRV and background
 branches all zero.
 
+## edep_occupancy and edep_occupancy_combine
+
+How busy are the detectors in the pileup, and how busy is the busiest
+channel? `edep_occupancy` runs EdepAna over the dts files of ONE pileup
+component and reads the `EDepAna/occupancy/` histograms the module fills for
+every StrawGasStep and CaloShowerStep (a `<name>_occ` step count and a
+`<name>_edep` deposited energy per observable, plus "hit" histograms of steps
+above the step energy threshold and at or after the step time minimum, with
+the time folded into the microbunch). The job itself is `edep`'s: the same
+fcl, per-run step parameters and Offline probe, so a step parameter means
+here what it means there. **It needs an Offline whose EdepAna has the
+occupancy histograms** (Offline PR #2097, `edepana-occupancy`, not yet in a release);
+on any other it returns an error that says so.
+
+Per event becomes per microbunch and then a rate:
+
+```
+per microbunch = per event * events_per_microbunch
+rate           = per microbunch / microbunch_ns     (kHz for hits, MeV/s for dose)
+```
+
+`events_per_microbunch` is the mean number of dts events of this component per
+microbunch (POT per microbunch times the component's events per POT). It
+defaults to 1, so without it every number is per event. At 1.58e7 POT per
+microbunch (SimEfficiencies2 Sim_best v1_1, Run 1A) it is 92.78 for
+EleBeamFlashCat, 173.25 for MuBeamFlashCat, 226.57 for MuStopPileupCat, 3746.4
+for EarlyEleBeamFlashCat and 276.6 for EarlyMuBeamFlashCat. Run each component
+with its own value and give it a `label`.
+
+**Dose needs different samples than occupancy.** The regular
+`dts.mu2e.EleBeamFlashCat` and `MuBeamFlashCat` are time-filtered
+(DetStepFilter keeps events with a step folded after 250 ns or before 10 ns),
+so they miss the prompt flash. Their hit metrics are right, their `*_edep_*`
+metrics are not. Dose needs the `Early*FlashCat` samples, which are
+unfiltered and prescaled: their events per POT are the stage efficiencies
+times the prescale (1000 / 30 / 20), which is why the values above differ.
+
+**Metrics** (all also in `list_analyses`; `*_err` is the statistical error):
+
+| group | metrics |
+|---|---|
+| totals per microbunch | `trk_steps_per_ub`, `trk_edep_mev_per_ub`, `trk_hits_per_ub`, and `calo_*` likewise (a hit is a step above threshold and in the folded time window; tracker edep is StrawGasStep `ionizingEdep`, calo is `energyDepG4`, the true deposit) |
+| tracker straw | `trk_peak_straw_hit_rate_khz` and the straw it is (`trk_peak_straw_plane/panel/straw`), `trk_mean_straw_hit_rate_khz` (over all 20736), `trk_peak_straw_edep_rate_mev_per_s` |
+| tracker row | `trk_peak_row_hit_rate_khz` (+ `plane`, `straw`, `radius_mm`), `trk_peak_row_edep_rate_mev_per_s` |
+| calorimeter crystal | `calo_peak_crystal_hit_rate_khz` (+ `id`, `disk`), `calo_peak_crystal_edep_rate_mev_per_s` |
+| calorimeter radial | `calo_disk{0,1}_peak_radial_hit_rate_khz` (+ `hit_r_mm`), `calo_disk{0,1}_peak_radial_edep_rate_mev_per_s` (+ `edep_r_mm`), per crystal |
+
+The peak channel of the dose (where the edep peak is) can differ from the hit
+peak; it is in the result's `peak_channels` metadata.
+
+**Averaging over phi.** The peak of ~20000 straws or ~1350 crystals with few
+counts each is biased high and noisy, so the phi-averaged peaks are the ones to
+quote for a trend. A tracker **row** is one plane and one straw number in all
+six panels: panels are rotated copies, so those straws sit at the same radius
+(r = 380 + 3.125 x straw mm in every plane, checked on `geom_common.txt`;
+panel faces differ only in z, by 13.9 mm), and the row rate is their mean. The
+calorimeter has no z structure inside a crystal, so its average is radial: per
+disk, in 35 mm bins of the **crystal-centre** radius (385-665 mm, so every bin
+holds crystals), divided by the crystals in the bin (EdepAna fills
+`calo_disk<d>_ncrystals_r` once from the geometry).
+
+**Uncertainties** are the square root of the summed squared weights of the
+bins, scaled to the microbunch. They treat steps as independent. The steps of
+one event are correlated, so they underestimate the true error.
+
+**Artifacts** (`files`): EdepAna's own file, `occupancy_per_microbunch.root`
+(the scaled histograms, with variances, and a JSON of the settings), and four
+PNGs: `occupancy_trk_row_hit_rate.png` (plane vs straw radius),
+`occupancy_calo_radial_rate.png`, `occupancy_folded_time.png`,
+`occupancy_rz.png` (per-microbunch r vs z, occupancy and dose).
+
+`edep_occupancy_combine` adds components. The busiest channel of the sum is
+not the sum of the components' busiest channels, so it adds the per-channel
+histograms of each component's `occupancy_per_microbunch.root` (already scaled
+to a microbunch, so it needs no per-file factors), and reports the same
+metrics, plus `n_components`, for the total. The result's `components`
+metadata gives, per component, its totals, its rate in the channel where the
+SUM peaks, and its share there, for the straw, row, crystal and radial peaks.
+Its own output, `occupancy_total_per_microbunch.root`, can be combined again.
+Files made with different step cuts or microbunch periods are refused.
+
+On Run 1A MDC2025ac dts (EleBeamFlashCat 795k events, MuBeamFlashCat 2.05M,
+MuStopPileupCat 2.24M, all events, regular samples, defaults) the total is
+829.6 tracker steps and 350.2 hits per microbunch, a peak straw of 40.46 +- 1.5
+kHz (unique straw 2784: plane 4, panel 5, straw 0; MuStopPileup 21.5, MuBeamFlash
+15.8, EleBeamFlash 3.2), a mean straw of 9.96 kHz, a peak row of 31.7 +- 0.6 kHz
+(plane 2, straw 0, r = 380 mm), a peak crystal (hit rate) of 392 kHz (crystal 2,
+disk 0 inner ring) and radial peaks of 256 kHz (disk 0) and 154 kHz (disk 1) per
+crystal at r = 402 mm. **Statistics matter for the peak straw**: the same
+analysis on the first 300k events of each gives 55 kHz, because the maximum of
+20736 noisy straws is biased high. The phi-averaged row (34.5 kHz at 300k) is
+less affected, the radial calo peaks hardly at all; use the row and radial
+numbers, or many events, for the peak.
+
+```python
+for name, per_ub in (("MuStopPileupCat", 226.57), ("MuBeamFlashCat", 173.25),
+                     ("EleBeamFlashCat", 92.78)):
+    run_analysis(analysis="edep_occupancy", dataset=f"dts.mu2e.{name}.MDC2025ac.art",
+                 output_dir=f"/scratch/occ/{name}", max_files=3,
+                 parameters={"events_per_microbunch": per_ub, "label": name})
+run_analysis(analysis="edep_occupancy_combine", output_dir="/scratch/occ/total",
+             data_files=[f"/scratch/occ/{n}/occupancy_per_microbunch.root"
+                         for n in ("MuStopPileupCat", "MuBeamFlashCat", "EleBeamFlashCat")])
+```
+
 ## total_edep_per_pot
 
 The dose from the three beam-related sources, per POT. Each source is
@@ -1273,7 +1539,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-220 tests, none of which start a mu2e job or reach SAM or metacat (the
+254 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
