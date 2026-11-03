@@ -120,7 +120,9 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
 - **Reference inputs.** An `AnalysisSpec` with `takes_reference` requires
   a baseline (`reference_file(s)` / `reference_dataset` in `run_analysis`,
   resolved like `data_file(s)`), which the runner gets as
-  `context.reference_paths`; every other analysis refuses one. Add another
+  `context.reference_paths`; with `reference_optional` too
+  (`approx_ce_sensitivity`) the baseline may be left out and the paths are
+  empty. Every other analysis refuses one. Add another
   comparison that way rather than with a new tool argument.
 - **Default inputs.** An `AnalysisSpec` with `default_inputs` runs without
   `data_file(s)`; the trigger rate and timing default to

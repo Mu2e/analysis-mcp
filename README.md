@@ -118,7 +118,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event, the events passing a `selection`, and (with an Offline that has the step counts) approximate calo/tracker hit counts from detector steps |
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
-| `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts |
+| `approx_ce_sensitivity` | `nts.*.root` from `edep`, optionally a `reference_file` from another configuration | `S/sqrt(B)` for the best momentum window, with the window and its signal/DIO/cosmic counts; with a reference, the same for it and overlay plots |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
 | `fullsim_sensitivity` | reconstructed CE-mixed-with-pileup EventNtuple `nts.*.root` file(s), e.g. CeMLeadingLogMix1BB | `S/sqrt(B)` for the best momentum window, as `approx_ce_sensitivity`, with the signal efficiency and detector response measured after the CE-like cuts |
 | `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
@@ -258,12 +258,14 @@ physics numbers. `edep` records the `max_events` it ran with next to each file
 it writes (`<file>.edep.json`, not listed in `files`), and
 `approx_ce_sensitivity` refuses such a file when given `stops_per_pot`.
 
-An analysis that `list_analyses` shows with `takes_reference: true` (so far
-`variable_comparison_ntuple`) compares its input with a second, baseline
-sample, which it then requires: pass exactly one of `reference_file`,
+An analysis that `list_analyses` shows with `takes_reference: true`
+(`variable_comparison_ntuple`, `approx_ce_sensitivity`) compares its input
+with a second, baseline sample: pass exactly one of `reference_file`,
 `reference_files` or `reference_dataset`, given and resolved like
 `data_file`, `data_files` and `dataset` (`max_files` cuts either dataset).
-Any other analysis refuses them. The result's metadata lists them as
+It requires one unless it also shows `reference_optional: true`
+(`approx_ce_sensitivity`, which then runs on its input alone). Any other
+analysis refuses them. The result's metadata lists them as
 `reference_files`.
 
 ### Results
@@ -409,7 +411,11 @@ alone and run.
 `dio_background`, `cosmic_background`, `total_background`, the signal peak's
 `signal_mpv_mev` / `signal_fwhm_mev`, and the two assumptions those rates are
 built on — `npot` and `cosmic_rate_per_s_per_mev` — so a number never travels
-without its normalization. The summary line carries them too. Its `metadata`
+without its normalization. With a reference file it adds
+`reference_sensitivity`, `reference_signal_rate`,
+`reference_total_background`, `reference_signal_mpv_mev`,
+`reference_signal_fwhm_mev` and `sensitivity_ratio` (input / reference);
+without one these are NaN. The summary line carries them too. Its `metadata`
 also records the rest of the assumptions (`sig_eff`, `signal_br`, the
 `cosmic_rate_per_mev` the cosmic rate works out to over the live time, and
 `onspill_seconds`; with `stops_per_pot`, also `stops_per_pot`,
@@ -938,6 +944,33 @@ Three deviations from the macro, all deliberate:
   Run-1B CE sample that moves `dio_background` by ~2% and `sensitivity` by
   0.01%.
 
+### Overlaying a reference configuration
+
+Pass a `reference_file` (another configuration's CE `edep` file, e.g. the
+nominal geometry when `data_file` is a test geometry) and the same chain runs
+on it with the same `selection`, `npot` and cosmic rate, each sample in its
+own best window. The efficiency is the reference's own:
+`reference_stops_per_pot` (with `stops_per_pot`; times the reference file's
+CE acceptance) or `reference_sig_eff` (with `sig_eff`), 0 meaning the
+input's. `label` and `reference_label` name the two in the legends. On top of
+the single-sample figures it writes, input solid and reference dashed:
+
+- `figures/sig_vs_bkg_overlay.png`: signal, DIO and cosmics with both best
+  windows, and the signal ratio underneath;
+- `figures/signal_shape_overlay.png`: the smeared signal at unit area, with
+  each MPV and FWHM;
+- `figures/response_overlay.png`: the energy loss before the tracker at unit
+  area, with each mean.
+
+```python
+run_analysis(analysis="approx_ce_sensitivity", output_dir="out/noipa_vs_bb",
+             data_file=".../col5bf_noipa_001/anakit/ce_edep/nts.owner.edep.version.sequencer.root",
+             reference_file=".../col5bf_bb_001/anakit/ce_edep/nts.owner.edep.version.sequencer.root",
+             parameters={"stops_per_pot": 7.4792e-4,
+                         "reference_stops_per_pot": 7.47886e-4,
+                         "label": "No IPA", "reference_label": "nominal"})
+```
+
 ## fullsim_sensitivity
 
 The full-simulation counterpart of `approx_ce_sensitivity`, built the same
@@ -1240,7 +1273,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-216 tests, none of which start a mu2e job or reach SAM or metacat (the
+220 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 

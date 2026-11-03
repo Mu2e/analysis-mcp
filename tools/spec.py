@@ -175,6 +175,9 @@ class AnalysisSpec:
         takes_reference: Compares its input with a second, baseline sample,
             which the caller must pass as reference_file(s) or
             reference_dataset.
+        reference_optional: With takes_reference, the baseline may be left
+            out: the analysis runs on its input alone, and compares only
+            when given one.
     """
 
     name: str
@@ -197,6 +200,7 @@ class AnalysisSpec:
     default_inputs: Callable[[], list[Path]] | None = None
     default_inputs_hint: str = ""
     takes_reference: bool = False
+    reference_optional: bool = False
 
     @property
     def takes_file_list(self) -> bool:
@@ -219,6 +223,8 @@ class AnalysisSpec:
             entry["default_inputs"] = self.default_inputs_hint
         if self.takes_reference:
             entry["takes_reference"] = True
+            if self.reference_optional:
+                entry["reference_optional"] = True
         if self.fcl is not None:
             env = current_env()
             entry["fcl"] = str(env.resolve_fcl(self.fcl))

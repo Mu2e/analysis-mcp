@@ -1036,6 +1036,92 @@ def test_generated_events_refuses_a_merged_file(tmp_dir):
         raise AssertionError("a merged file was accepted")
 
 
+# --- approx_ce_sensitivity: overlay with a reference configuration ------------
+
+def test_sensitivity_without_a_reference_reports_nan_reference_metrics(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"sig_eff": 1e-3})
+    assert result.status == "success", result.message
+    for name in ("reference_sensitivity", "reference_signal_rate",
+                 "reference_total_background", "reference_signal_mpv_mev",
+                 "reference_signal_fwhm_mev", "sensitivity_ratio"):
+        assert np.isnan(result.metadata[name]), name
+    assert not any("overlay" in f for f in result.files), result.files
+    assert "Reference" not in result.message
+    ce = list_analyses().metadata["analyses"]["approx_ce_sensitivity"]
+    assert ce["takes_reference"] is True and ce["reference_optional"] is True
+
+
+def test_sensitivity_against_itself_overlays_a_ratio_of_one(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          reference_file=str(path), output_dir=tmp_dir,
+                          parameters={"sig_eff": 1e-3, "label": "No IPA",
+                                      "reference_label": "nominal"})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert meta["reference_sensitivity"] == meta["sensitivity"]
+    assert meta["reference_signal_mpv_mev"] == meta["signal_mpv_mev"]
+    assert meta["sensitivity_ratio"] == 1.0
+    assert meta["reference_label"] == "nominal" and meta["n_reference_files"] == 1
+    names = {Path(f).name for f in result.files}
+    assert {"sig_vs_bkg.png", "sig_vs_bkg_overlay.png", "signal_shape_overlay.png",
+            "response_overlay.png"} <= names, names
+    assert "Reference: S/sqrt(B)" in result.message, result.message
+    log = (Path(tmp_dir) / "approx_ce_sensitivity.log").read_text()
+    assert "Reference (nominal)" in log and "No IPA / nominal = 1" in log, log
+
+
+def test_reference_keeps_its_own_stopping_rate(tmp_dir):
+    new, ref = Path(tmp_dir) / "new.root", Path(tmp_dir) / "ref.root"
+    _write_edep_tree(new, n=4000, ngen_total=8000)       # acceptance 0.5
+    _write_edep_tree(ref, n=4000, ngen_total=10000)      # acceptance 0.4
+    params = {"stops_per_pot": 2e-3, "selection": ""}
+    same = run_analysis(analysis="approx_ce_sensitivity", data_file=str(new),
+                        reference_file=str(ref), output_dir=str(Path(tmp_dir) / "a"),
+                        parameters=params)
+    own = run_analysis(analysis="approx_ce_sensitivity", data_file=str(new),
+                       reference_file=str(ref), output_dir=str(Path(tmp_dir) / "b"),
+                       parameters={**params, "reference_stops_per_pot": 3e-3})
+    assert same.status == own.status == "success", (same.message, own.message)
+    # 0 means the input's stopping rate, times the reference's own acceptance
+    assert same.metadata["reference_stops_per_pot"] == 2e-3
+    assert np.isclose(same.metadata["reference_sig_eff"], 2e-3 * 0.4)
+    assert np.isclose(own.metadata["reference_sig_eff"], 3e-3 * 0.4)
+    assert own.metadata["sig_eff"] == same.metadata["sig_eff"] == 1e-3
+    assert own.metadata["reference_sensitivity"] > same.metadata["reference_sensitivity"]
+    assert own.metadata["sensitivity"] == same.metadata["sensitivity"]
+
+
+def test_sensitivity_refuses_reference_inputs_that_do_not_fit(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+
+    def attempt(**kwargs):
+        params = kwargs.pop("parameters")
+        return run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                            output_dir=tmp_dir, parameters=params, **kwargs)
+
+    alone = attempt(parameters={"sig_eff": 1e-3, "reference_sig_eff": 2e-3})
+    assert alone.status == "error" and "reference_file" in alone.message, alone.message
+    mixed = attempt(reference_file=str(path),
+                    parameters={"sig_eff": 1e-3, "reference_stops_per_pot": 2e-3})
+    assert mixed.status == "error" and "same way" in mixed.message, mixed.message
+    two = attempt(reference_files=[str(path), str(path)],
+                  parameters={"sig_eff": 1e-3})
+    assert two.status == "error" and "one reference file" in two.message, two.message
+    other = Path(tmp_dir) / "other.root"
+    _write_edep_tree(other)
+    tight = attempt(reference_file=str(other),
+                    parameters={"sig_eff": 1e-3,
+                                "selection": "event_calo_edep_vis > 1000"})
+    assert tight.status == "error"     # the input fails first, as before
+    assert "reference" not in tight.message, tight.message
+
+
 def test_sensitivity_refuses_a_nan_efficiency_input(tmp_dir):
     path = Path(tmp_dir) / "nts.owner.edep.test.root"
     _write_edep_tree(path, n=100, ngen_total=200)

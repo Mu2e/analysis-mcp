@@ -24,11 +24,16 @@ The chain, following the original macro:
 5. Scan every window [x1, x2] with x1 >= 50 MeV and keep the one maximizing
    S/sqrt(B).
 
+Given a reference file too (another configuration's CE sample), the same
+chain runs on it with the same assumptions, apart from its own stopping rate
+or efficiency, and the two are overlaid: signal and backgrounds, the signal
+shape, and the energy-loss response.
+
 The numbers are rough by construction — this is a figure of merit for
 comparing beamline configurations, not a sensitivity calculation.
 """
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -264,7 +269,99 @@ def _write_plots(outdir: Path, signal: Spectrum, dio_reco: Spectrum,
     return written
 
 
-# --- the runner --------------------------------------------------------------
+def _unit_area(spectrum: Spectrum) -> np.ndarray:
+    total = spectrum.values.sum() * spectrum.width
+    return spectrum.values / total if total > 0.0 else spectrum.values
+
+
+def _write_overlay_plots(outdir: Path, new: "SampleResult", ref: "SampleResult",
+                         label: str, reference_label: str) -> list[str]:
+    """The input (solid) over the reference (dashed). Returns the paths
+    written."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    figdir = outdir / "figures"
+    figdir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+    samples = ((new, label, "-"), (ref, reference_label, "--"))
+    xlim = (min(95.0, *(s.mpv - 1.5 * s.fwhm for s in (new, ref))),
+            max(105.0, *(s.mpv + 1.5 * s.fwhm for s in (new, ref))))
+
+    def step(ax, spectrum: Spectrum, values=None, **kwargs):
+        ax.stairs(spectrum.values if values is None else values,
+                  spectrum.edges(), **kwargs)
+
+    def save(fig, filename: str) -> None:
+        fig.tight_layout()
+        path = figdir / filename
+        fig.savefig(path, dpi=150)
+        plt.close(fig)
+        written.append(str(path))
+
+    # signal vs background, both samples, with the signal ratio underneath
+    fig, (ax, rax) = plt.subplots(2, 1, figsize=(8, 7.5), sharex=True,
+                                  gridspec_kw={"height_ratios": (3, 1)})
+    for sample, name, ls in samples:
+        best = sample.best
+        step(ax, sample.signal, color="tab:blue", ls=ls, lw=1.8,
+             label=f"Signal, {name} (S/sqrt(B) = {best['sensitivity']:.3g})")
+        step(ax, sample.dio_reco, color="tab:red", ls=ls, lw=1.8,
+             label=f"DIO, {name}")
+        for edge in (best["low_mev"], best["high_mev"]):
+            ax.axvline(edge, color="0.4", ls=ls, lw=1.0)
+    # the cosmic rate depends on the run's parameters alone: one line
+    step(ax, new.cosmic, color="tab:green", lw=1.8, label="Cosmic (both)")
+    ax.set_yscale("log")
+    ax.set_xlim(*xlim)
+    ax.set_ylim(1e-3, 1e4)
+    ax.set_ylabel(f"Rate / {new.signal.width:.1f} MeV")
+    ax.set_title(f"{label} (solid) vs. {reference_label} (dashed), "
+                 f"S/sqrt(B) ratio {new.best['sensitivity'] / ref.best['sensitivity']:.3g}")
+    ax.legend(ncols=2, fontsize="small")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.where(ref.signal.values > 0.0,
+                         new.signal.values / ref.signal.values, np.nan)
+    step(rax, new.signal, values=ratio, color="tab:blue", lw=1.5)
+    rax.axhline(1.0, color="0.5", lw=0.8)
+    rax.set_ylim(0.0, 2.0)
+    rax.set_xlabel("Energy (MeV)")
+    rax.set_ylabel(f"Signal {label} / {reference_label}", fontsize="small")
+    save(fig, "sig_vs_bkg_overlay.png")
+
+    # signal shape (unit area): where the peak sits and how wide it is
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for sample, name, ls in samples:
+        step(ax, sample.signal, values=_unit_area(sample.signal), color="tab:blue",
+             ls=ls, lw=1.8, label=f"{name}: MPV {sample.mpv:.2f}, "
+                                  f"FWHM {sample.fwhm:.2f} MeV")
+    ax.set_xlim(*xlim)
+    ax.set_xlabel("Energy (MeV)")
+    ax.set_ylabel("Fraction per MeV")
+    ax.set_title("Signal shape after the tracker resolution (unit area)")
+    ax.legend(fontsize="small")
+    save(fig, "signal_shape_overlay.png")
+
+    # energy loss before the tracker (unit area)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    for sample, name, ls in samples:
+        values = _unit_area(sample.response)
+        mean = float((sample.response.centers() * values).sum()
+                     * sample.response.width)
+        step(ax, sample.response, values=values, color="tab:blue", ls=ls, lw=1.5,
+             label=f"{name}: mean {mean:.2f} MeV")
+    ax.set_yscale("log")
+    ax.set_xlabel("Energy difference (MeV)")
+    ax.set_ylabel("Fraction per MeV")
+    ax.set_title("Energy loss before the tracker (unit area)")
+    ax.legend(fontsize="small")
+    save(fig, "response_overlay.png")
+
+    return written
+
+
+# --- selected events ---------------------------------------------------------
 
 def selected_hist(variables: dict[str, np.ndarray], mask: np.ndarray,
                   name: str) -> Spectrum:
@@ -317,94 +414,196 @@ def signal_efficiency(variables: dict[str, np.ndarray], mask: np.ndarray,
     return sig_eff, acceptance
 
 
+# --- one sample --------------------------------------------------------------
+
+@dataclass
+class SampleResult:
+    """What one EdepAna file gives: the spectra the plots draw, the best
+    window, and the normalization they were built on."""
+
+    path: Path
+    n_selected: int
+    n_events: int
+    selected_weight: float
+    sig_eff: float
+    ce_acceptance: float | None
+    n_gen_events: float | None
+    run_record: dict | None
+    signal_entries: float
+    signal: Spectrum          # smeared, as a rate
+    response: Spectrum        # energy-loss density, sig_eff folded in
+    resolution: Kernel
+    dio_true: Spectrum
+    dio_reco: Spectrum
+    cosmic: Spectrum
+    extras: dict[str, Spectrum]
+    best: dict[str, float]
+    top: list[dict]
+    mpv: float
+    fwhm: float
+    cosmic_rate: float
+    onspill_seconds: float
+
+
+def evaluate_sample(path: Path, params: dict[str, float | str], sig_eff: float,
+                    stops_per_pot: float) -> SampleResult:
+    """Steps 1-5 of the module docstring for one file. Exactly one of sig_eff
+    and stops_per_pot is > 0. Raises SensitivityError, EdepTreeError or
+    SelectionError with a message for the caller."""
+    npot = params["npot"]
+    selection = params["selection"]
+    ce_acceptance = n_gen_events = run_record = None
+
+    variables = read_edep_tree(path)
+    mask = select_events(variables, selection)
+    if stops_per_pot > 0.0:
+        run_record = read_run_record(path)
+        if run_record is not None and run_record["max_events"] is not None:
+            raise SensitivityError(
+                f"this file comes from an 'edep' run with max_events="
+                f"{run_record['max_events']}, which cuts a subrun short "
+                "while ngen keeps its whole generated-event count, so the "
+                "CE acceptance behind stops_per_pot would come out low; "
+                "rerun 'edep' without max_events, or pass sig_eff"
+            )
+        n_gen_events = generated_events(path)
+        sig_eff, ce_acceptance = signal_efficiency(variables, mask,
+                                                   n_gen_events, stops_per_pot)
+    n_selected = int(mask.sum())
+    signal = selected_hist(variables, mask, SIGNAL_VAR)
+    response = selected_hist(variables, mask, RESPONSE_VAR)
+    extras = {name: selected_hist(variables, mask, name)
+              for name in EXTRA_PLOT_VARS}
+
+    # Both normalizations divide by the entry count, so empty input is a
+    # clean error rather than a division by zero.
+    for hist in (signal, response):
+        if hist.entries <= 0:
+            raise SensitivityError(
+                f"no selected event has '{hist.name}': {n_selected} of "
+                f"{mask.size} events pass '{selection}', and none of them "
+                "reached the tracker front, so there is no signal shape to "
+                "work with. Run this on a CE (signal) sample, or loosen "
+                "the selection."
+            )
+
+    # 1-2. signal shape -> rate, then smeared by the tracker resolution
+    signal = signal.rebin(SIGNAL_REBIN)
+    signal_entries = float(signal.entries)
+    signal = signal.scaled(npot * SIGNAL_BR * sig_eff / signal.entries)
+    # A density in energy offset. The efficiency is folded in here, so it
+    # rides along with the response into the smeared DIO spectrum.
+    response = response.scaled(sig_eff / response.entries / response.width)
+    signal_reco = signal.smear(
+        Kernel.gaussian(signal.width, TRK_RESOLUTION_SIGMA_MEV)
+    )
+    mpv, fwhm = mpv_fwhm(signal_reco)
+
+    # 3. DIO: theory spectrum -> rate, smeared by the energy loss and then
+    # by the resolution on its own fine binning, then put on signal's bins.
+    dio_true = load_dio_spectrum().scaled((1. - MUON_CAPTURE_RATE) * sig_eff * npot)
+    resolution = Kernel.gaussian(dio_true.width, TRK_RESOLUTION_SIGMA_MEV)
+    dio_reco = (dio_true
+                .smear(Kernel.from_density(response, dio_true.width))
+                .smear(resolution)
+                .regrid(signal_reco))
+
+    # 4. cosmics: flat rate per MeV/c over the implied on-spill time
+    events = npot / params["mean_pot_per_event"]
+    onspill_seconds = events * ONSPILL_SECONDS_PER_EVENT
+    cosmic_rate = params["cosmic_rate_per_s_per_mev"] * onspill_seconds
+    cosmic = replace(
+        signal_reco, name="cosmic", title="Cosmics",
+        values=np.full(signal_reco.nbins, cosmic_rate * signal_reco.width),
+    )
+
+    # 5. best window
+    best, top = scan_signal_box(signal_reco, dio_reco, cosmic)
+    return SampleResult(
+        path=path, n_selected=n_selected, n_events=int(mask.size),
+        selected_weight=float(variables["weight"][mask].sum()),
+        sig_eff=sig_eff, ce_acceptance=ce_acceptance,
+        n_gen_events=n_gen_events, run_record=run_record,
+        signal_entries=signal_entries, signal=signal_reco, response=response,
+        resolution=resolution, dio_true=dio_true, dio_reco=dio_reco,
+        cosmic=cosmic, extras=extras, best=best, top=top, mpv=mpv, fwhm=fwhm,
+        cosmic_rate=cosmic_rate, onspill_seconds=onspill_seconds,
+    )
+
+
+def _sig_eff_line(sample: SampleResult, stops_per_pot: float) -> str:
+    return f"  sig_eff          {sample.sig_eff:g}" + (
+        "" if sample.ce_acceptance is None else
+        f"  (stops/POT {stops_per_pot:g} x CE acceptance {sample.ce_acceptance:g}"
+        f" = {sample.selected_weight:g} selected / "
+        f"{sample.n_gen_events:g} generated)")
+
+
+def _best_line(sample: SampleResult) -> str:
+    best = sample.best
+    return (f"Best window [{best['low_mev']:.1f}, {best['high_mev']:.1f}] MeV: "
+            f"S = {best['signal']:.3g}, DIO = {best['dio']:.3g}, "
+            f"cosmic = {best['cosmic']:.3g} -> B = {best['background']:.3g}, "
+            f"S/sqrt(B) = {best['sensitivity']:.4g}")
+
+
+# --- the runner --------------------------------------------------------------
+
 def run(context: RunContext) -> RunOutcome:
-    """Compute the approximate CE sensitivity for one EdepAna ROOT file."""
-    sig_eff = context.params["sig_eff"]
-    stops_per_pot = context.params["stops_per_pot"]
-    if np.isnan(sig_eff) or np.isnan(stops_per_pot):
-        return RunOutcome(error=(
-            f"sig_eff ({sig_eff:g}) and stops_per_pot ({stops_per_pot:g}) "
-            "must be numbers, not NaN"))
+    """Compute the approximate CE sensitivity for one EdepAna ROOT file, and
+    for a reference file too when one is given, overlaying the two."""
+    params = context.params
+    sig_eff = params["sig_eff"]
+    stops_per_pot = params["stops_per_pot"]
+    ref_sig_eff = params["reference_sig_eff"]
+    ref_stops_per_pot = params["reference_stops_per_pot"]
+    for name, value in (("sig_eff", sig_eff), ("stops_per_pot", stops_per_pot),
+                        ("reference_sig_eff", ref_sig_eff),
+                        ("reference_stops_per_pot", ref_stops_per_pot)):
+        if np.isnan(value):
+            return RunOutcome(error=f"{name} must be a number, not NaN")
     if (sig_eff > 0.0) == (stops_per_pot > 0.0):
         return RunOutcome(error=(
             "pass exactly one of sig_eff or stops_per_pot (> 0): sig_eff is "
             "the signal efficiency itself, stops_per_pot works it out with "
             "the file's own CE acceptance"))
-    ce_acceptance = n_gen_events = run_record = None
-    npot = context.params["npot"]
-    cosmic_rate_per_s_per_mev = context.params["cosmic_rate_per_s_per_mev"]
-    mean_pot_per_event = context.params["mean_pot_per_event"]
-    selection = context.params["selection"]
+    has_reference = bool(context.reference_paths)
+    if not has_reference and (ref_sig_eff > 0.0 or ref_stops_per_pot > 0.0):
+        return RunOutcome(error=(
+            "reference_sig_eff and reference_stops_per_pot apply only with a "
+            "reference_file, the baseline sample to overlay"))
+    if (ref_sig_eff > 0.0 and stops_per_pot > 0.0) or (
+            ref_stops_per_pot > 0.0 and sig_eff > 0.0):
+        return RunOutcome(error=(
+            "the reference is normalized the same way as the input: with "
+            "sig_eff give reference_sig_eff, with stops_per_pot give "
+            "reference_stops_per_pot"))
+    if len(context.reference_paths) > 1:
+        return RunOutcome(error=(
+            f"takes one reference file, as it takes one data_file; got "
+            f"{len(context.reference_paths)}"))
+    selection = params["selection"]
     outdir = context.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
     try:
-        variables = read_edep_tree(context.input_path)
-        mask = select_events(variables, selection)
-        if stops_per_pot > 0.0:
-            run_record = read_run_record(context.input_path)
-            if run_record is not None and run_record["max_events"] is not None:
-                raise SensitivityError(
-                    f"this file comes from an 'edep' run with max_events="
-                    f"{run_record['max_events']}, which cuts a subrun short "
-                    "while ngen keeps its whole generated-event count, so the "
-                    "CE acceptance behind stops_per_pot would come out low; "
-                    "rerun 'edep' without max_events, or pass sig_eff"
-                )
-            n_gen_events = generated_events(context.input_path)
-            sig_eff, ce_acceptance = signal_efficiency(variables, mask,
-                                                       n_gen_events, stops_per_pot)
-        n_selected = int(mask.sum())
-        signal = selected_hist(variables, mask, SIGNAL_VAR)
-        response = selected_hist(variables, mask, RESPONSE_VAR)
-        extras = {name: selected_hist(variables, mask, name)
-                  for name in EXTRA_PLOT_VARS}
-
-        # Both normalizations divide by the entry count, so empty input is a
-        # clean error rather than a division by zero.
-        for hist in (signal, response):
-            if hist.entries <= 0:
-                raise SensitivityError(
-                    f"no selected event has '{hist.name}': {n_selected} of "
-                    f"{mask.size} events pass '{selection}', and none of them "
-                    "reached the tracker front, so there is no signal shape to "
-                    "work with. Run this on a CE (signal) sample, or loosen "
-                    "the selection."
-                )
-
-        # 1-2. signal shape -> rate, then smeared by the tracker resolution
-        signal = signal.rebin(SIGNAL_REBIN)
-        signal = signal.scaled(npot * SIGNAL_BR * sig_eff / signal.entries)
-        # A density in energy offset. The efficiency is folded in here, so it
-        # rides along with the response into the smeared DIO spectrum.
-        response = response.scaled(sig_eff / response.entries / response.width)
-        signal_reco = signal.smear(
-            Kernel.gaussian(signal.width, TRK_RESOLUTION_SIGMA_MEV)
-        )
-        mpv, fwhm = mpv_fwhm(signal_reco)
-
-        # 3. DIO: theory spectrum -> rate, smeared by the energy loss and then
-        # by the resolution on its own fine binning, then put on signal's bins.
-        dio_true = load_dio_spectrum().scaled((1. - MUON_CAPTURE_RATE) * sig_eff * npot)
-        resolution = Kernel.gaussian(dio_true.width, TRK_RESOLUTION_SIGMA_MEV)
-        dio_reco = (dio_true
-                    .smear(Kernel.from_density(response, dio_true.width))
-                    .smear(resolution)
-                    .regrid(signal_reco))
-
-        # 4. cosmics: flat rate per MeV/c over the implied on-spill time
-        events = npot / mean_pot_per_event
-        onspill_seconds = events * ONSPILL_SECONDS_PER_EVENT
-        cosmic_rate = cosmic_rate_per_s_per_mev * onspill_seconds
-        cosmic = replace(
-            signal_reco, name="cosmic", title="Cosmics",
-            values=np.full(signal_reco.nbins, cosmic_rate * signal_reco.width),
-        )
-
-        # 5. best window
-        best, top = scan_signal_box(signal_reco, dio_reco, cosmic)
+        sample = evaluate_sample(context.input_path, params, sig_eff,
+                                 stops_per_pot)
     except (SensitivityError, EdepTreeError, SelectionError) as exc:
         return RunOutcome(error=str(exc), extra={"selection": selection})
+    ref = None
+    if has_reference:
+        # 0 means "the input's": two configurations usually differ in their
+        # stopping rate, so the caller passes the reference's own.
+        ref_stops = ref_stops_per_pot or stops_per_pot
+        try:
+            ref = evaluate_sample(context.reference_paths[0], params,
+                                  ref_sig_eff or sig_eff, ref_stops)
+        except (SensitivityError, EdepTreeError, SelectionError) as exc:
+            return RunOutcome(error=f"reference file: {exc}",
+                              extra={"selection": selection})
+    best = sample.best
+    nan = float("nan")
 
     metrics = {
         "sensitivity": float(best["sensitivity"]),
@@ -414,76 +613,112 @@ def run(context: RunContext) -> RunOutcome:
         "dio_background": float(best["dio"]),
         "cosmic_background": float(best["cosmic"]),
         "total_background": float(best["background"]),
-        "signal_mpv_mev": float(mpv),
-        "signal_fwhm_mev": float(fwhm),
+        "signal_mpv_mev": float(sample.mpv),
+        "signal_fwhm_mev": float(sample.fwhm),
         # The assumptions the rates above are built on, reported with them so
         # a number never travels without the normalization behind it.
-        "npot": float(npot),
-        "cosmic_rate_per_s_per_mev": float(cosmic_rate_per_s_per_mev),
+        "npot": float(params["npot"]),
+        "cosmic_rate_per_s_per_mev": float(params["cosmic_rate_per_s_per_mev"]),
+        # The reference's, each in its own best window; NaN without one.
+        "reference_sensitivity": nan if ref is None else float(ref.best["sensitivity"]),
+        "reference_signal_rate": nan if ref is None else float(ref.best["signal"]),
+        "reference_total_background": (nan if ref is None
+                                       else float(ref.best["background"])),
+        "reference_signal_mpv_mev": nan if ref is None else float(ref.mpv),
+        "reference_signal_fwhm_mev": nan if ref is None else float(ref.fwhm),
+        "sensitivity_ratio": (nan if ref is None else
+                              float(best["sensitivity"] / ref.best["sensitivity"])),
     }
 
     log_path = outdir / "approx_ce_sensitivity.log"
     lines = [
         "approx_ce_sensitivity",
         f"  input            {context.input_path}",
-        f"  selection        {selection or '(none)'}: {n_selected} of {mask.size} events",
-        f"  sig_eff          {sig_eff:g}" + (
-            "" if ce_acceptance is None else
-            f"  (stops/POT {stops_per_pot:g} x CE acceptance {ce_acceptance:g}"
-            f" = {variables['weight'][mask].sum():g} selected / "
-            f"{n_gen_events:g} generated)"),
+        f"  selection        {selection or '(none)'}: {sample.n_selected} of "
+        f"{sample.n_events} events",
+        _sig_eff_line(sample, stops_per_pot),
     ]
-    if ce_acceptance is not None and run_record is None:
+    if sample.ce_acceptance is not None and sample.run_record is None:
         lines.append(
             "  WARNING          no edep run record next to the file, so this "
             "cannot confirm it comes from one full 'edep' run (without "
             "max_events, not merged); the CE acceptance is only as good as that")
     lines += [
-        f"  NPOT             {npot:g}",
+        f"  NPOT             {params['npot']:g}",
         f"  signal BR        {SIGNAL_BR:.4g} per stop  (R_mue = {R_MUE:g} per capture "
         f"x {MUON_CAPTURE_RATE:g} captures per stop)",
-        f"  cosmic rate      {cosmic_rate_per_s_per_mev:.4g} per s per MeV/c "
-        f"-> {cosmic_rate:.4g} per MeV/c ({onspill_seconds:.4g} s on-spill)",
-        f"  signal entries   {signal.entries:g}",
-        f"  MPV / FWHM       {mpv:.3f} / {fwhm:.3f} MeV",
+        f"  cosmic rate      {params['cosmic_rate_per_s_per_mev']:.4g} per s per MeV/c "
+        f"-> {sample.cosmic_rate:.4g} per MeV/c ({sample.onspill_seconds:.4g} s on-spill)",
+        f"  signal entries   {sample.signal_entries:g}",
+        f"  MPV / FWHM       {sample.mpv:.3f} / {sample.fwhm:.3f} MeV",
         "",
-        f"Best window [{best['low_mev']:.1f}, {best['high_mev']:.1f}] MeV: "
-        f"S = {best['signal']:.3g}, DIO = {best['dio']:.3g}, "
-        f"cosmic = {best['cosmic']:.3g} -> B = {best['background']:.3g}, "
-        f"S/sqrt(B) = {best['sensitivity']:.4g}",
+        _best_line(sample),
         "",
-        f"Top {len(top)} windows scanned:",
+        f"Top {len(sample.top)} windows scanned:",
     ]
     lines += [
         f"  [{e['low_mev']:6.1f}, {e['high_mev']:6.1f}] MeV  S = {e['signal']:9.3g}  "
         f"DIO = {e['dio']:9.3g}  cosmic = {e['cosmic']:9.3g}  "
         f"S/sqrt(B) = {e['sensitivity']:.4g}"
-        for e in top
+        for e in sample.top
     ]
+    if ref is not None:
+        lines += [
+            "",
+            f"Reference ({params['reference_label']})",
+            f"  input            {ref.path}",
+            f"  selection        {selection or '(none)'}: {ref.n_selected} of "
+            f"{ref.n_events} events",
+            _sig_eff_line(ref, ref_stops),
+            f"  signal entries   {ref.signal_entries:g}",
+            f"  MPV / FWHM       {ref.mpv:.3f} / {ref.fwhm:.3f} MeV",
+            "",
+            _best_line(ref),
+            "",
+            f"S/sqrt(B) {params['label']} / {params['reference_label']} = "
+            f"{metrics['sensitivity_ratio']:.4g}",
+        ]
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    files = _write_plots(outdir, signal_reco, dio_reco, cosmic, response,
-                         resolution.as_spectrum(dio_true.width, "resolution"),
-                         dio_true, extras, best, mpv, fwhm)
+    files = _write_plots(outdir, sample.signal, sample.dio_reco, sample.cosmic,
+                         sample.response,
+                         sample.resolution.as_spectrum(sample.dio_true.width,
+                                                       "resolution"),
+                         sample.dio_true, sample.extras, best, sample.mpv,
+                         sample.fwhm)
+    if ref is not None:
+        files += _write_overlay_plots(outdir, sample, ref, params["label"],
+                                      params["reference_label"])
 
     return RunOutcome(
         metrics=metrics,
         files=files,
         log_path=log_path,
         extra={
-            "sig_eff": sig_eff,
-            **({} if ce_acceptance is None else {
+            "sig_eff": sample.sig_eff,
+            **({} if sample.ce_acceptance is None else {
                 "stops_per_pot": stops_per_pot,
-                "ce_acceptance": ce_acceptance,
-                "n_gen_events": n_gen_events,
-                "edep_run_recorded": run_record is not None}),
+                "ce_acceptance": sample.ce_acceptance,
+                "n_gen_events": sample.n_gen_events,
+                "edep_run_recorded": sample.run_record is not None}),
             "selection": selection,
-            "n_events_selected": n_selected,
+            "n_events_selected": sample.n_selected,
             "signal_br": SIGNAL_BR,
-            "cosmic_rate_per_mev": cosmic_rate,
-            "onspill_seconds": onspill_seconds,
-            "signal_hist_entries": float(signal.entries),
+            "cosmic_rate_per_mev": sample.cosmic_rate,
+            "onspill_seconds": sample.onspill_seconds,
+            "signal_hist_entries": sample.signal_entries,
             "dio_table": str(DIO_TABLE),
+            **({} if ref is None else {
+                "label": params["label"],
+                "reference_label": params["reference_label"],
+                "reference_sig_eff": ref.sig_eff,
+                "reference_n_events_selected": ref.n_selected,
+                "reference_signal_box_low_mev": float(ref.best["low_mev"]),
+                "reference_signal_box_high_mev": float(ref.best["high_mev"]),
+                **({} if ref.ce_acceptance is None else {
+                    "reference_stops_per_pot": ref_stops,
+                    "reference_ce_acceptance": ref.ce_acceptance,
+                    "reference_n_gen_events": ref.n_gen_events})}),
         },
     )
 
@@ -496,6 +731,10 @@ def summarize(metrics: dict[str, float]) -> str:
         f"(S = {metrics['signal_rate']:.3g}, B = {metrics['total_background']:.3g}) "
         f"for {metrics['npot']:.3g} POT and a cosmic rate of "
         f"{metrics['cosmic_rate_per_s_per_mev']:.4g} per s per MeV/c."
+        + ("" if np.isnan(metrics["reference_sensitivity"]) else
+           f" Reference: S/sqrt(B) = {metrics['reference_sensitivity']:.4g} "
+           f"(S = {metrics['reference_signal_rate']:.3g}), ratio "
+           f"{metrics['sensitivity_ratio']:.4g}.")
     )
 
 
@@ -504,7 +743,8 @@ SPEC = AnalysisSpec(
     description=(
         "Approximate Run-1A conversion-electron sensitivity S/sqrt(B) from "
         "the EdepAna tree, with DIO and cosmic backgrounds, for a "
-        "configurable event selection."
+        "configurable event selection; optionally overlaid with a reference "
+        "configuration's."
     ),
     input_kind="root_file",
     produced_by=("edep",),
@@ -513,12 +753,17 @@ SPEC = AnalysisSpec(
         "signal_rate", "dio_background", "cosmic_background",
         "total_background", "signal_mpv_mev", "signal_fwhm_mev",
         "npot", "cosmic_rate_per_s_per_mev",
+        "reference_sensitivity", "reference_signal_rate",
+        "reference_total_background", "reference_signal_mpv_mev",
+        "reference_signal_fwhm_mev", "sensitivity_ratio",
     ),
     units={
         "signal_box_low_mev": "MeV",
         "signal_box_high_mev": "MeV",
         "signal_mpv_mev": "MeV",
         "signal_fwhm_mev": "MeV",
+        "reference_signal_mpv_mev": "MeV",
+        "reference_signal_fwhm_mev": "MeV",
         "npot": "POT",
         "cosmic_rate_per_s_per_mev": "per second per MeV/c",
     },
@@ -570,12 +815,47 @@ SPEC = AnalysisSpec(
                         "the original macro's histograms had.",
             default=DEFAULT_SELECTION, kind="text", allow_empty=True,
         ),
+        ParamSpec(
+            name="reference_sig_eff",
+            description="With a reference_file and sig_eff only: the "
+                        "reference sample's own signal efficiency. 0 means "
+                        "the same as sig_eff.",
+            default=0.0, minimum=0.0, maximum=1.0,
+        ),
+        ParamSpec(
+            name="reference_stops_per_pot",
+            description="With a reference_file and stops_per_pot only: the "
+                        "reference configuration's own stopped muons per POT "
+                        "(its muon_stop_rate stops_per_pot), times the "
+                        "reference file's CE acceptance as for "
+                        "stops_per_pot. 0 means the same as stops_per_pot.",
+            default=0.0, minimum=0.0, maximum=1.0,
+        ),
+        ParamSpec(
+            name="label",
+            description="Legend name of the input sample in the overlay "
+                        "plots, e.g. 'No IPA'.",
+            default="input", kind="text",
+        ),
+        ParamSpec(
+            name="reference_label",
+            description="Legend name of the reference sample in the overlay "
+                        "plots, e.g. 'nominal'.",
+            default="reference", kind="text",
+        ),
     ),
     input_hint=(
         "An EdepAna nts.*.root file from a CE (signal) sample, holding "
         f"{TREE_PATH} (EdepAna in Offline v13_39_00 or later), with events "
-        "passing the selection that reach the tracker front."
+        "passing the selection that reach the tracker front. Optionally a "
+        "reference_file of the same kind (another configuration's CE sample, "
+        "same selection, npot and cosmic rate), which is evaluated the same "
+        "way and overlaid: figures/sig_vs_bkg_overlay.png, "
+        "signal_shape_overlay.png and response_overlay.png, plus the "
+        "reference_* metrics (NaN without one)."
     ),
+    takes_reference=True,
+    reference_optional=True,
     run=run,
     summarize=summarize,
 )

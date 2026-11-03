@@ -47,7 +47,8 @@ def list_analyses() -> ArtifactResult:
 
     Comparisons: an analysis with `takes_reference` compares its input (the
     new sample) with a baseline passed as reference_file, reference_files
-    or reference_dataset.
+    or reference_dataset; with `reference_optional` too, the baseline may be
+    left out.
     """
     env = current_env()
     catalogue = {name: spec.describe() for name, spec in sorted(ANALYSES.items())}
@@ -142,7 +143,8 @@ def run_analysis(
         timeout_s: Kill the job if it runs longer than this many seconds.
             Raise it when passing many files.
         reference_file: For an analysis with `takes_reference` (see
-            list_analyses) only, and required there: the baseline the input
+            list_analyses) only, and required there unless it also lists
+            `reference_optional`: the baseline the input
             is compared with, e.g. the ntuple before a code change when
             data_file is the one after. Given as for data_file.
         reference_files: Several baseline files, as for data_files.
@@ -171,7 +173,8 @@ def run_analysis(
         return fail(f"compares nothing, so {' and '.join(reference)} does not "
                     "apply: only an analysis whose takes_reference is true (see "
                     "list_analyses) takes a reference.", **reference)
-    if spec.takes_reference and len(reference) != 1:
+    if spec.takes_reference and (len(reference) > 1 or (
+            not reference and not spec.reference_optional)):
         return fail("compares its input with a baseline: pass exactly one of "
                     "reference_file, reference_files or reference_dataset (the "
                     "baseline, e.g. before a change), with data_file(s) or "
