@@ -1584,7 +1584,7 @@ def run(context: RunContext) -> RunOutcome:
                               extra={"selection": selection})
     best = sample.best
     box = sample.box
-    nan = float("nan")
+    none = -1.0     # a reference metric without a reference, as NO_BOX_METRICS
 
     # What the momentum-only scan found stays in `best`; in box mode the
     # headline metrics describe the optimized box instead.
@@ -1610,15 +1610,16 @@ def run(context: RunContext) -> RunOutcome:
         "punzi_fom": float(punzi_fom(headline["signal"], headline["background"])),
         # -1 in momentum mode, where no such cut or efficiency exists.
         **(box["metrics"] if box is not None else NO_BOX_METRICS),
-        # The reference's, each in its own best window or box; NaN without one.
-        "reference_sensitivity": (nan if ref is None
+        # The reference's, each in its own best window or box; -1 without one
+        # (not NaN: the MCP reply turns NaN into null).
+        "reference_sensitivity": (none if ref is None
                                   else float(ref_headline["sensitivity"])),
-        "reference_signal_rate": nan if ref is None else float(ref_headline["signal"]),
-        "reference_total_background": (nan if ref is None
+        "reference_signal_rate": none if ref is None else float(ref_headline["signal"]),
+        "reference_total_background": (none if ref is None
                                        else float(ref_headline["background"])),
-        "reference_signal_mpv_mev": nan if ref is None else float(ref.mpv),
-        "reference_signal_fwhm_mev": nan if ref is None else float(ref.fwhm),
-        "sensitivity_ratio": (nan if ref is None else
+        "reference_signal_mpv_mev": none if ref is None else float(ref.mpv),
+        "reference_signal_fwhm_mev": none if ref is None else float(ref.fwhm),
+        "sensitivity_ratio": (none if ref is None else
                               float(headline["sensitivity"]
                                     / ref_headline["sensitivity"])),
     }
@@ -1732,7 +1733,7 @@ def run(context: RunContext) -> RunOutcome:
 
 
 def summarize(metrics: dict[str, float]) -> str:
-    reference = ("" if np.isnan(metrics["reference_sensitivity"]) else
+    reference = ("" if metrics["reference_sensitivity"] < 0.0 else     # -1: none
                  f" Reference: S/sqrt(B) = {metrics['reference_sensitivity']:.4g} "
                  f"(S = {metrics['reference_signal_rate']:.3g}), ratio "
                  f"{metrics['sensitivity_ratio']:.4g}.")
@@ -1960,7 +1961,7 @@ SPEC = AnalysisSpec(
         "same selection, npot, cosmic rate and cut_mode), which is evaluated "
         "the same way (its own box in box mode) and overlaid: "
         "figures/sig_vs_bkg_overlay.png, signal_shape_overlay.png and "
-        "response_overlay.png, plus the reference_* metrics (NaN without one)."
+        "response_overlay.png, plus the reference_* metrics (-1 without one)."
     ),
     takes_reference=True,
     reference_optional=True,

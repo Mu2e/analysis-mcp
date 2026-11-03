@@ -428,7 +428,7 @@ without its normalization. With a reference file it adds
 `reference_sensitivity`, `reference_signal_rate`,
 `reference_total_background`, `reference_signal_mpv_mev`,
 `reference_signal_fwhm_mev` and `sensitivity_ratio` (input / reference);
-without one these are NaN. The summary line carries them too. Its `metadata`
+without one these are -1. The summary line carries them too. Its `metadata`
 also records the rest of the assumptions (`sig_eff`, `signal_br`, the
 `cosmic_rate_per_mev` the cosmic rate works out to over the live time, and
 `onspill_seconds`; with `stops_per_pot`, also `stops_per_pot`,

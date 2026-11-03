@@ -1060,7 +1060,7 @@ def test_generated_events_refuses_a_merged_file(tmp_dir):
 
 # --- approx_ce_sensitivity: overlay with a reference configuration ------------
 
-def test_sensitivity_without_a_reference_reports_nan_reference_metrics(tmp_dir):
+def test_sensitivity_without_a_reference_reports_minus_one_reference_metrics(tmp_dir):
     path = Path(tmp_dir) / "nts.owner.edep.test.root"
     _write_edep_tree(path)
     result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
@@ -1069,7 +1069,7 @@ def test_sensitivity_without_a_reference_reports_nan_reference_metrics(tmp_dir):
     for name in ("reference_sensitivity", "reference_signal_rate",
                  "reference_total_background", "reference_signal_mpv_mev",
                  "reference_signal_fwhm_mev", "sensitivity_ratio"):
-        assert np.isnan(result.metadata[name]), name
+        assert result.metadata[name] == -1.0, name
     assert not any("overlay" in f for f in result.files), result.files
     assert "Reference" not in result.message
     ce = list_analyses().metadata["analyses"]["approx_ce_sensitivity"]
