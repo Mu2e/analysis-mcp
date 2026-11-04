@@ -425,10 +425,43 @@ STEP_PARAMS = (
      + _STEP_NOTE),
 )
 
+# The folded-time windows of EdepAna's occupancy "hit" histograms, from Offline
+# PR #2097 (merged 2026-11-03), all required there: (analysis parameter,
+# EdepAna key, default, minimum, maximum, description). Defaults are the PR's
+# Analyses/test/edep.fcl: the digitization windows measured from the marker
+# (tracker digitizationStart/End 450/1705 ns, calo 450/1795 ns) minus 200 ns.
+_WINDOW_NOTE = ("Used only by the occupancy hit histograms (Offline PR #2097); "
+                "the tree, the summary and the step counts keep the raw-time "
+                "step windows.")
+HIT_WINDOW_PARAMS = (
+    ("fold_time_offset_ns", "FoldTimeOffset", -200.0, -1e6, 1e6,
+     "Added to the raw step time before it is folded modulo the microbunch "
+     "period, like StrawDigisFromStrawGasSteps::microbunchTime. The default, "
+     "-200 ns (the nominal proton bunch time minus TimeFromProtonsToDRMarker), "
+     "puts folded times in the digitizers' event-window frame; 0 folds the raw "
+     "step time. " + _WINDOW_NOTE),
+    ("trk_hit_time_min_ns", "TrkHitTimeMin", 250.0, -1e6, 1e6,
+     "Tracker hit histograms: earliest folded step time (ns) counted. "
+     + _WINDOW_NOTE),
+    ("trk_hit_time_max_ns", "TrkHitTimeMax", 1505.0, -1e6, 1e6,
+     "Tracker hit histograms: latest folded step time (ns) counted. "
+     + _WINDOW_NOTE),
+    ("calo_hit_time_min_ns", "CaloHitTimeMin", 250.0, -1e6, 1e6,
+     "Calorimeter hit histograms: earliest folded step time (ns) counted. "
+     + _WINDOW_NOTE),
+    ("calo_hit_time_max_ns", "CaloHitTimeMax", 1595.0, -1e6, 1e6,
+     "Calorimeter hit histograms: latest folded step time (ns) counted. "
+     + _WINDOW_NOTE),
+)
+
 # The module whose parameters decide whether the step counts exist, and the
-# one it gained them with.
+# one it gained them with; likewise the occupancy hit windows. Offline
+# PR #2097 added FoldTimeOffset in one revision (4b9f0ae9) and the four
+# hit-time limits only in its last (63843fce), so probe one of those: it
+# means the module has all five.
 MODULE_TYPE = "EdepAna"
 STEP_PROBE_PARAMETER = "TrkStepEnergyThreshold"
+HIT_WINDOW_PROBE_PARAMETER = "TrkHitTimeMin"
 ANALYZER_LABEL = "EDepAna"           # in edep.fcl
 JOB_FCL_NAME = "edep_job.fcl"
 
@@ -493,19 +526,47 @@ def parse_step_counts(stdout: str) -> tuple[dict[str, float], dict[str, dict[str
     return metrics, windows
 
 
-def job_fcl_text(step_params: dict[str, float], base: Path = FCL) -> str:
-    """The run's fcl: the shipped edep.fcl plus the step-count parameters.
+def job_fcl_text(step_params: dict[str, float], base: Path = FCL,
+                 hit_windows: dict[str, float] | None = None) -> str:
+    """The run's fcl: the shipped edep.fcl plus the step-count parameters,
+    and the occupancy hit windows when `hit_windows` is given.
 
-    EdepAna with PR #2067 requires them and an older one rejects them, so they
-    cannot live in fcl/edep.fcl. FHiCL cannot `#include` an absolute path, so
-    this is a copy with the lines appended, as the trigger analyses do.
+    EdepAna with PR #2067 requires the step parameters (and with PR #2097 the
+    hit windows) and an older one rejects them, so they cannot live in
+    fcl/edep.fcl. FHiCL cannot `#include` an absolute path, so this is a copy
+    with the lines appended, as the trigger analyses do.
     """
     lines = [base.read_text(encoding="utf-8").rstrip(), "",
              "# --- set by tools/analyses/edep.py for this run (Offline PR #2067) ---"]
     for name, key, *_ in STEP_PARAMS:
         lines.append(f"physics.analyzers.{ANALYZER_LABEL}.{key} : "
                      f"{float(step_params[name])!r}")
+    if hit_windows is not None:
+        lines.append("# --- occupancy hit windows (Offline PR #2097) ---")
+        for name, key, *_ in HIT_WINDOW_PARAMS:
+            lines.append(f"physics.analyzers.{ANALYZER_LABEL}.{key} : "
+                         f"{float(hit_windows[name])!r}")
     return "\n".join(lines) + "\n"
+
+
+def hit_window_values(params: dict) -> dict[str, float]:
+    """The hit windows to run with: the caller's where set, else the defaults.
+
+    Only edep_occupancy exposes them; plain `edep` runs the defaults, which
+    an EdepAna with PR #2097 needs set even when nothing reads the histograms.
+    """
+    return {name: float(params.get(name, default))
+            for name, _, default, *_ in HIT_WINDOW_PARAMS}
+
+
+def hit_window_problem(windows: dict[str, float]) -> str | None:
+    """A complaint if a requested hit window is empty, else None."""
+    for det in ("trk", "calo"):
+        lo, hi = windows[f"{det}_hit_time_min_ns"], windows[f"{det}_hit_time_max_ns"]
+        if lo > hi:
+            return (f"{det}_hit_time_min_ns ({lo:g}) is above "
+                    f"{det}_hit_time_max_ns ({hi:g}): the window would be empty")
+    return None
 
 
 def step_param_problem(params: dict[str, float | str]) -> str | None:
@@ -565,6 +626,9 @@ def run(context: RunContext) -> RunOutcome:
     """
     try:
         with_steps = module_accepts(MODULE_TYPE, STEP_PROBE_PARAMETER, context.outdir)
+        # PR #2097 came after PR #2067, so only an EdepAna with steps can have it
+        with_windows = with_steps and module_accepts(
+            MODULE_TYPE, HIT_WINDOW_PROBE_PARAMETER, context.outdir)
     except ModuleProbeError as exc:
         return RunOutcome(error=f"could not tell whether the configured Offline's "
                                 f"EdepAna has the step counts: {exc}")
@@ -572,11 +636,15 @@ def run(context: RunContext) -> RunOutcome:
     fcl = FCL
     if with_steps:
         problem = step_param_problem(context.params)
+        windows = hit_window_values(context.params) if with_windows else None
+        if problem is None and windows is not None:
+            problem = hit_window_problem(windows)
         if problem:
             return RunOutcome(error=problem)
         context.outdir.mkdir(parents=True, exist_ok=True)
         fcl = context.outdir / JOB_FCL_NAME
-        fcl.write_text(job_fcl_text(context.params), encoding="utf-8")
+        fcl.write_text(job_fcl_text(context.params, hit_windows=windows),
+                       encoding="utf-8")
         extra["job_fcl"] = str(fcl)
     else:
         changed = non_default_step_params(context.params)
