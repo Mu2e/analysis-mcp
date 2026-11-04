@@ -1,4 +1,4 @@
-# analysis-mcp-server
+# analysis-mcp
 
 An example MCP server that exposes Mu2e analyses as agent tools. An agent asks
 which analyses exist, then runs one — either a mu2e job over art file(s):
@@ -1663,7 +1663,7 @@ CONFIG = {
         "transport": "stdio",
         "command": "python3",
         "args": ["-m", "analysis_mcp_server"],
-        "cwd": "/exp/mu2e/app/users/mmackenz/mu2eopt/analysis-mcp-server",
+        "cwd": "/path/to/analysis-mcp",
     }
 }
 tools = await load_tools(CONFIG)
