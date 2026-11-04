@@ -114,7 +114,7 @@ def _stub_module_accepts(module_type, parameter, outdir, **_):
     assert module_type == "EdepAna"
     if parameter == "TrkStepEnergyThreshold":
         return _OFFLINE_HAS_STEPS[0]
-    assert parameter == "FoldTimeOffset", parameter
+    assert parameter == "TrkHitTimeMin", parameter
     return _OFFLINE_HAS_STEPS[0] and _OFFLINE_HAS_WINDOWS[0]
 
 
@@ -3625,13 +3625,13 @@ def test_edep_occupancy_says_what_an_old_offline_needs(tmp_dir):
     # step counts but no hit windows: an older EdepAna or an unmerged #2097 build
     saved = edep_mod.module_accepts
     try:
-        edep_mod.module_accepts = lambda m, parameter, *a, **k: parameter != "FoldTimeOffset"
+        edep_mod.module_accepts = lambda m, parameter, *a, **k: parameter != "TrkHitTimeMin"
         outcome = eocc.run(RunContext(
             input_paths=[Path(tmp_dir) / "in.art"], outdir=Path(tmp_dir) / "nw",
             params=ANALYSES["edep_occupancy"].resolve_params({}), timeout_s=60))
     finally:
         edep_mod.module_accepts = saved
-    assert "FoldTimeOffset" in outcome.error and "PR #2097" in outcome.error
+    assert "TrkHitTimeMin" in outcome.error and "PR #2097" in outcome.error
     # a new enough EdepAna without the occupancy directory, or with an old one
     outcome, _ = _run_edep_occupancy(tmp_dir, None)
     assert "no EDepAna/occupancy directory" in outcome.error

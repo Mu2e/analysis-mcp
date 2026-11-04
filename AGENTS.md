@@ -109,7 +109,8 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
 - **`edep_occupancy` needs EdepAna's `occupancy/` histograms** (Offline PR
   #2097, merged 2026-11-03; Musings after it). Its last revision made five
   hit-window parameters required (`FoldTimeOffset`, `Trk/CaloHitTimeMin/Max`):
-  `edep.run` probes for `FoldTimeOffset` and appends them to the per-run fcl
+  `edep.run` probes for `TrkHitTimeMin` (an intermediate revision of the PR
+  has `FoldTimeOffset` alone) and appends them to the per-run fcl
   only when the module declares them (never in `fcl/edep.fcl`, which must stay
   valid for released Offline). `edep_occupancy` refuses an EdepAna without
   them, which also covers unmerged builds of the PR. It runs through `edep.run`

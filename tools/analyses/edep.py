@@ -455,10 +455,13 @@ HIT_WINDOW_PARAMS = (
 )
 
 # The module whose parameters decide whether the step counts exist, and the
-# one it gained them with; likewise the occupancy hit windows.
+# one it gained them with; likewise the occupancy hit windows. Offline
+# PR #2097 added FoldTimeOffset in one revision (4b9f0ae9) and the four
+# hit-time limits only in its last (63843fce), so probe one of those: it
+# means the module has all five.
 MODULE_TYPE = "EdepAna"
 STEP_PROBE_PARAMETER = "TrkStepEnergyThreshold"
-HIT_WINDOW_PROBE_PARAMETER = "FoldTimeOffset"
+HIT_WINDOW_PROBE_PARAMETER = "TrkHitTimeMin"
 ANALYZER_LABEL = "EDepAna"           # in edep.fcl
 JOB_FCL_NAME = "edep_job.fcl"
 
