@@ -649,12 +649,12 @@ async def main() -> int:
         #    combine adds their per-channel histograms. The peak of the sum
         #    is not the sum of the peaks, so the metrics are never added.
         scaled_files: list[str] = []
-        for label, per_ub, files in occupancy:
+        for component_index, (label, per_ub, files) in enumerate(occupancy):
             print(f"\n=== run_analysis: edep_occupancy on {label} "
                   f"({len(files)} file(s), {per_ub:g} events / microbunch) ===")
             occ = payload(await session.call_tool("run_analysis", {
                 "analysis": "edep_occupancy", **files_arg(files),
-                "output_dir": str(outdir / "edep_occupancy" / label),
+                "output_dir": str(outdir / "edep_occupancy" / f"component_{component_index}"),
                 "parameters": {"events_per_microbunch": per_ub, "label": label},
                 "timeout_s": args.timeout_s,
                 **({"max_events": args.max_events} if args.max_events else {}),
