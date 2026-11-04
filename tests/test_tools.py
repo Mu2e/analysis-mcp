@@ -104,12 +104,18 @@ EDEP_DESCRIPTION_NEW = EDEP_DESCRIPTION_OLD + """\
 
 # edep asks the configured Offline whether EdepAna has the step counts, which
 # would start mu2e: no test may, so the answer is stubbed. Tests set it.
+# Likewise whether it has the occupancy hit windows (Offline PR #2097), which
+# only an EdepAna with the step counts can have.
 _OFFLINE_HAS_STEPS = [True]
+_OFFLINE_HAS_WINDOWS = [True]
 
 
 def _stub_module_accepts(module_type, parameter, outdir, **_):
-    assert (module_type, parameter) == ("EdepAna", "TrkStepEnergyThreshold")
-    return _OFFLINE_HAS_STEPS[0]
+    assert module_type == "EdepAna"
+    if parameter == "TrkStepEnergyThreshold":
+        return _OFFLINE_HAS_STEPS[0]
+    assert parameter == "FoldTimeOffset", parameter
+    return _OFFLINE_HAS_STEPS[0] and _OFFLINE_HAS_WINDOWS[0]
 
 
 edep_mod.module_accepts = _stub_module_accepts
@@ -3613,8 +3619,19 @@ def test_edep_occupancy_is_unchanged_by_hadd_of_several_jobs(tmp_dir):
 
 
 def test_edep_occupancy_says_what_an_old_offline_needs(tmp_dir):
+    from tools.spec import RunContext
     outcome, _ = _run_edep_occupancy(tmp_dir, _occ_hists(), has_steps=False)
-    assert "occupancy histograms" in outcome.error and "edepana-occupancy" in outcome.error
+    assert "occupancy histograms" in outcome.error and "PR #2097" in outcome.error
+    # step counts but no hit windows: an older EdepAna or an unmerged #2097 build
+    saved = edep_mod.module_accepts
+    try:
+        edep_mod.module_accepts = lambda m, parameter, *a, **k: parameter != "FoldTimeOffset"
+        outcome = eocc.run(RunContext(
+            input_paths=[Path(tmp_dir) / "in.art"], outdir=Path(tmp_dir) / "nw",
+            params=ANALYSES["edep_occupancy"].resolve_params({}), timeout_s=60))
+    finally:
+        edep_mod.module_accepts = saved
+    assert "FoldTimeOffset" in outcome.error and "PR #2097" in outcome.error
     # a new enough EdepAna without the occupancy directory, or with an old one
     outcome, _ = _run_edep_occupancy(tmp_dir, None)
     assert "no EDepAna/occupancy directory" in outcome.error
@@ -3623,6 +3640,54 @@ def test_edep_occupancy_says_what_an_old_offline_needs(tmp_dir):
     del old["calo_crystal_hits"]
     outcome, _ = _run_edep_occupancy(tmp_dir, old, name="old")
     assert "lacks calo_crystal_hits" in outcome.error
+
+
+def test_edep_job_fcl_sets_the_hit_windows_only_when_asked():
+    params = ANALYSES["edep"].resolve_params({})
+    plain = edep_mod.job_fcl_text(params)
+    assert "FoldTimeOffset" not in plain and "HitTime" not in plain
+    windows = edep_mod.hit_window_values({"trk_hit_time_max_ns": 1400.0})
+    text = edep_mod.job_fcl_text(params, hit_windows=windows)
+    for key, value in (("FoldTimeOffset", "-200.0"), ("TrkHitTimeMin", "250.0"),
+                       ("TrkHitTimeMax", "1400.0"), ("CaloHitTimeMin", "250.0"),
+                       ("CaloHitTimeMax", "1595.0")):
+        assert f"physics.analyzers.EDepAna.{key} : {value}\n" in text, key
+    assert "FoldTimeOffset" not in (FCL_DIR / "edep.fcl").read_text(encoding="utf-8"), \
+        "the shipped fcl must stay valid for an Offline without the hit windows"
+    assert "trk_hit_time_min_ns" in edep_mod.hit_window_problem(
+        edep_mod.hit_window_values({"trk_hit_time_min_ns": 1600.0}))
+    assert edep_mod.hit_window_problem(edep_mod.hit_window_values({})) is None
+
+
+def test_edep_sets_the_hit_windows_only_on_an_offline_that_has_them(tmp_dir):
+    """Plain edep must still run on an EdepAna with #2097, which requires them."""
+    from tools.spec import RunContext
+    for has_windows in (True, False):
+        fake, calls = _fake_edep_job(tmp_dir)
+        real, _OFFLINE_HAS_WINDOWS[0] = edep_mod.run_mu2e_job, has_windows
+        edep_mod.run_mu2e_job = fake
+        try:
+            outdir = Path(tmp_dir) / f"w{has_windows}"
+            outcome = edep_mod.run(RunContext(
+                input_paths=[Path(tmp_dir) / "in.art"], outdir=outdir,
+                params=ANALYSES["edep"].resolve_params({}), timeout_s=60))
+        finally:
+            edep_mod.run_mu2e_job, _OFFLINE_HAS_WINDOWS[0] = real, True
+        assert outcome.error is None, outcome.error
+        text = calls.fcl[0].read_text()
+        assert ("FoldTimeOffset : -200.0" in text) == has_windows, has_windows
+        assert "TrkStepEnergyThreshold" in text
+
+
+def test_edep_occupancy_passes_its_hit_windows_and_records_them(tmp_dir):
+    outcome, seen = _run_edep_occupancy(
+        tmp_dir, _occ_hists(), parameters={"calo_hit_time_max_ns": 1500.0,
+                                           "fold_time_offset_ns": 0.0})
+    assert outcome.error is None, outcome.error
+    assert seen["params"]["calo_hit_time_max_ns"] == 1500.0
+    assert seen["params"]["fold_time_offset_ns"] == 0.0
+    _, meta = eocc.read_scaled_file(Path(tmp_dir) / "comp" / eocc.SCALED_FILE)
+    assert meta["step_cuts"]["calo_hit_time_max_ns"] == 1500.0
 
 
 def test_edep_occupancy_warns_when_the_microbunch_differs_from_the_folding(tmp_dir):

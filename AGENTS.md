@@ -107,7 +107,12 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   table, tree). A skipped collection's metrics are -1, never absent, so every
   listed metric is always reported; keep that when adding collections.
 - **`edep_occupancy` needs EdepAna's `occupancy/` histograms** (Offline PR
-  #2097, `edepana-occupancy`, in no release yet). It runs through `edep.run`
+  #2097, merged 2026-11-03; Musings after it). Its last revision made five
+  hit-window parameters required (`FoldTimeOffset`, `Trk/CaloHitTimeMin/Max`):
+  `edep.run` probes for `FoldTimeOffset` and appends them to the per-run fcl
+  only when the module declares them (never in `fcl/edep.fcl`, which must stay
+  valid for released Offline). `edep_occupancy` refuses an EdepAna without
+  them, which also covers unmerged builds of the PR. It runs through `edep.run`
   (never a second copy of the job/fcl logic) and then reads
   `EDepAna/occupancy`; a file without them is a plain error. Peaks of a sum
   are not sums of peaks, so `edep_occupancy_combine` adds the per-channel

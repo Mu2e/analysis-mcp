@@ -17,7 +17,12 @@ What it does, in the order an agent would:
                          --trigger-ntuple: the trigger efficiency read from
                          EventNtuple trig_<path> branches, for a track
                          selection -- no mu2e job
-  8. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
+  8. `run_analysis`   -- `edep_occupancy` once per pileup component you pass
+                         with --occupancy, then `edep_occupancy_combine` over
+                         their occupancy_per_microbunch.root files: the peak
+                         straw, straw-row, crystal and radial calo rates of
+                         the total pileup, and each component's share
+  9. `run_analysis`   -- `approx_ce_sensitivity` over the nts.*.root step 3
                          wrote, which is what `produced_by` is for
 
 Environment (the `ana` python already has the mcp SDK; no installs needed):
@@ -69,6 +74,21 @@ or --ntuple-selection. --trigger-paths applies, without the prescales:
         --trigger-ntuple /pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/MDC2025au_best_v1_1-001/root/a8/50/nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root \
         [--ntuple-selection 'status == 1 and pdg == 11 and downstream and 100 < p_front < 110']
 
+Pileup occupancy and peak channel rates, one --occupancy per component:
+LABEL[:EVENTS_PER_MICROBUNCH] then its dts file(s). The Run 1A events per
+microbunch of the MDC2025ac components are built in (see RUN1A_EVENTS_PER_UB),
+so a known label needs no number. With two or more components the totals are
+combined channel by channel. It needs an Offline whose EdepAna has the
+occupancy histograms (Offline PR #2097, merged 2026-11-03), so pass --musing
+with a Musing released after it, or --work-area on Offline main. --max-events is fine here (the averages use the events analyzed), but a
+peak straw from few events is biased high; the row and radial peaks less so:
+
+    python3 examples/simple_client.py --musing 'SimJob <Musing with #2097>' \
+        --occupancy MuStopPileupCat /pnfs/.../dts.mu2e.MuStopPileupCat.MDC2025ac.....art \
+        --occupancy MuBeamFlashCat  /pnfs/.../dts.mu2e.MuBeamFlashCat.MDC2025ac.....art \
+        --occupancy EleBeamFlashCat /pnfs/.../dts.mu2e.EleBeamFlashCat.MDC2025ac.....art \
+        [--max-events 2000]
+
 A quick smoke test that does not wait for a full mu2e job (per-gen-event
 metrics are meaningless with --max-events, so skip the chained sensitivity):
 
@@ -116,6 +136,33 @@ WORK_AREA = "/exp/mu2e/app/users/mmackenz/mu2eopt"
 # agnostic track paths. The menu's TPR and MPR paths are left out: they are
 # not meant for the real trigger.
 DEFAULT_TRIGGER_PATHS = "cpr_TrkDe_80m70p:1, apr_TrkDe_80m70p:1"
+
+# dts events per microbunch of each MDC2025ac pileup component at Run 1A
+# intensity (1.58e7 POT/microbunch, SimEfficiencies2 Sim_best v1_1), as in
+# edep_occupancy's own parameter help. --occupancy LABEL:VALUE overrides.
+RUN1A_EVENTS_PER_UB = {
+    "MuStopPileupCat": 226.57,
+    "MuBeamFlashCat": 173.25,
+    "EleBeamFlashCat": 92.78,
+    "EarlyMuBeamFlashCat": 276.6,
+    "EarlyEleBeamFlashCat": 3746.4,
+}
+
+# The peak metrics printed for the occupancy runs, rather than all ~60.
+OCCUPANCY_METRICS = (
+    "n_events_analyzed", "events_per_microbunch",
+    "trk_hits_per_ub", "calo_hits_per_ub",
+    "trk_mean_straw_hit_rate_khz",
+    "trk_peak_straw_hit_rate_khz", "trk_peak_straw_hit_rate_khz_err",
+    "trk_peak_straw_plane", "trk_peak_straw_panel", "trk_peak_straw_straw",
+    "trk_peak_row_hit_rate_khz", "trk_peak_row_hit_rate_khz_err",
+    "trk_peak_row_plane", "trk_peak_row_straw", "trk_peak_row_radius_mm",
+    "calo_peak_crystal_hit_rate_khz", "calo_peak_crystal_hit_rate_khz_err",
+    "calo_peak_crystal_id", "calo_peak_crystal_disk",
+    "calo_disk0_peak_radial_hit_rate_khz", "calo_disk0_peak_radial_hit_r_mm",
+    "calo_disk1_peak_radial_hit_rate_khz", "calo_disk1_peak_radial_hit_r_mm",
+    "n_components",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -245,6 +292,16 @@ def parse_args() -> argparse.Namespace:
              "default applies.",
     )
     parser.add_argument(
+        "--occupancy", nargs="+", action="append",
+        metavar="LABEL[:EVENTS_PER_UB] FILE",
+        help="A pileup component for edep_occupancy: its label, optionally "
+             "':' and its dts events per microbunch, then its dts art "
+             "file(s). Repeat once per component; two or more are then "
+             "combined with edep_occupancy_combine. Labels in "
+             f"{', '.join(RUN1A_EVENTS_PER_UB)} default to their Run 1A "
+             "events per microbunch.",
+    )
+    parser.add_argument(
         "--timeout-s", type=int, default=1800,
         help="Kill the mu2e job after this many seconds.",
     )
@@ -255,10 +312,30 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if not (args.data_file or args.stops_file or args.stopmat_file
-            or args.trigger or args.trigger_ntuple):
+            or args.trigger or args.trigger_ntuple or args.occupancy):
         parser.error("name something to run: an art file for edep, "
-                     "--stops-file, --stopmat-file, --trigger, or "
-                     "--trigger-ntuple")
+                     "--stops-file, --stopmat-file, --trigger, "
+                     "--trigger-ntuple or --occupancy")
+    components = []
+    for entry in args.occupancy or []:
+        if len(entry) < 2:
+            parser.error(f"--occupancy {entry[0]}: give the label, then at "
+                         "least one dts file")
+        label, _, value = entry[0].partition(":")
+        if value:
+            try:
+                per_ub = float(value)
+            except ValueError:
+                parser.error(f"--occupancy {entry[0]}: '{value}' is not a number")
+        elif label in RUN1A_EVENTS_PER_UB:
+            per_ub = RUN1A_EVENTS_PER_UB[label]
+        else:
+            parser.error(f"--occupancy {label}: not a known component, so "
+                         f"give its events per microbunch as {label}:VALUE")
+        components.append((label, per_ub, entry[1:]))
+    if len({label for label, _, _ in components}) != len(components):
+        parser.error("--occupancy labels must differ: each names one component")
+    args.occupancy = components
     if args.ntuple_selection is not None and not args.trigger_ntuple:
         parser.error("--ntuple-selection needs --trigger-ntuple")
     if (args.trigger_signal_file or args.trigger_pileup_file) and not args.trigger:
@@ -387,8 +464,11 @@ async def main() -> int:
     signal_files = [absolute(f) for f in args.trigger_signal_file or []]
     pileup_files = [absolute(f) for f in args.trigger_pileup_file or []]
     ntuple_files = [absolute(f) for f in args.trigger_ntuple or []]
+    occupancy = [(label, per_ub, [absolute(f) for f in files])
+                 for label, per_ub, files in args.occupancy]
     for path in (data_file, stops_file, *stopmat_files, *signal_files,
-                 *pileup_files, *ntuple_files):
+                 *pileup_files, *ntuple_files,
+                 *(f for _, _, files in occupancy for f in files)):
         if path is not None and not path.exists():
             print(f"No such input file: {path}", file=sys.stderr)
             return 2
@@ -564,10 +644,56 @@ async def main() -> int:
             show_trigger_paths(ntuple_eff, "efficiency")
             failed |= ntuple_eff["status"] != "success"
 
+        # 7. Pileup occupancy: one edep_occupancy per component, each scaled
+        #    to a microbunch by its own events_per_microbunch, then the
+        #    combine adds their per-channel histograms. The peak of the sum
+        #    is not the sum of the peaks, so the metrics are never added.
+        scaled_files: list[str] = []
+        for label, per_ub, files in occupancy:
+            print(f"\n=== run_analysis: edep_occupancy on {label} "
+                  f"({len(files)} file(s), {per_ub:g} events / microbunch) ===")
+            occ = payload(await session.call_tool("run_analysis", {
+                "analysis": "edep_occupancy", **files_arg(files),
+                "output_dir": str(outdir / "edep_occupancy" / label),
+                "parameters": {"events_per_microbunch": per_ub, "label": label},
+                "timeout_s": args.timeout_s,
+                **({"max_events": args.max_events} if args.max_events else {}),
+            }))
+            show_result(occ, OCCUPANCY_METRICS)
+            for warning in occ["metadata"].get("warnings", []):
+                print(f"  warning: {warning}")
+            if occ["status"] != "success":
+                failed = True
+                continue
+            scaled_files += [f for f in occ["files"]
+                             if Path(f).name == "occupancy_per_microbunch.root"]
+
+        if len(scaled_files) > 1:
+            print(f"\n=== run_analysis: edep_occupancy_combine over "
+                  f"{len(scaled_files)} components ===")
+            total = payload(await session.call_tool("run_analysis", {
+                "analysis": "edep_occupancy_combine",
+                "data_files": scaled_files,
+                "output_dir": str(outdir / "edep_occupancy" / "total"),
+            }))
+            show_result(total, OCCUPANCY_METRICS)
+            if total["status"] == "success":
+                # each component's rate in the channel where the SUM peaks
+                shares = (("trk_peak_straw_hit", "straw"),
+                          ("trk_peak_row_hit", "row"),
+                          ("calo_peak_crystal_hit", "crystal"))
+                print(f"\n  {'component':<22}" + "".join(
+                    f" {name + ' kHz (share)':>24}" for _, name in shares))
+                for label, row in total["metadata"]["components"].items():
+                    print(f"  {label:<22}" + "".join(
+                        f" {row[tag + '_rate_khz']:>14.4g} ({row[tag + '_share']:5.1%})"
+                        for tag, _ in shares))
+            failed |= total["status"] != "success"
+
         if edep is None or args.no_chain:
             return 1 if failed else 0
 
-        # 7. Chain: the nts.*.root edep wrote is what the sensitivity reads.
+        # 8. Chain: the nts.*.root edep wrote is what the sensitivity reads.
         ntuples = [f for f in edep["files"] if Path(f).name.startswith("nts.")]
         if not ntuples:
             print("\nNo nts.*.root in edep's output, nothing to chain.")
