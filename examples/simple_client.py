@@ -649,6 +649,7 @@ async def main() -> int:
         #    combine adds their per-channel histograms. The peak of the sum
         #    is not the sum of the peaks, so the metrics are never added.
         scaled_files: list[str] = []
+        incomplete: list[str] = []  # components with no scaled file
         for component_index, (label, per_ub, files) in enumerate(occupancy):
             print(f"\n=== run_analysis: edep_occupancy on {label} "
                   f"({len(files)} file(s), {per_ub:g} events / microbunch) ===")
@@ -664,11 +665,21 @@ async def main() -> int:
                 print(f"  warning: {warning}")
             if occ["status"] != "success":
                 failed = True
+                incomplete.append(label)
                 continue
-            scaled_files += [f for f in occ["files"]
-                             if Path(f).name == "occupancy_per_microbunch.root"]
+            scaled = [f for f in occ["files"]
+                      if Path(f).name == "occupancy_per_microbunch.root"]
+            if not scaled:
+                failed = True
+                incomplete.append(label)
+            scaled_files += scaled
 
-        if len(scaled_files) > 1 and len(scaled_files) == len(occupancy):
+        if incomplete and len(occupancy) > 1:
+            # a total without every requested component would understate it
+            print(f"\nSkipping edep_occupancy_combine: no scaled histograms "
+                  f"from {', '.join(incomplete)}, so the total would be "
+                  f"incomplete.")
+        elif len(scaled_files) > 1:
             print(f"\n=== run_analysis: edep_occupancy_combine over "
                   f"{len(scaled_files)} components ===")
             total = payload(await session.call_tool("run_analysis", {
