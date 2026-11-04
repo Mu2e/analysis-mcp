@@ -668,7 +668,7 @@ async def main() -> int:
             scaled_files += [f for f in occ["files"]
                              if Path(f).name == "occupancy_per_microbunch.root"]
 
-        if len(scaled_files) > 1:
+        if len(scaled_files) > 1 and len(scaled_files) == len(occupancy):
             print(f"\n=== run_analysis: edep_occupancy_combine over "
                   f"{len(scaled_files)} components ===")
             total = payload(await session.call_tool("run_analysis", {
