@@ -3523,7 +3523,8 @@ def _write_raw_occupancy(path, hists, n_events):
 
 
 def _run_edep_occupancy(tmp_dir, hists=None, n_events=1000.0, parameters=None,
-                        has_steps=True, name="comp"):
+                        has_steps=True, name="comp", n_gen_events=2000.0,
+                        max_events=None, counts=None):
     """edep_occupancy with edep's job replaced by a file the test wrote."""
     from tools.spec import RunContext
     outdir = Path(tmp_dir) / name
@@ -3539,17 +3540,28 @@ def _run_edep_occupancy(tmp_dir, hists=None, n_events=1000.0, parameters=None,
 
     def fake_edep(context):
         seen["params"] = context.params
-        return RunOutcome(metrics={"n_events": n_events}, files=[str(raw)],
-                          extra={"selection": "", "job_fcl": "x"})
+        seen["edep_ran"] = True
+        return RunOutcome(metrics={"n_events": n_events, "n_gen_events": n_gen_events},
+                          files=[str(raw)], extra={"selection": "", "job_fcl": "x"})
+
+    def fake_counts(context, filter_label):
+        # print_counts' job, standing in for count.run_counts_job
+        seen["counts"] = (context, filter_label)
+        assert "edep_ran" not in seen, "the prescale job runs first"
+        if isinstance(counts, str):
+            return RunOutcome(error=counts)
+        return RunOutcome(metrics={"n_events": n_events, **counts},
+                          extra={"prescale_filters": {filter_label: {"prescale": counts["prescale"]}}})
     from tools.spec import RunOutcome
-    saved = edep_mod.run, edep_mod.module_accepts
+    saved = edep_mod.run, edep_mod.module_accepts, eocc.count_mod.run_counts_job
     edep_mod.run, edep_mod.module_accepts = fake_edep, lambda *a, **k: has_steps
+    eocc.count_mod.run_counts_job = fake_counts
     try:
         params = ANALYSES["edep_occupancy"].resolve_params(parameters)
         outcome = eocc.run(RunContext(input_paths=[Path(tmp_dir) / "in.art"], outdir=outdir,
-                                      params=params, timeout_s=60))
+                                      params=params, timeout_s=60, max_events=max_events))
     finally:
-        edep_mod.run, edep_mod.module_accepts = saved
+        edep_mod.run, edep_mod.module_accepts, eocc.count_mod.run_counts_job = saved
     return outcome, seen
 
 
@@ -3605,6 +3617,85 @@ def test_edep_occupancy_defaults_to_per_event(tmp_dir):
     # events_per_microbunch = 1: the numbers are per event (21 hits over 1000 events)
     assert outcome.metrics["events_per_microbunch"] == 1.0
     assert abs(outcome.metrics["trk_hits_per_ub"] - 21.0 / 1000.0) < 1e-12
+
+
+def test_edep_occupancy_normalizes_from_generated_events(tmp_dir):
+    # 1000 dts events from 50000 generated, 0.01 generated per POT, 1e7 POT/ub:
+    # 1000 / 50000 * 0.01 * 1e7 = 2000 events per microbunch
+    outcome, seen = _run_edep_occupancy(
+        tmp_dir, _occ_hists(), n_events=1000.0, n_gen_events=50000.0,
+        parameters={"gen_events_per_pot": 0.01, "pot_per_microbunch": 1e7})
+    assert outcome.error is None, outcome.error
+    m = outcome.metrics
+    assert tuple(m) == ANALYSES["edep_occupancy"].metrics
+    assert abs(m["events_per_microbunch"] - 2000.0) < 1e-9
+    assert m["n_gen_events"] == 50000.0 and m["prescale"] == 1.0
+    assert abs(m["trk_hits_per_ub"] - 21.0 * 2000.0 / 1000.0) < 1e-9
+    assert "counts" not in seen                          # no prescale, no second job
+    norm = outcome.extra["normalization"]
+    assert norm["mode"] == "gen_events_per_pot" and norm["events_per_gen_event"] == 0.02
+    _, meta = eocc.read_scaled_file(Path(tmp_dir) / "comp" / eocc.SCALED_FILE)
+    assert abs(meta["events_per_microbunch"] - 2000.0) < 1e-9
+    assert meta["normalization"]["n_gen_events"] == 50000.0
+    # the same number given directly gives the same metrics
+    direct, _ = _run_edep_occupancy(tmp_dir, _occ_hists(), n_events=1000.0, name="direct",
+                                    parameters={"events_per_microbunch": 2000.0})
+    for key in ("trk_peak_row_hit_rate_khz", "calo_peak_crystal_hit_rate_khz",
+                "trk_hits_per_ub", "calo_disk0_peak_radial_hit_rate_khz"):
+        assert abs(direct.metrics[key] - m[key]) < 1e-9 * max(1.0, m[key]), key
+    assert direct.extra["normalization"] == {"mode": "events_per_microbunch"}
+    # the default POT per microbunch is the one behind the events_per_microbunch table
+    params = ANALYSES["edep_occupancy"].resolve_params({"gen_events_per_pot": 0.01})
+    assert params["pot_per_microbunch"] == 1.58e7
+
+
+def test_edep_occupancy_divides_out_the_named_prescale(tmp_dir):
+    # an Early sample kept 1 in 1000: GenEventCount counts before the prescale
+    outcome, seen = _run_edep_occupancy(
+        tmp_dir, _occ_hists(), n_events=1000.0, n_gen_events=50000.0,
+        counts={"n_gen_events": 50000.0, "prescale": 0.001},
+        parameters={"gen_events_per_pot": 0.01, "pot_per_microbunch": 1e7,
+                    "prescale_filter": "EarlyFlashPrescaleFilter"})
+    assert outcome.error is None, outcome.error
+    context, label = seen["counts"]
+    assert label == "EarlyFlashPrescaleFilter" and context.max_events is None
+    assert context.outdir.name == "counts"
+    assert outcome.metrics["prescale"] == 0.001
+    assert abs(outcome.metrics["events_per_microbunch"] - 2000.0 * 1000) < 1e-6
+    assert "prescale_filters" in outcome.extra["normalization"]
+    assert "warnings" not in outcome.extra
+    # print_counts' GenEventCount total wins over EdepAna's, with a warning
+    outcome, _ = _run_edep_occupancy(
+        tmp_dir, _occ_hists(), n_events=1000.0, n_gen_events=40000.0, name="mismatch",
+        counts={"n_gen_events": 50000.0, "prescale": 0.001},
+        parameters={"gen_events_per_pot": 0.01, "pot_per_microbunch": 1e7,
+                    "prescale_filter": "EarlyFlashPrescaleFilter"})
+    assert outcome.metrics["n_gen_events"] == 50000.0
+    assert "print_counts" in outcome.extra["warnings"][0]
+    # a failed prescale job (e.g. the wrong stream) stops before EdepAna runs
+    outcome, seen = _run_edep_occupancy(
+        tmp_dir, _occ_hists(), name="wrong", counts="file(s) from another stream",
+        parameters={"gen_events_per_pot": 0.01, "prescale_filter": "XPrescaleFilter"})
+    assert "another stream" in outcome.error and "edep_ran" not in seen
+
+
+def test_edep_occupancy_refuses_mixed_or_partial_generated_normalization(tmp_dir):
+    both, seen = _run_edep_occupancy(tmp_dir, _occ_hists(), parameters={
+        "gen_events_per_pot": 0.01, "events_per_microbunch": 100.0})
+    assert "not both" in both.error and "edep_ran" not in seen
+    partial, seen = _run_edep_occupancy(tmp_dir, _occ_hists(), max_events=100,
+                                        parameters={"gen_events_per_pot": 0.01})
+    assert "max_events" in partial.error and "edep_ran" not in seen
+    stray, _ = _run_edep_occupancy(tmp_dir, _occ_hists(),
+                                   parameters={"prescale_filter": "XPrescaleFilter"})
+    assert "only with gen_events_per_pot" in stray.error
+    no_gen, _ = _run_edep_occupancy(tmp_dir, _occ_hists(), n_gen_events=0.0,
+                                    parameters={"gen_events_per_pot": 0.01})
+    assert "GenEventCount" in no_gen.error
+    # per-event mode still allows max_events, and reports the counts it saw
+    ok, _ = _run_edep_occupancy(tmp_dir, _occ_hists(), max_events=100, name="ok")
+    assert ok.error is None and ok.metrics["n_gen_events"] == 2000.0
+    assert ok.metrics["prescale"] == 1.0
 
 
 def test_edep_occupancy_is_unchanged_by_hadd_of_several_jobs(tmp_dir):
@@ -3894,7 +3985,10 @@ def test_every_art_analysis_parser_matches_its_declared_metrics():
             # EdepAna's stdout is parsed by edep; the metrics come from its histograms
             hists = _occ_hists()
             meta = {"microbunch_ns": 1695.0, "n_events": 10.0, "events_per_microbunch": 1.0}
-            assert tuple(eocc.metrics_from(hists, meta)[0]) == spec.metrics
+            # ... and the generated events behind them from edep's summary
+            assert "n_gen_events" in parse_edep_summary(sample)
+            assert (tuple(eocc.metrics_from(hists, meta)[0]) + eocc.GEN_METRICS
+                    == spec.metrics)
         elif name in ("occupancy_digi", "occupancy_reco"):
             # the table's metrics, then what the per-event tree adds
             names = (occ_digi if name == "occupancy_digi" else occ_reco).COLLECTIONS
