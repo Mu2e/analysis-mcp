@@ -1,4 +1,4 @@
-# analysis-mcp-server
+# analysis-mcp
 
 An example MCP server that exposes Mu2e analyses as agent tools. An agent asks
 which analyses exist, then runs one — either a mu2e job over art file(s):
@@ -1294,12 +1294,27 @@ channel? `edep_occupancy` runs EdepAna over the dts files of ONE pileup
 component and reads the `EDepAna/occupancy/` histograms the module fills for
 every StrawGasStep and CaloShowerStep (a `<name>_occ` step count and a
 `<name>_edep` deposited energy per observable, plus "hit" histograms of steps
-above the step energy threshold and at or after the step time minimum, with
-the time folded into the microbunch). The job itself is `edep`'s: the same
-fcl, per-run step parameters and Offline probe, so a step parameter means
-here what it means there. **It needs an Offline whose EdepAna has the
-occupancy histograms** (Offline PR #2097, `edepana-occupancy`, not yet in a release);
-on any other it returns an error that says so.
+above the step energy threshold whose folded time is inside the hit window).
+The job itself is `edep`'s: the same fcl, per-run step parameters and Offline
+probe, so a step parameter means here what it means there. **It needs an
+Offline whose EdepAna has the occupancy histograms with their hit windows**
+(Offline PR #2097, merged 2026-11-03: the Musings released after it, or a work
+area on Offline main since then); on any other, including a build of the PR
+from before its last revision, it returns an error that says so.
+
+**Hit windows.** Step times are folded like the digitizers' `microbunchTime`:
+raw time plus `fold_time_offset_ns` (default -200 ns, the nominal proton bunch
+time minus `TimeFromProtonsToDRMarker`), modulo the microbunch period, so the
+folded times are in the event-window frame. A hit counts when it is above the
+step energy threshold and its folded time is inside `trk_hit_time_min_ns` /
+`trk_hit_time_max_ns` (default 250-1505 ns) or `calo_hit_time_min_ns` /
+`calo_hit_time_max_ns` (250-1595 ns): the digitization windows (450-1705 and
+450-1795 ns from the marker) minus 200 ns, as in Offline's
+`Analyses/test/edep.fcl`. The raw-time step windows (`*_step_time_*_ns`) cut
+only edep's tree and step counts, not the hit histograms. Plain `edep` sets
+the windows to their defaults on an EdepAna that has them, since the module
+requires them. `edep_occupancy_combine` refuses files made with different
+windows, as for any step cut.
 
 Per event becomes per microbunch and then a rate:
 
@@ -1367,6 +1382,12 @@ metadata gives, per component, its totals, its rate in the channel where the
 SUM peaks, and its share there, for the straw, row, crystal and radial peaks.
 Its own output, `occupancy_total_per_microbunch.root`, can be combined again.
 Files made with different step cuts or microbunch periods are refused.
+
+The numbers below predate the hit windows: they were made with an earlier
+revision of PR #2097 (raw time folded, no offset, hits at folded time >= 500
+ns). The windows count more hits (on 20000 MuStopPileupCat events, 23702
+tracker and 14582 calorimeter hits against 22098 and 13169); dose has no time
+cut and is unchanged.
 
 On Run 1A MDC2025ac dts (EleBeamFlashCat 795k events, MuBeamFlashCat 2.05M,
 MuStopPileupCat 2.24M, all events, regular samples, defaults) the total is
@@ -1675,7 +1696,7 @@ CONFIG = {
         "transport": "stdio",
         "command": "python3",
         "args": ["-m", "analysis_mcp_server"],
-        "cwd": "/exp/mu2e/app/users/mmackenz/mu2eopt/analysis-mcp-server",
+        "cwd": "/path/to/analysis-mcp",
     }
 }
 tools = await load_tools(CONFIG)

@@ -4,9 +4,13 @@
 EdepAna (Offline/Analyses/src/EdepAna_module.cc) fills, once per event over
 all StrawGasSteps and CaloShowerSteps, pairs of histograms: `<name>_occ`
 (steps) and `<name>_edep` (deposited energy, MeV), plus "hit" histograms that
-count only steps above the step energy threshold whose time folded into the
-microbunch is at or after the step time minimum: `trk_straw_hits`,
-`calo_crystal_hits`, `calo_disk{0,1}_rcrys_hits`. This analysis runs that job
+count only steps above the step energy threshold whose folded time lies in the
+hit window: `trk_straw_hits`, `calo_crystal_hits`, `calo_disk{0,1}_rcrys_hits`.
+The time is folded like the digitizers' microbunchTime (raw time plus
+`fold_time_offset_ns`, modulo the microbunch period), so the windows
+(`trk_hit_time_*_ns`, `calo_hit_time_*_ns`) are in the event-window frame and
+default to the digitization windows. The step time window (`*_step_time_*_ns`,
+raw time) applies only to edep's tree and step counts, not to these. This analysis runs that job
 (through `edep`'s own job and fcl machinery) over the dts files of ONE pileup
 component, scales its histograms from per event to per microbunch, and turns
 them into totals and into the busiest-channel rates that sizing electronics
@@ -69,6 +73,11 @@ SCALED_FILE = "occupancy_per_microbunch.root"
 # Microbunch period (ns): PhysicsParams' nominal DR period, which EdepAna uses
 # to fold step times, 1695 ns for Run 1.
 MICROBUNCH_NS = 1695.0
+
+NEEDS_OFFLINE = ("this needs an Offline whose EdepAna has the occupancy histograms "
+                 "with their hit windows: Offline PR #2097, merged 2026-11-03, in "
+                 "the Musings released after it (or a work area built on Offline "
+                 "main since then)")
 
 # The tracker: StrawId's layout (DataProducts/inc/StrawId.hh), unique straw =
 # (plane * 6 + panel) * 96 + straw.
@@ -233,9 +242,7 @@ def read_edep_occupancy(path: Path) -> tuple[dict[str, Hist], float, float]:
     an EdepAna file from an Offline without them.
     """
     import uproot
-    needs = ("this needs an Offline whose EdepAna has the occupancy "
-             "histograms (Offline PR #2097, 'edepana-occupancy', not yet in a release): "
-             "run in a work area built on it")
+    needs = NEEDS_OFFLINE
     with uproot.open(path) as root:
         keys = {k.split(";")[0] for k in root.keys()}
         if OCCUPANCY_DIR not in keys:
@@ -571,21 +578,24 @@ def run(context: RunContext) -> RunOutcome:
         return RunOutcome(error="events_per_microbunch and microbunch_ns must be "
                                 "greater than zero")
     try:
-        with_steps = edep_mod.module_accepts(edep_mod.MODULE_TYPE, edep_mod.STEP_PROBE_PARAMETER,
+        with_windows = (
+            edep_mod.module_accepts(edep_mod.MODULE_TYPE, edep_mod.STEP_PROBE_PARAMETER,
                                     context.outdir)
+            and edep_mod.module_accepts(edep_mod.MODULE_TYPE,
+                                        edep_mod.HIT_WINDOW_PROBE_PARAMETER, context.outdir))
     except ModuleProbeError as exc:
         return RunOutcome(error=f"could not describe the configured Offline's "
                                 f"EdepAna: {exc}")
-    if not with_steps:
+    if not with_windows:
+        # An EdepAna without the hit windows has no occupancy histograms, or
+        # (an unmerged build of the PR) ones with a different time cut.
         return RunOutcome(error=(
-            "the configured Offline's EdepAna predates the step counts, so it has no "
-            "occupancy histograms either: this needs an Offline with the EdepAna "
-            "occupancy histograms (Offline PR #2097, 'edepana-occupancy', not "
-            "yet in a release); run in a work area built on it"))
+            "the configured Offline's EdepAna has no hit-window parameters "
+            f"({edep_mod.HIT_WINDOW_PROBE_PARAMETER}): {NEEDS_OFFLINE}"))
 
     # edep owns the job and its fcl; the selection is irrelevant here.
-    edep_params = {"selection": "",
-                   **{name: params[name] for name, *_ in edep_mod.STEP_PARAMS}}
+    cut_names = [name for name, *_ in (*edep_mod.STEP_PARAMS, *edep_mod.HIT_WINDOW_PARAMS)]
+    edep_params = {"selection": "", **{name: params[name] for name in cut_names}}
     inner = edep_mod.run(RunContext(
         input_paths=context.input_paths, outdir=context.outdir, params=edep_params,
         timeout_s=context.timeout_s, max_events=context.max_events,
@@ -617,7 +627,7 @@ def run(context: RunContext) -> RunOutcome:
             "events_per_microbunch": params["events_per_microbunch"],
             "n_events": n_events, "max_events": context.max_events,
             "n_input_files": len(context.input_paths),
-            "step_cuts": {name: params[name] for name, *_ in edep_mod.STEP_PARAMS},
+            "step_cuts": {name: params[name] for name in cut_names},
             "components": [params["label"]]}
     scaled_path = context.outdir / SCALED_FILE
     write_scaled_file(scaled_path, scaled, meta)
@@ -675,9 +685,10 @@ def summarize(metrics: dict[str, float]) -> str:
 
 def step_params() -> tuple[ParamSpec, ...]:
     """edep's step parameters, as this analysis' own (same names and defaults)."""
-    note = (" The occupancy hit histograms use the energy threshold and the time "
-            "minimum, with the time folded into the microbunch; the time maximum "
-            "is accepted for the job's step counts and not used by them.")
+    note = (" The occupancy hit histograms use only the energy threshold of "
+            "these; their time cut is the folded hit window "
+            "(trk_hit_time_*_ns, calo_hit_time_*_ns). The step time window is "
+            "accepted for the job's step counts and not used by them.")
     return tuple(ParamSpec(name=name, description=desc + note, default=default,
                            minimum=lo, maximum=hi)
                  for name, _, default, lo, hi, desc in edep_mod.STEP_PARAMS)
@@ -696,7 +707,7 @@ SPEC = AnalysisSpec(
         "tracker's straw rows of six panels; the calorimeter's crystal-centre "
         "radius per disk). Writes occupancy_per_microbunch.root for "
         "edep_occupancy_combine. Needs an Offline with the EdepAna occupancy "
-        "histograms."
+        "histograms (Offline PR #2097)."
     ),
     metrics=COMMON_METRICS,
     units=COMMON_UNITS,
@@ -715,6 +726,9 @@ SPEC = AnalysisSpec(
                                "can report each component's share of the peak."),
                   default="", kind="text", allow_empty=True),
         *step_params(),
+        *(ParamSpec(name=name, description=desc, default=default,
+                    minimum=lo, maximum=hi)
+          for name, _, default, lo, hi, desc in edep_mod.HIT_WINDOW_PARAMS),
     ),
     summarize=summarize,
     input_hint=(

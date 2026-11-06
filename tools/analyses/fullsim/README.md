@@ -27,7 +27,7 @@ counts for the stopped mu- NPOT gives (`normalization.py`).
 ```bash
 source /cvmfs/mu2e.opensciencegrid.org/setupmu2e-art.sh
 pyenv ana
-cd /path/to/analysis-mcp-server
+cd /path/to/analysis-mcp
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1   # shared interactive nodes
 ```
 
