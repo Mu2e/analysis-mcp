@@ -1298,6 +1298,35 @@ EleBeamFlashCat, 173.25 for MuBeamFlashCat, 226.57 for MuStopPileupCat, 3746.4
 for EarlyEleBeamFlashCat and 276.6 for EarlyMuBeamFlashCat. Run each component
 with its own value and give it a `label`.
 
+**Normalizing from the sample's generated events.** For a sample you made
+yourself (a geometry scan, where the events per POT are what changes), give
+`gen_events_per_pot` instead of `events_per_microbunch`: the generated events
+per POT of the job that made the dts, i.e. the upstream stage's efficiency
+(MuBeamCat or EleBeamCat events per POT for a flash sample resampled from
+them, stopped muons per POT for a stop sample). Then
+
+```
+events_per_microbunch = n_events / (n_gen_events * prescale)
+                        * gen_events_per_pot * pot_per_microbunch
+```
+
+`n_gen_events` is the sum of the input's subrun GenEventCounts (EdepAna's
+summary; subruns with no events left still count). `pot_per_microbunch`
+defaults to 1.58e7, the value behind the table above. `prescale` is 1 unless
+`prescale_filter` names the producing job's prescale filter (the Early*
+samples' `EarlyPrescaleFilter`, kept fraction 1/30 for MuBeam): GenEventCount
+counts before the prescale, so a prescaled sample without it comes out low by
+the prescale. The filter's fraction is read from the file by `count`'s
+print_counts job, which runs first and refuses a file of another stream; run
+`count` on a file to list its filters. The mode needs a full run (`max_events`
+is refused: a job stopped inside a subrun has already added its whole
+GenEventCount) and refuses `events_per_microbunch` set as well. The result
+reports `n_gen_events` and `prescale` as metrics and the inputs in its
+`normalization` metadata (also stored in `occupancy_per_microbunch.root`).
+As a check, SimEfficiencies2 Sim_best v1_1 gives MuBeamCat 0.00213816 per POT
+and MuBeamFlashCat 0.00512832 per MuBeamCat event, which at 1.58e7 POT is the
+173.25 above.
+
 **Dose needs different samples than occupancy.** The regular
 `dts.mu2e.EleBeamFlashCat` and `MuBeamFlashCat` are time-filtered
 (DetStepFilter keeps events with a step folded after 250 ns or before 10 ns),
@@ -1527,7 +1556,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-250 tests, none of which start a mu2e job or reach SAM or metacat (the
+256 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 

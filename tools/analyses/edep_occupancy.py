@@ -25,6 +25,25 @@ where `events_per_microbunch` is how many dts events of this component land
 in one microbunch on average (POT per microbunch x the component's events per
 POT). It defaults to 1, which leaves every number per event.
 
+From generated events. A caller that makes its own sample (a geometry scan,
+where the dts events per POT are what changes) does not know
+events_per_microbunch in advance. It can give `gen_events_per_pot` instead,
+the generated events of the job that made these dts per POT (the upstream
+stage's efficiency: MuBeamCat or EleBeamCat events per POT for a flash sample
+resampled from them, stopped muons per POT for a stop sample), and then
+
+    events_per_microbunch = n_events / (n_gen_events * prescale)
+                            * gen_events_per_pot * pot_per_microbunch
+
+with n_gen_events the sum of the input's subrun GenEventCounts (EdepAna sums
+them in beginSubRun, so a subrun with no events left in it still counts) and
+`prescale` the fraction kept by the producing job's prescale filter, read from
+the file when `prescale_filter` names it (as `count` does, through its job).
+GenEventCount counts before the prescale, so a prescaled sample (the Early*
+flash samples) without its filter named comes out low by the prescale.
+max_events is refused in this mode: the job would stop inside a subrun whose
+whole GenEventCount it has already added, and undercount.
+
 Peaks. The peak of a SUM over components is not the sum of the components'
 peaks (they peak in different channels), so the combining analysis
 `edep_occupancy_combine` adds the per-channel histograms, never metrics. For
@@ -64,6 +83,7 @@ import numpy as np
 
 from ..mu2e_job import ModuleProbeError
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
+from . import count as count_mod
 from . import edep as edep_mod
 
 # Where EdepAna books them in its TFileService file.
@@ -73,6 +93,11 @@ SCALED_FILE = "occupancy_per_microbunch.root"
 # Microbunch period (ns): PhysicsParams' nominal DR period, which EdepAna uses
 # to fold step times, 1695 ns for Run 1.
 MICROBUNCH_NS = 1695.0
+
+# POT per microbunch for the generated-event normalization: SimEfficiencies2
+# Sim_best v1_1 (Run 1A), the value behind the events_per_microbunch table in
+# EVENTS_PER_UB_HELP, so the two normalizations agree on a production sample.
+POT_PER_MICROBUNCH = 1.58e7
 
 NEEDS_OFFLINE = ("this needs an Offline whose EdepAna has the occupancy histograms "
                  "with their hit windows: Offline PR #2097, merged 2026-11-03, in "
@@ -146,6 +171,12 @@ _UNITS = {**dict(_BASE), **dict(_TOTALS), **dict(_RATE_METRICS)}
 COMMON_UNITS = {m: u for m, u in _UNITS.items() if u}
 COMMON_UNITS.update({f"{m}_err": _UNITS[m] for m in _ERR_OF if _UNITS[m]})
 assert set(COMMON_UNITS) <= set(COMMON_METRICS)
+
+# edep_occupancy's own: what the generated-event normalization used. Not in
+# COMMON_METRICS, which edep_occupancy_combine reports for a sum of samples.
+GEN_METRICS = ("n_gen_events", "prescale")
+OCC_METRICS = COMMON_METRICS + GEN_METRICS
+OCC_UNITS = {**COMMON_UNITS, "n_gen_events": "generated events"}
 
 
 class OccupancyError(RuntimeError):
@@ -276,6 +307,20 @@ def per_microbunch(hists: dict[str, Hist], n_events: float,
     factor = events_per_microbunch / n_events
     return {n: (h if n in GEOMETRY_HIST_NAMES else h.scaled(factor))
             for n, h in hists.items()}
+
+
+def events_per_microbunch_from_gen(n_events: float, n_gen_events: float,
+                                   prescale: float, gen_events_per_pot: float,
+                                   pot_per_microbunch: float) -> float:
+    """Mean dts events per microbunch from the sample's own generated events.
+
+    n_events / (n_gen_events * prescale) is the events per generated event
+    before the prescale threw any away (prescale = fraction kept, 1 for none),
+    as `count` computes it; times generated events per POT and POT per
+    microbunch.
+    """
+    return (n_events / (n_gen_events * prescale)
+            * gen_events_per_pot * pot_per_microbunch)
 
 
 def _peak(values: np.ndarray, variances: np.ndarray) -> tuple[int, float, float]:
@@ -559,7 +604,30 @@ EVENTS_PER_UB_HELP = (
     "every metric per event, not per microbunch. Run 1A at 1.58e7 POT/microbunch "
     "(SimEfficiencies2 Sim_best v1_1): EleBeamFlashCat 92.78, MuBeamFlashCat "
     "173.25, MuStopPileupCat 226.57, EarlyEleBeamFlashCat 3746.4, "
-    "EarlyMuBeamFlashCat 276.6. " + DOSE_NOTE)
+    "EarlyMuBeamFlashCat 276.6. Leave it at 1 when gen_events_per_pot is "
+    "given: it is then computed from the sample. " + DOSE_NOTE)
+
+GEN_PER_POT_HELP = (
+    "Use instead of events_per_microbunch when that is not known in advance "
+    "(a sample you made yourself, e.g. in a geometry scan): the generated "
+    "events per POT of the job that made these dts, i.e. the upstream stage's "
+    "efficiency (MuBeamCat or EleBeamCat events per POT for a flash sample "
+    "resampled from them; stopped muons per POT for a stop sample). Then "
+    "events_per_microbunch = n_events / (n_gen_events * prescale) * "
+    "gen_events_per_pot * pot_per_microbunch, with n_gen_events summed from "
+    "the input's subrun GenEventCounts. 0 (the default) leaves it unused. "
+    "Needs a full run: max_events is refused. A prescaled sample (the Early* "
+    "flash samples) also needs prescale_filter, or it comes out low by the "
+    "prescale.")
+
+PRESCALE_FILTER_HELP = (
+    "Only with gen_events_per_pot: module label of the prescale filter that "
+    "thinned this sample's stream in the job that made it (e.g. the Early "
+    "flash streams' filter), whose kept fraction is divided out because "
+    "GenEventCount counts before it. It is read from the file by a short "
+    "print_counts job, as 'count' does, and a file whose name says it is from "
+    "another stream is refused. Unset (the default) means no prescale (1); "
+    "run 'count' on a file to list the filters it carries.")
 
 
 def _check_period(period: float, microbunch_ns: float) -> list[str]:
@@ -577,6 +645,30 @@ def run(context: RunContext) -> RunOutcome:
     if params["events_per_microbunch"] <= 0 or params["microbunch_ns"] <= 0:
         return RunOutcome(error="events_per_microbunch and microbunch_ns must be "
                                 "greater than zero")
+    gen_per_pot = float(params["gen_events_per_pot"])
+    filter_label = str(params["prescale_filter"]) or None
+    problem = _gen_mode_problem(params, context.max_events)
+    if problem:
+        return RunOutcome(error=problem)
+
+    # The prescale first: its job is short and refuses a file from another
+    # stream before EdepAna spends its time on it.
+    prescale, counts_extra, counts_n_gen = 1.0, None, None
+    if gen_per_pot > 0 and filter_label:
+        counts = count_mod.run_counts_job(
+            RunContext(input_paths=context.input_paths,
+                       outdir=context.outdir / "counts", params={},
+                       timeout_s=context.timeout_s, max_events=None,
+                       wants_file_list=context.wants_file_list),
+            filter_label)
+        if counts.error is not None or counts.metrics is None:
+            return RunOutcome(log_path=counts.log_path, extra=counts.extra,
+                              error=f"reading the prescale of {filter_label}: "
+                                    f"{counts.error or 'no counts'}")
+        prescale = counts.metrics["prescale"]
+        counts_n_gen = counts.metrics["n_gen_events"]
+        counts_extra = {k: counts.extra[k] for k in ("prescale_filters",)
+                        if k in counts.extra}
     try:
         with_windows = (
             edep_mod.module_accepts(edep_mod.MODULE_TYPE, edep_mod.STEP_PROBE_PARAMETER,
@@ -619,12 +711,43 @@ def run(context: RunContext) -> RunOutcome:
         return RunOutcome(files=inner.files, log_path=inner.log_path, extra=extra,
                           error="EdepAna analyzed no events, so there is nothing to scale")
     warnings = _check_period(period, params["microbunch_ns"])
+
+    # EdepAna's summary sums every subrun's GenEventCount it read.
+    n_gen = float(inner.metrics.get("n_gen_events", -1.0))
+    events_per_ub = params["events_per_microbunch"]
+    normalization = {"mode": "events_per_microbunch"}
+    if gen_per_pot > 0:
+        if counts_n_gen is not None and n_gen > 0 and \
+                abs(counts_n_gen - n_gen) > 1e-9 * n_gen:
+            warnings.append(
+                f"EdepAna counted {n_gen:g} generated events and print_counts "
+                f"{counts_n_gen:g}; using print_counts' GenEventCount total")
+        if counts_n_gen is not None:
+            n_gen = counts_n_gen
+        if n_gen <= 0:
+            return RunOutcome(files=inner.files, log_path=inner.log_path, extra=extra,
+                              error=("the input has no generated-event bookkeeping "
+                                     "(GenEventCount), so gen_events_per_pot cannot "
+                                     "normalize it: give events_per_microbunch "
+                                     "instead"))
+        events_per_ub = events_per_microbunch_from_gen(
+            n_events, n_gen, prescale, gen_per_pot, params["pot_per_microbunch"])
+        normalization = {"mode": "gen_events_per_pot",
+                         "gen_events_per_pot": gen_per_pot,
+                         "pot_per_microbunch": params["pot_per_microbunch"],
+                         "n_gen_events": n_gen, "prescale": prescale,
+                         "prescale_filter": filter_label or "",
+                         "events_per_gen_event": n_events / (n_gen * prescale)}
+        if counts_extra:
+            normalization.update(counts_extra)
+    extra["normalization"] = normalization
     if warnings:
         extra["warnings"] = warnings
 
-    scaled = per_microbunch(raw, n_events, params["events_per_microbunch"])
+    scaled = per_microbunch(raw, n_events, events_per_ub)
     meta = {"label": params["label"], "microbunch_ns": params["microbunch_ns"],
-            "events_per_microbunch": params["events_per_microbunch"],
+            "events_per_microbunch": events_per_ub,
+            "normalization": normalization,
             "n_events": n_events, "max_events": context.max_events,
             "n_input_files": len(context.input_paths),
             "step_cuts": {name: params[name] for name in cut_names},
@@ -632,12 +755,35 @@ def run(context: RunContext) -> RunOutcome:
     scaled_path = context.outdir / SCALED_FILE
     write_scaled_file(scaled_path, scaled, meta)
     metrics, pos = metrics_from(scaled, meta)
+    metrics["n_gen_events"] = n_gen
+    metrics["prescale"] = prescale
     extra["peak_channels"] = _describe_positions(pos, scaled)
     extra["error_note"] = ERROR_NOTE
     plots = make_plots(scaled, meta, context.outdir,
                        title=params["label"] or "occupancy per microbunch")
     return RunOutcome(metrics=metrics, files=[*inner.files, str(scaled_path), *plots],
                       log_path=inner.log_path, extra=extra)
+
+
+def _gen_mode_problem(params: dict, max_events: int | None) -> str | None:
+    """Why the normalization parameters cannot be used together, or None."""
+    gen_per_pot = float(params["gen_events_per_pot"])
+    if gen_per_pot <= 0:
+        if params["prescale_filter"]:
+            return ("prescale_filter is used only with gen_events_per_pot: "
+                    "events_per_microbunch is the final per-microbunch number, "
+                    "prescale included")
+        return None
+    if params["events_per_microbunch"] != 1.0:
+        return ("give either events_per_microbunch or gen_events_per_pot, not "
+                "both: with gen_events_per_pot, events_per_microbunch is computed "
+                "from the sample's generated events")
+    if max_events is not None:
+        return ("gen_events_per_pot needs a full run, without max_events: a job "
+                "stopped early has already counted the whole GenEventCount of the "
+                "subrun it stopped in, so the events per generated event would "
+                "come out low. Use fewer files for a quicker run")
+    return None
 
 
 ERROR_NOTE = ("*_err are sqrt of the summed squared weights of the bins involved, "
@@ -709,11 +855,21 @@ SPEC = AnalysisSpec(
         "edep_occupancy_combine. Needs an Offline with the EdepAna occupancy "
         "histograms (Offline PR #2097)."
     ),
-    metrics=COMMON_METRICS,
-    units=COMMON_UNITS,
+    metrics=OCC_METRICS,
+    units=OCC_UNITS,
     parameters=(
         ParamSpec(name="events_per_microbunch", description=EVENTS_PER_UB_HELP,
                   default=1.0, minimum=1e-12, maximum=1e9),
+        ParamSpec(name="gen_events_per_pot", description=GEN_PER_POT_HELP,
+                  default=0.0, minimum=0.0, maximum=1e6),
+        ParamSpec(name="pot_per_microbunch",
+                  description=("POT per microbunch, used only with "
+                               "gen_events_per_pot. The default, 1.58e7, is "
+                               "SimEfficiencies2 Sim_best v1_1 (Run 1A), the value "
+                               "behind the events_per_microbunch examples."),
+                  default=POT_PER_MICROBUNCH, minimum=1.0, maximum=1e12),
+        ParamSpec(name="prescale_filter", description=PRESCALE_FILTER_HELP,
+                  default="", kind="text", allow_empty=True),
         ParamSpec(name="microbunch_ns",
                   description=("Microbunch period (ns) that per-microbunch numbers "
                                "are divided by to give rates. EdepAna folds step "
