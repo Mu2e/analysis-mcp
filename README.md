@@ -1342,6 +1342,7 @@ times the prescale (1000 / 30 / 20), which is why the values above differ.
 | totals per microbunch | `trk_steps_per_ub`, `trk_edep_mev_per_ub`, `trk_hits_per_ub`, and `calo_*` likewise (a hit is a step above threshold and in the folded time window; tracker edep is StrawGasStep `ionizingEdep`, calo is `energyDepG4`, the true deposit) |
 | tracker straw | `trk_peak_straw_hit_rate_khz` and the straw it is (`trk_peak_straw_plane/panel/straw`), `trk_mean_straw_hit_rate_khz` (over all 20736), `trk_peak_straw_edep_rate_mev_per_s` |
 | tracker row | `trk_peak_row_hit_rate_khz` (+ `plane`, `straw`, `radius_mm`), `trk_peak_row_edep_rate_mev_per_s` |
+| tracker region | `trk_peak_region_hit_rate_khz` (+ `plane`, the region's first, and `radius_mm`, its mean straw radius), `trk_peak_region_edep_rate_mev_per_s`, and the region size `trk_region_planes`, `trk_region_straws` |
 | calorimeter crystal | `calo_peak_crystal_hit_rate_khz` (+ `id`, `disk`), `calo_peak_crystal_edep_rate_mev_per_s` |
 | calorimeter radial | `calo_disk{0,1}_peak_radial_hit_rate_khz` (+ `hit_r_mm`), `calo_disk{0,1}_peak_radial_edep_rate_mev_per_s` (+ `edep_r_mm`), per crystal |
 
@@ -1358,6 +1359,22 @@ calorimeter has no z structure inside a crystal, so its average is radial: per
 disk, in 35 mm bins of the **crystal-centre** radius (385-665 mm, so every bin
 holds crystals), divided by the crystals in the bin (EdepAna fills
 `calo_disk<d>_ncrystals_r` once from the geometry).
+
+**Coarse tracker regions.** A row is still a peak over ~3500 noisy bins,
+so at low statistics it is biased high and noisy: a geometry scan with a few
+tens of microbunches' worth of each component puts only tens of hits in the
+busiest row. The busiest *region* averages more straws: `region_planes`
+consecutive planes x `region_straws` consecutive straw numbers over all six
+panels (both analyses take them; defaults 12 and 8, i.e. a third of the
+tracker and 25 mm in radius). Each must divide 36 / 96, so the regions tile
+the tracker; anything else is refused. 1 x 1 is the row, 36 x 96 the mean
+straw. On the Run 1A totals below the 12 x 8 region peaks at 26.18 kHz
+(planes 0-11, r = 380-402 mm; MuStopPileup 65%, MuBeamFlash 28%,
+EleBeamFlash 7%) against 31.67 kHz for the row: the region measures the hot
+area's mean rate, not its hottest row. Toys drawn from those maps at ~8 /
+15 / 53 microbunches of EleBeamFlash / MuBeamFlash / MuStopPileup put the
+row at +100-220% bias and 20-40% spread, the 12 x 8 region at 0-2% and 4-6%
+(the range covers 1-3 hits per independent cluster).
 
 **Uncertainties** are the square root of the summed squared weights of the
 bins, scaled to the microbunch. They treat steps as independent. The steps of
