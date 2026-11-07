@@ -61,6 +61,13 @@ noisy. Averaging channels at the same radius reduces both:
   radius (checked on geom_common.txt, 1 um spread); only z differs, by +-13.9
   mm between the two panel faces. The row's rate is the mean per straw over
   the six, computed from the per-straw histograms.
+* Tracker regions: rows are still noisy at low statistics (a geometry scan's
+  few tens of microbunches put tens of hits in the busiest row, and the
+  maximum over ~3500 rows is biased high), so the busiest REGION is reported
+  too: bins of `region_planes` consecutive planes x `region_straws`
+  consecutive straw numbers over all six panels (default 12 planes x 8 straws,
+  25 mm in radius), the mean per straw in the bin. Each must divide the
+  tracker's 36 planes / 96 straws, so the bins tile it.
 * Calorimeter: the crystals do not vary in z in a way that matters (a crystal
   is a unit), so the average is radial: per disk, in bins of the crystal
   CENTRE radius, divided by the number of crystals in the bin
@@ -111,6 +118,8 @@ N_PLANES, N_PANELS, N_STRAWS = 36, 6, 96
 # r = 380.0 + 3.125 * straw mm, the same in every plane and panel (fit
 # residual 0.5 um).
 STRAW_R0_MM, STRAW_DR_MM = 380.0, 3.125
+# The default tracker region for the coarse peak: 12 planes x 8 straws (25 mm).
+REGION_PLANES, REGION_STRAWS = 12, 8
 
 # The calorimeter: two disks of 674 crystals, numbered disk 0 first.
 N_DISKS = 2
@@ -146,8 +155,12 @@ _RATE_METRICS = (
     ("trk_peak_row_hit_rate_khz", _KHZ),
     ("trk_peak_row_plane", ""), ("trk_peak_row_straw", ""),
     ("trk_peak_row_radius_mm", "mm"),
+    ("trk_peak_region_hit_rate_khz", _KHZ),
+    ("trk_peak_region_plane", ""), ("trk_peak_region_radius_mm", "mm"),
+    ("trk_region_planes", ""), ("trk_region_straws", ""),
     ("trk_peak_straw_edep_rate_mev_per_s", _MEVS),
     ("trk_peak_row_edep_rate_mev_per_s", _MEVS),
+    ("trk_peak_region_edep_rate_mev_per_s", _MEVS),
     ("calo_peak_crystal_hit_rate_khz", _KHZ),
     ("calo_peak_crystal_id", ""), ("calo_peak_crystal_disk", ""),
     ("calo_peak_crystal_edep_rate_mev_per_s", _MEVS),
@@ -358,6 +371,41 @@ def tracker_rows(hist: Hist) -> Hist:
                 [np.arange(N_PLANES + 1.0), np.arange(N_STRAWS + 1.0)])
 
 
+def region_problem(planes: float, straws: float) -> str | None:
+    """Why (planes, straws) cannot tile the tracker, or None."""
+    for value, name, n in ((planes, "region_planes", N_PLANES),
+                           (straws, "region_straws", N_STRAWS)):
+        if value != int(value) or int(value) < 1 or n % int(value):
+            divisors = [d for d in range(1, n + 1) if n % d == 0]
+            return (f"{name} must be a whole number dividing {n} (one of "
+                    f"{divisors}) so the regions tile the tracker; got {value:g}")
+    return None
+
+
+def tracker_regions(hist: Hist, planes: int, straws: int) -> Hist:
+    """Per-straw histogram -> the mean per straw of each region of `planes`
+    consecutive planes x `straws` consecutive straw numbers over all six
+    panels, shape (N_PLANES // planes, N_STRAWS // straws). (1, 1) is the row.
+    """
+    problem = region_problem(planes, straws)
+    if problem:
+        raise OccupancyError(problem)
+    if hist.values.size != N_PLANES * N_PANELS * N_STRAWS:
+        raise OccupancyError(f"expected {N_PLANES * N_PANELS * N_STRAWS} straw "
+                             f"bins, got {hist.values.size}")
+    shape = (N_PLANES // planes, planes, N_PANELS, N_STRAWS // straws, straws)
+    n = planes * N_PANELS * straws
+    return Hist(hist.values.reshape(shape).sum(axis=(1, 2, 4)) / n,
+                hist.variances.reshape(shape).sum(axis=(1, 2, 4)) / n ** 2,
+                [np.arange(0.0, N_PLANES + 1.0, planes),
+                 np.arange(0.0, N_STRAWS + 1.0, straws)])
+
+
+def region_radius_mm(first_straw: int, straws: int) -> float:
+    """Mean straw radius of a region starting at straw number `first_straw`."""
+    return STRAW_R0_MM + STRAW_DR_MM * (first_straw + (straws - 1) / 2.0)
+
+
 def crystal_disk(cid: int, n_crystals: int) -> int:
     """The disk of a crystal: the crystals are numbered disk 0 first."""
     return int(cid // (n_crystals // N_DISKS))
@@ -372,7 +420,8 @@ def radial_per_crystal(hist: Hist, n_crystals: Hist) -> Hist:
                 np.where(n > 0, hist.variances / safe ** 2, 0.0), hist.edges)
 
 
-def compute(hists: dict[str, Hist], microbunch_ns: float
+def compute(hists: dict[str, Hist], microbunch_ns: float,
+            region: tuple[int, int] = (REGION_PLANES, REGION_STRAWS)
             ) -> tuple[dict[str, float], dict]:
     """Totals and peak rates from per-microbunch histograms.
 
@@ -382,7 +431,8 @@ def compute(hists: dict[str, Hist], microbunch_ns: float
     """
     ns = microbunch_ns
     m: dict[str, float] = {}
-    pos: dict = {}
+    planes, straws = int(region[0]), int(region[1])
+    pos: dict = {"trk_region_shape": (planes, straws)}
 
     def total(name: str) -> tuple[float, float]:
         return float(hists[name].values.sum()), float(math.sqrt(hists[name].variances.sum()))
@@ -402,11 +452,16 @@ def compute(hists: dict[str, Hist], microbunch_ns: float
         rows = tracker_rows(h)
         i, v, e = _peak(h.values, h.variances)
         ri, rv, re_ = _peak(rows.values.ravel(), rows.variances.ravel())
+        regions = tracker_regions(h, planes, straws)
+        gi, gv, ge = _peak(regions.values.ravel(), regions.variances.ravel())
         key = "hit_rate_khz" if tag == "hit" else "edep_rate_mev_per_s"
         m[f"trk_peak_straw_{key}"], m[f"trk_peak_straw_{key}_err"] = rate(v, ns), rate(e, ns)
         m[f"trk_peak_row_{key}"], m[f"trk_peak_row_{key}_err"] = rate(rv, ns), rate(re_, ns)
+        m[f"trk_peak_region_{key}"] = rate(gv, ns)
+        m[f"trk_peak_region_{key}_err"] = rate(ge, ns)
         pos[f"trk_straw_{tag}"] = i
         pos[f"trk_row_{tag}"] = ri
+        pos[f"trk_region_{tag}"] = gi
         if tag == "hit":
             plane, rem = divmod(i, N_PANELS * N_STRAWS) if i >= 0 else (-1, -1)
             panel, straw = divmod(rem, N_STRAWS) if i >= 0 else (-1, -1)
@@ -416,6 +471,11 @@ def compute(hists: dict[str, Hist], microbunch_ns: float
             m["trk_peak_row_plane"], m["trk_peak_row_straw"] = float(rplane), float(rstraw)
             m["trk_peak_row_radius_mm"] = (STRAW_R0_MM + STRAW_DR_MM * rstraw
                                            if ri >= 0 else -1.0)
+            gplane, gstraw = divmod(gi, N_STRAWS // straws) if gi >= 0 else (-1, -1)
+            m["trk_peak_region_plane"] = float(gplane * planes) if gi >= 0 else -1.0
+            m["trk_peak_region_radius_mm"] = (region_radius_mm(gstraw * straws, straws)
+                                              if gi >= 0 else -1.0)
+            m["trk_region_planes"], m["trk_region_straws"] = float(planes), float(straws)
     m["trk_mean_straw_hit_rate_khz"] = _khz(
         float(hists["trk_straw_hits"].values.mean()), ns)
 
@@ -446,9 +506,11 @@ def compute(hists: dict[str, Hist], microbunch_ns: float
     return m, pos
 
 
-def metrics_from(hists: dict[str, Hist], meta: dict) -> tuple[dict[str, float], dict]:
+def metrics_from(hists: dict[str, Hist], meta: dict,
+                 region: tuple[int, int] = (REGION_PLANES, REGION_STRAWS)
+                 ) -> tuple[dict[str, float], dict]:
     """Every metric of the occupancy analyses, in COMMON_METRICS order."""
-    computed, pos = compute(hists, meta["microbunch_ns"])
+    computed, pos = compute(hists, meta["microbunch_ns"], region)
     computed["n_events_analyzed"] = meta["n_events"]
     computed["events_per_microbunch"] = meta["events_per_microbunch"]
     return {name: computed[name] for name in COMMON_METRICS}, pos
@@ -475,10 +537,21 @@ def peak_shares(components: list[tuple[str, dict[str, Hist]]],
             return 0.0
         return float(values.reshape(N_PLANES, N_PANELS, N_STRAWS).mean(axis=1).ravel()[index])
 
+    planes, straws = total_pos["trk_region_shape"]
+
+    def region_value(values: np.ndarray, index: int) -> float:
+        if index < 0:
+            return 0.0
+        h = Hist(values, np.zeros_like(values), [])
+        return float(tracker_regions(h, planes, straws).values.ravel()[index])
+
     probes = [("trk_peak_straw_hit", "trk_straw_hits", "trk_straw_hit", at, _khz),
               ("trk_peak_row_hit", "trk_straw_hits", "trk_row_hit", row_value, _khz),
+              ("trk_peak_region_hit", "trk_straw_hits", "trk_region_hit", region_value, _khz),
               ("trk_peak_straw_edep", "trk_straw_edep", "trk_straw_edep", at, _per_s),
               ("trk_peak_row_edep", "trk_straw_edep", "trk_row_edep", row_value, _per_s),
+              ("trk_peak_region_edep", "trk_straw_edep", "trk_region_edep", region_value,
+               _per_s),
               ("calo_peak_crystal_hit", "calo_crystal_hits", "calo_crystal_hit", at, _khz),
               ("calo_peak_crystal_edep", "calo_crystal_edep", "calo_crystal_edep", at, _per_s)]
     for d in range(N_DISKS):
@@ -647,7 +720,8 @@ def run(context: RunContext) -> RunOutcome:
                                 "greater than zero")
     gen_per_pot = float(params["gen_events_per_pot"])
     filter_label = str(params["prescale_filter"]) or None
-    problem = _gen_mode_problem(params, context.max_events)
+    problem = (_gen_mode_problem(params, context.max_events)
+               or region_problem(params["region_planes"], params["region_straws"]))
     if problem:
         return RunOutcome(error=problem)
 
@@ -754,7 +828,7 @@ def run(context: RunContext) -> RunOutcome:
             "components": [params["label"]]}
     scaled_path = context.outdir / SCALED_FILE
     write_scaled_file(scaled_path, scaled, meta)
-    metrics, pos = metrics_from(scaled, meta)
+    metrics, pos = metrics_from(scaled, meta, region_of(params))
     metrics["n_gen_events"] = n_gen
     metrics["prescale"] = prescale
     extra["peak_channels"] = _describe_positions(pos, scaled)
@@ -806,6 +880,16 @@ def _describe_positions(pos: dict, hists: dict[str, Hist]) -> dict:
             plane, straw = divmod(ri, N_STRAWS)
             out[f"trk_peak_row_{tag}"] = {"plane": plane, "straw": straw,
                                           "radius_mm": STRAW_R0_MM + STRAW_DR_MM * straw}
+        gi = pos.get(f"trk_region_{tag}", -1)
+        if gi >= 0:
+            planes, straws = pos["trk_region_shape"]
+            gplane, gstraw = divmod(gi, N_STRAWS // straws)
+            first_plane, first_straw = gplane * planes, gstraw * straws
+            out[f"trk_peak_region_{tag}"] = {
+                "planes": [first_plane, first_plane + planes - 1],
+                "straws": [first_straw, first_straw + straws - 1],
+                "radius_mm": [STRAW_R0_MM + STRAW_DR_MM * first_straw,
+                              STRAW_R0_MM + STRAW_DR_MM * (first_straw + straws - 1)]}
         ci = pos[f"calo_crystal_{tag}"]
         if ci >= 0:
             n_cry = hists["calo_crystal_hits"].values.size
@@ -822,11 +906,37 @@ def summarize(metrics: dict[str, float]) -> str:
             f"{metrics['trk_peak_straw_plane']:g} panel "
             f"{metrics['trk_peak_straw_panel']:g} straw "
             f"{metrics['trk_peak_straw_straw']:g}), peak row "
-            f"{metrics['trk_peak_row_hit_rate_khz']:.4g} kHz, mean "
-            f"{metrics['trk_mean_straw_hit_rate_khz']:.4g} kHz; calorimeter "
+            f"{metrics['trk_peak_row_hit_rate_khz']:.4g} kHz, peak "
+            f"{metrics['trk_region_planes']:g}-plane x {metrics['trk_region_straws']:g}-straw "
+            f"region {metrics['trk_peak_region_hit_rate_khz']:.4g} kHz (planes from "
+            f"{metrics['trk_peak_region_plane']:g}, r {metrics['trk_peak_region_radius_mm']:.0f} "
+            f"mm), mean {metrics['trk_mean_straw_hit_rate_khz']:.4g} kHz; calorimeter "
             f"{metrics['calo_hits_per_ub']:.4g} hits/ub, peak crystal "
             f"{metrics['calo_peak_crystal_id']:g} at "
             f"{metrics['calo_peak_crystal_hit_rate_khz']:.4g} kHz.")
+
+
+def region_params() -> tuple[ParamSpec, ...]:
+    """The coarse tracker region's size, shared with edep_occupancy_combine."""
+    return (
+        ParamSpec(name="region_planes",
+                  description=("Planes per tracker region for the trk_peak_region_* "
+                               "metrics: consecutive planes, a divisor of 36 (1, 2, 3, "
+                               "4, 6, 9, 12, 18, 36). Larger regions average more "
+                               "straws, so the peak is less noisy and less biased "
+                               "high at low statistics, but it is the mean over the "
+                               "region, not the hottest row."),
+                  default=float(REGION_PLANES), minimum=1.0, maximum=float(N_PLANES)),
+        ParamSpec(name="region_straws",
+                  description=("Straw numbers per tracker region (all six panels), "
+                               "a divisor of 96; 8 straws span 25 mm in radius "
+                               "(3.125 mm per straw number)."),
+                  default=float(REGION_STRAWS), minimum=1.0, maximum=float(N_STRAWS)),
+    )
+
+
+def region_of(params: dict) -> tuple[int, int]:
+    return int(params["region_planes"]), int(params["region_straws"])
 
 
 def step_params() -> tuple[ParamSpec, ...]:
@@ -881,6 +991,7 @@ SPEC = AnalysisSpec(
                                "stored in the output file so edep_occupancy_combine "
                                "can report each component's share of the peak."),
                   default="", kind="text", allow_empty=True),
+        *region_params(),
         *step_params(),
         *(ParamSpec(name=name, description=desc, default=default,
                     minimum=lo, maximum=hi)

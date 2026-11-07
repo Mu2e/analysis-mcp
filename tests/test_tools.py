@@ -3814,6 +3814,55 @@ def test_tracker_rows_average_the_six_panels():
     assert abs(rows.variances[7, 12] - 21.0 / 36) < 1e-12
 
 
+def test_tracker_regions_average_planes_panels_and_straws():
+    hits = np.zeros(eocc.N_PLANES * eocc.N_PANELS * eocc.N_STRAWS)
+    hits[(13 * 6 + 2) * 96 + 17] = 48.0     # plane 13, straw 17: region (1, 2) of 12 x 8
+    regions = eocc.tracker_regions(_occ_hist(hits), 12, 8)
+    assert regions.values.shape == (3, 12)
+    assert regions.values[1, 2] == 48.0 / (12 * 6 * 8) and regions.values.sum() == regions.values[1, 2]
+    assert abs(regions.variances[1, 2] - 48.0 / (12 * 6 * 8) ** 2) < 1e-15
+    # one plane x one straw is the row
+    rows = eocc.tracker_rows(_occ_hist(hits))
+    assert np.allclose(eocc.tracker_regions(_occ_hist(hits), 1, 1).values, rows.values)
+    assert eocc.region_radius_mm(16, 8) == 380.0 + 3.125 * 19.5
+
+
+def test_tracker_regions_must_tile_the_tracker(tmp_dir):
+    assert eocc.region_problem(12, 8) is None and eocc.region_problem(36, 96) is None
+    assert "region_planes" in eocc.region_problem(5, 8)
+    assert "region_straws" in eocc.region_problem(12, 7)
+    assert "region_planes" in eocc.region_problem(2.5, 8)
+    outcome, seen = _run_edep_occupancy(tmp_dir, _occ_hists(), parameters={"region_planes": 5})
+    assert outcome.error is not None and "divid" in outcome.error and "edep_ran" not in seen
+
+
+def test_peak_region_metrics_follow_the_region_size(tmp_dir):
+    a, b = _combine_inputs(tmp_dir)
+    for planes, straws in ((12, 8), (6, 4), (36, 96)):
+        result = run_analysis(analysis="edep_occupancy_combine", data_files=[str(a), str(b)],
+                              output_dir=str(Path(tmp_dir) / f"r{planes}_{straws}"),
+                              parameters={"region_planes": planes, "region_straws": straws})
+        assert result.status == "success", result.message
+        m = result.metadata
+        hists, meta = eocc.read_scaled_file(Path(result.files[0]))
+        regions = eocc.tracker_regions(hists["trk_straw_hits"], planes, straws)
+        i = int(regions.values.argmax())
+        assert abs(m["trk_peak_region_hit_rate_khz"]
+                   - regions.values.max() / 1695.0 * 1e6) < 1e-9
+        assert m["trk_region_planes"] == planes and m["trk_region_straws"] == straws
+        gplane, gstraw = divmod(i, 96 // straws)
+        assert m["trk_peak_region_plane"] == gplane * planes
+        assert m["trk_peak_region_radius_mm"] == eocc.region_radius_mm(gstraw * straws, straws)
+        shares = [m["components"][c]["trk_peak_region_hit_share"] for c in ("A", "B")]
+        assert abs(sum(shares) - 1.0) < 1e-12
+    # the whole tracker in one region is the mean straw rate
+    assert abs(m["trk_peak_region_hit_rate_khz"] - m["trk_mean_straw_hit_rate_khz"]) < 1e-9
+    bad = run_analysis(analysis="edep_occupancy_combine", data_files=[str(a), str(b)],
+                       output_dir=str(Path(tmp_dir) / "bad"),
+                       parameters={"region_straws": 7})
+    assert bad.status == "error" and "region_straws" in bad.message
+
+
 def _combine_inputs(tmp_dir):
     """Two components peaking in different channels, as scaled files."""
     paths = []
