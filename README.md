@@ -122,7 +122,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event, the events passing a `selection`, and (with an Offline that has the step counts) approximate calo/tracker hit counts from detector steps |
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
-| `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window (or, with `cut_mode="box"`, the best momentum/time/R(max)/d0/cos box), with the cuts and its signal/DIO/cosmic counts |
+| `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window (or, with `cut_mode="box"`, the best momentum/time/R(max)/d0/cos box), with the cuts and its signal/DIO/cosmic counts; and the median expected 90% CL limit on R_mue in its own momentum window |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
 | `fullsim_sensitivity` | reconstructed CE-mixed-with-pileup EventNtuple `nts.*.root` file(s), e.g. CeMLeadingLogMix1BB | `S/sqrt(B)` for the best momentum window, as `approx_ce_sensitivity`, with the signal efficiency and detector response measured after the CE-like cuts |
 | `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
@@ -1098,6 +1098,37 @@ Three deviations from the macro, all deliberate:
   response is interpolated rather than snapped to the nearest bin. On the
   Run-1B CE sample that moves `dio_background` by ~2% and `sensitivity` by
   0.01%.
+
+### Expected limit
+
+Besides S/sqrt(B), `approx_ce_sensitivity` reports `expected_limit`: the median
+expected 90% CL CLs upper limit on R_mue for the `npot` given, from a counting
+experiment on the Asimov data (the background alone, without fluctuations).
+The signal-count limit s solves q(s, b) = 1.645^2, with q from Cowan, Cranmer,
+Gross and Vitells (Eur. Phys. J. C 71, 1554) or, with a background uncertainty
+sigma, Bhattiprolu, Martin and Wells (arXiv:2009.07249); the limit on R_mue is
+s / S x 1e-13, S being the window's signal at R_mue = 1e-13. Its momentum
+window is scanned like S/sqrt(B)'s (bin centers, from 50 MeV) but chosen to
+minimize the limit, and it is computed on the momentum spectra in either
+cut mode. `expected_limit_box_low_mev` / `_high_mev`, `expected_limit_signal`
+and `expected_limit_background` describe that window.
+
+S/sqrt(B) is the limit's large-background, no-uncertainty limit. With a few
+background events, or with a background uncertainty, the two rank windows and
+designs differently, and the ranking then depends on `npot` (the run length):
+the background uncertainty grows with the background while its statistics grow
+with its square root, so a long run favours narrower windows. Two parameters
+set the uncertainty, used by the limit only:
+
+- `background_uncertainty`: a fixed relative systematic on the window's
+  background (0.2 for 20%);
+- `cosmic_measurement_live_ratio`: the live time of the sample the cosmics are
+  measured in (e.g. off-spill data) over the on-spill time; it adds that
+  measurement's statistics, variance = the window's cosmics / the ratio.
+
+Both default to 0 (statistics only). The limit is only as good as the
+background: `cosmic_rate_per_s_per_mev` must describe the cosmics left after
+the selection and veto the result stands for.
 
 ## fullsim_sensitivity
 

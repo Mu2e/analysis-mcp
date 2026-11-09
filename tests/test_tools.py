@@ -732,6 +732,138 @@ def test_scan_keeps_a_tiny_window_count_against_a_huge_spectrum_total():
     assert abs(best["dio"] - 0.2 * 10) < 1e-6 or best["dio"] > 0.1, best
 
 
+# --- approx_ce_sensitivity: the expected limit --------------------------------
+
+def _reference_q(s, b, sigma):
+    """q = Z^2 of the median expected exclusion, written out independently in
+    mpmath at 50 digits: Cowan et al. (Eur. Phys. J. C 71, 1554) for sigma = 0,
+    Bhattiprolu, Martin and Wells (arXiv:2009.07249) otherwise."""
+    import mpmath as mp
+    mp.mp.dps = 50
+    s, b, sigma = mp.mpf(s), mp.mpf(b), mp.mpf(sigma)
+    if sigma == 0:
+        return 2 * (s - b * mp.log(1 + s / b))
+    x = mp.sqrt((s + b) ** 2 - 4 * s * b * sigma ** 2 / (b + sigma ** 2))
+    return (2 * (s - b * mp.log((b + s + x) / (2 * b))
+                 - b ** 2 / sigma ** 2 * mp.log((b - s + x) / (2 * b)))
+            - (b + s - x) * (1 + b / sigma ** 2))
+
+
+def _reference_s_up(b, sigma=0.0):
+    import mpmath as mp
+    target = mp.mpf("1.6448536") ** 2
+    return float(mp.findroot(lambda s: _reference_q(s, b, sigma) - target,
+                             (mp.mpf("1e-6"), mp.mpf(100 * b + 100)),
+                             solver="anderson"))
+
+
+def test_expected_limit_signal_is_the_asimov_cls_90_percent_limit():
+    """s_up(b) solves q(s, b) = 1.645^2: the median expected 90% CL CLs limit
+    on the Asimov (background-only) data. It is the figure of merit of the
+    Run 1A expected limits, so it must match the formula to high precision."""
+    for b in (1e-3, 0.3, 3.0, 6.1, 30.0, 1e3):
+        got = float(sens.expected_signal_limit(b))
+        want = _reference_s_up(b)
+        assert abs(got / want - 1) < 1e-6, (b, got, want)
+    # the counting limit tends to 1.645 sqrt(b) for a large background
+    assert abs(float(sens.expected_signal_limit(1e8)) / (1.6448536 * 1e4) - 1) < 1e-3
+
+
+def test_expected_limit_signal_with_a_background_uncertainty():
+    for b, rel in ((0.3, 0.2), (6.1, 0.2), (28.3, 0.2), (28.3, 0.1), (1e3, 0.05)):
+        got = float(sens.expected_signal_limit(b, rel * b))
+        want = _reference_s_up(b, rel * b)
+        assert abs(got / want - 1) < 1e-6, (b, rel, got, want)
+    # a negligible uncertainty gives the statistics-only limit
+    for b in (0.3, 3.0, 30.0):
+        assert abs(float(sens.expected_signal_limit(b, 1e-4 * b))
+                   / float(sens.expected_signal_limit(b)) - 1) < 1e-3, b
+    # far beyond the float range of the exact formula, the Gaussian limit
+    b = 1e15
+    assert abs(float(sens.expected_signal_limit(b, 0.2 * b))
+               / (1.6448536 * np.sqrt(b + (0.2 * b) ** 2)) - 1) < 1e-6
+    # vectorized: one call for many windows
+    many = sens.expected_signal_limit(np.array([0.3, 30.0]), np.array([0.0, 6.0]))
+    assert many.shape == (2,)
+    assert abs(many[1] / _reference_s_up(30.0, 6.0) - 1) < 1e-6
+
+
+def _limit_spectra():
+    signal, dio, cosmic = (Spectrum(np.zeros(40), 95.0, 0.5, name=n)
+                           for n in ("signal", "dio", "cosmic"))
+    signal.values[16:24] = [0.1, 0.4, 0.9, 1.0, 0.8, 0.5, 0.2, 0.05]
+    dio.values[:] = np.geomspace(2.0, 1e-4, 40)
+    cosmic.values[:] = 0.3
+    return signal, dio, cosmic
+
+
+def test_limit_scan_finds_the_window_with_the_lowest_limit():
+    signal, dio, cosmic = _limit_spectra()
+    for rel, live_ratio in ((0.0, 0.0), (0.2, 0.0), (0.1, 2.0)):
+        best = sens.scan_limit_window(signal, dio, cosmic,
+                                      background_uncertainty=rel,
+                                      cosmic_measurement_live_ratio=live_ratio)
+        brute = None
+        for i in range(signal.nbins):
+            for j in range(i + 1, signal.nbins + 1):
+                s = signal.values[i:j].sum()
+                c = cosmic.values[i:j].sum()
+                bkg = dio.values[i:j].sum() + c
+                if s <= 0:
+                    continue
+                var = (rel * bkg) ** 2 + (c / live_ratio if live_ratio else 0.0)
+                limit = _reference_s_up(bkg, np.sqrt(var)) / s
+                if brute is None or limit < brute[0]:     # bin centers, as the S/sqrt(B) scan
+                    brute = (limit, float(signal.centers()[i]),
+                             float(signal.centers()[j - 1]))
+        assert abs(best["limit_per_signal"] / brute[0] - 1) < 1e-6, (rel, best, brute)
+        assert (best["low_mev"], best["high_mev"]) == brute[1:], (rel, best, brute)
+
+
+def test_a_background_uncertainty_never_improves_the_limit():
+    signal, dio, cosmic = _limit_spectra()
+    stat = sens.scan_limit_window(signal, dio, cosmic)
+    syst = sens.scan_limit_window(signal, dio, cosmic, background_uncertainty=0.2)
+    meas = sens.scan_limit_window(signal, dio, cosmic, background_uncertainty=0.2,
+                                  cosmic_measurement_live_ratio=2.0)
+    assert stat["limit_per_signal"] < syst["limit_per_signal"] < meas["limit_per_signal"]
+
+
+def test_sensitivity_reports_the_expected_limit(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    base = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                        output_dir=tmp_dir, parameters={"sig_eff": 1e-3})
+    assert base.status == "success", base.message
+    m = base.metadata
+    for name in ("expected_limit", "expected_limit_box_low_mev",
+                 "expected_limit_box_high_mev", "expected_limit_signal",
+                 "expected_limit_background"):
+        assert name in m, name
+    # the limit is s_up(B) x R_mue / S for its own window
+    want = float(sens.expected_signal_limit(m["expected_limit_background"])) \
+        * sens.R_MUE / m["expected_limit_signal"]
+    assert abs(m["expected_limit"] / want - 1) < 1e-9, (m["expected_limit"], want)
+    assert "expected 90% CL limit" in base.message, base.message
+
+    syst = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                        output_dir=tmp_dir,
+                        parameters={"sig_eff": 1e-3, "background_uncertainty": 0.2,
+                                    "cosmic_measurement_live_ratio": 2.0})
+    assert syst.status == "success", syst.message
+    ms = syst.metadata
+    assert ms["expected_limit"] > m["expected_limit"]
+    # S/sqrt(B) and its window do not depend on the limit's settings
+    for name in ("sensitivity", "signal_box_low_mev", "signal_box_high_mev",
+                 "total_background", "punzi_fom"):
+        assert ms[name] == m[name], name
+
+    bad = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir,
+                       parameters={"sig_eff": 1e-3, "background_uncertainty": -0.1})
+    assert bad.status == "error", bad.message
+
+
 def test_sensitivity_rejects_a_file_without_the_tree(tmp_dir):
     """A non-EdepAna ROOT file (or a pre-tree one) is reported, not a crash."""
     import uproot

@@ -321,6 +321,99 @@ def scan_signal_box(signal: Spectrum, dio: Spectrum, cosmic: Spectrum,
     return best, per_edge[:top_n]
 
 
+# --- the expected limit ---------------------------------------------------------
+# The median expected 90% CL CLs upper limit of a counting experiment, worked
+# out on the Asimov data (the background alone, without fluctuations): the
+# signal count s at which the exclusion significance reaches EXCLUSION_Z, since
+# then CLs = 2 (1 - Phi(Z)) = 0.10. S/sqrt(B) is its large-background limit
+# without a background uncertainty; at a few background events, or with one, the
+# two rank windows and designs differently.
+EXCLUSION_Z = 1.6448536
+# Above this many background events the exact formulas lose float precision,
+# and their Gaussian limit, Z sqrt(b + sigma^2), is exact to far better than 1e-6.
+GAUSSIAN_BACKGROUND = 1.0e10
+
+
+def _exclusion_q(s, b, sigma):
+    """Z^2 of the median expected exclusion of signal s over background b with
+    an absolute background uncertainty sigma (arrays): Cowan, Cranmer, Gross
+    and Vitells (Eur. Phys. J. C 71, 1554) for sigma = 0, and Bhattiprolu,
+    Martin and Wells (arXiv:2009.07249) otherwise."""
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        stat = 2.0 * (s - b * np.log1p(s / b))
+        var = np.where(sigma > 0.0, sigma ** 2, 1.0)
+        x = np.sqrt((s + b) ** 2 - 4.0 * s * b * var / (b + var))
+        syst = (2.0 * (s - b * np.log((b + s + x) / (2.0 * b))
+                       - b * b / var * np.log((b - s + x) / (2.0 * b)))
+                - (b + s - x) * (1.0 + b / var))
+    return np.where(sigma > 0.0, syst, stat)
+
+
+def expected_signal_limit(background, sigma=0.0):
+    """The median expected 90% CL upper limit on the signal count, for a
+    background count `background` (> 0) known to an absolute uncertainty
+    `sigma` (0: statistics only). Arrays broadcast; solved by bisection."""
+    b, sigma = np.broadcast_arrays(np.asarray(background, dtype=float),
+                                   np.asarray(sigma, dtype=float))
+    target = EXCLUSION_Z ** 2
+    gauss = EXCLUSION_Z * np.sqrt(b + sigma ** 2)
+    lo, hi = np.zeros(b.shape), 3.0 * gauss + 10.0
+    while np.any(_exclusion_q(hi, b, sigma) < target):   # q rises with s
+        hi = np.where(_exclusion_q(hi, b, sigma) < target, 2.0 * hi, hi)
+    for _ in range(64):
+        mid = 0.5 * (lo + hi)
+        below = _exclusion_q(mid, b, sigma) < target
+        lo, hi = np.where(below, mid, lo), np.where(below, hi, mid)
+    return np.where(b > GAUSSIAN_BACKGROUND, gauss, 0.5 * (lo + hi))
+
+
+def scan_limit_window(signal: Spectrum, dio: Spectrum, cosmic: Spectrum,
+                      background_uncertainty: float = 0.0,
+                      cosmic_measurement_live_ratio: float = 0.0,
+                      box_min_mev: float = SIGNAL_BOX_MIN_MEV) -> dict[str, float]:
+    """The momentum window with the lowest expected limit, scanned over the
+    same windows as scan_signal_box (edges are bin centers too).
+
+    The background's uncertainty is `background_uncertainty` times the
+    background (a fixed relative systematic) and, when the cosmics are
+    measured in a sample `cosmic_measurement_live_ratio` times as long as the
+    on-spill time (e.g. off-spill data), that measurement's statistics: their
+    variance is the window's cosmics over the ratio. `limit_per_signal` is the
+    limit on the signal count divided by the window's signal count, so the
+    limit on a rate is it times the rate the signal spectrum assumes.
+    """
+    centers = signal.centers()
+    first_bin = int(np.searchsorted(centers, box_min_mev))
+    best: dict[str, float] | None = None
+    for ibin in range(first_bin, signal.nbins):
+        s = np.cumsum(signal.values[ibin:])
+        d = np.cumsum(dio.values[ibin:])
+        c = np.cumsum(cosmic.values[ibin:])
+        background = d + c
+        usable = np.flatnonzero((s > 0.0) & (background > 0.0))
+        if usable.size == 0:
+            continue
+        var = (background_uncertainty * background[usable]) ** 2
+        if cosmic_measurement_live_ratio > 0.0:
+            var = var + c[usable] / cosmic_measurement_live_ratio
+        per_signal = expected_signal_limit(background[usable], np.sqrt(var)) / s[usable]
+        k = int(np.argmin(per_signal))
+        if best is None or per_signal[k] < best["limit_per_signal"]:
+            j = usable[k]
+            best = {
+                "low_mev": float(centers[ibin]),
+                "high_mev": float(centers[ibin + j]),
+                "signal": float(s[j]), "dio": float(d[j]), "cosmic": float(c[j]),
+                "background": float(background[j]),
+                "limit_per_signal": float(per_signal[k]),
+            }
+    if best is None:
+        raise SensitivityError(
+            "no signal window had both signal and background > 0 — the input "
+            f"histograms are probably empty above {box_min_mev:g} MeV")
+    return best
+
+
 def ce_time_efficiency(t1: float, t2: float,
                        lifetime_ns: float = MUON_LIFETIME_NS):
     """Fraction of CEs in [t1, t2) ns of the microbunch [0, T): the density is
@@ -1363,6 +1456,12 @@ def run(context: RunContext) -> RunOutcome:
 
         # 5. best window
         best, top = scan_signal_box(signal_reco, dio_reco, cosmic)
+        # 5b. the window with the lowest expected limit, on the same spectra
+        # (momentum only, in either cut mode)
+        limit = scan_limit_window(
+            signal_reco, dio_reco, cosmic,
+            background_uncertainty=context.params["background_uncertainty"],
+            cosmic_measurement_live_ratio=context.params["cosmic_measurement_live_ratio"])
 
         # 6. (box mode) the best box in momentum, time, R(max), d0 and cos
         box = None
@@ -1391,6 +1490,14 @@ def run(context: RunContext) -> RunOutcome:
         "npot": float(npot),
         "cosmic_rate_per_s_per_mev": float(cosmic_rate_per_s_per_mev),
         "momentum_only_sensitivity": float(best["sensitivity"]),
+        # The median expected 90% CL limit on R_mue, in its own momentum
+        # window (the signal spectrum assumes R_MUE, so the limit is the
+        # signal-count limit per signal event times R_MUE).
+        "expected_limit": float(limit["limit_per_signal"] * R_MUE),
+        "expected_limit_box_low_mev": limit["low_mev"],
+        "expected_limit_box_high_mev": limit["high_mev"],
+        "expected_limit_signal": limit["signal"],
+        "expected_limit_background": limit["background"],
         # The figure of merit the box is optimized on, for the headline
         # window or box in either mode; the expected limit scales ~ 1/punzi_fom.
         "punzi_fom": float(punzi_fom(headline["signal"], headline["background"])),
@@ -1428,6 +1535,13 @@ def run(context: RunContext) -> RunOutcome:
         f"S = {best['signal']:.3g}, DIO = {best['dio']:.3g}, "
         f"cosmic = {best['cosmic']:.3g} -> B = {best['background']:.3g}, "
         f"S/sqrt(B) = {best['sensitivity']:.4g}",
+        f"Expected 90% CL limit R_mue < {limit['limit_per_signal'] * R_MUE:.4g} in "
+        f"[{limit['low_mev']:.1f}, {limit['high_mev']:.1f}] MeV: "
+        f"S = {limit['signal']:.3g}, DIO = {limit['dio']:.3g}, "
+        f"cosmic = {limit['cosmic']:.3g} -> B = {limit['background']:.3g} "
+        f"(background uncertainty {context.params['background_uncertainty']:g} "
+        "relative, cosmic measurement live-time ratio "
+        f"{context.params['cosmic_measurement_live_ratio']:g}; 0 = none)",
         "",
         f"Top {len(top)} windows scanned:",
     ]
@@ -1476,6 +1590,16 @@ def run(context: RunContext) -> RunOutcome:
 
 
 def summarize(metrics: dict[str, float]) -> str:
+    limit = (
+        f" The expected 90% CL limit is R_mue < {metrics['expected_limit']:.3g} "
+        f"in [{metrics['expected_limit_box_low_mev']:.1f}, "
+        f"{metrics['expected_limit_box_high_mev']:.1f}] MeV/c "
+        f"(S = {metrics['expected_limit_signal']:.3g}, "
+        f"B = {metrics['expected_limit_background']:.3g}).")
+    return _summarize_sensitivity(metrics) + limit
+
+
+def _summarize_sensitivity(metrics: dict[str, float]) -> str:
     if metrics["ce_box_efficiency"] >= 0.0:     # -1 in momentum mode
         return (
             f"S/sqrt(B) = {metrics['sensitivity']:.4g} in the optimized box "
@@ -1515,6 +1639,9 @@ SPEC = AnalysisSpec(
         "total_background", "signal_mpv_mev", "signal_fwhm_mev",
         "npot", "cosmic_rate_per_s_per_mev",
         "momentum_only_sensitivity", "punzi_fom", *BOX_CUT_METRICS,
+        "expected_limit", "expected_limit_box_low_mev",
+        "expected_limit_box_high_mev", "expected_limit_signal",
+        "expected_limit_background",
     ),
     units={
         "time_low_ns": "ns", "time_high_ns": "ns",
@@ -1526,6 +1653,9 @@ SPEC = AnalysisSpec(
         "signal_fwhm_mev": "MeV",
         "npot": "POT",
         "cosmic_rate_per_s_per_mev": "per second per MeV/c",
+        "expected_limit": "R_mue (conversions per muon capture), 90% CL",
+        "expected_limit_box_low_mev": "MeV",
+        "expected_limit_box_high_mev": "MeV",
     },
     parameters=(
         ParamSpec(
@@ -1575,6 +1705,28 @@ SPEC = AnalysisSpec(
                         "Scaled by the on-spill live time "
                         "that npot and mean npot per event implies. "
                         + "In 'box' mode it is the cosmic-electron rate for the LOOSE selection the cosmic shapes were extracted with (ConvAna set 81: e-, APR/CPR trigger, upstream-reflection and multi-track vetoes, 100 < p < 110 MeV/c; no t0, cos, R(max) or d0 cut); the box's cosmic count is this rate times the box's cosmic time and geometry efficiencies, with no further scaling. In 'momentum' mode it is the rate after whatever fixed selection the result is meant to represent, applied as-is. The default (0) is, in momentum mode, the Run-1A rate 10/7.8e5 and, in box mode, that rate times the loose/tight yield ratio from the shapes file (the tight Run-1A cuts 540 < t0 < 1650 ns, 0.525 < cos < 0.649, 482 < R(max) < 642.6 mm pass 3.2% of the loose set, so ~31x, ~4.0e-4).",
+            default=0.0, minimum=0.0,
+        ),
+        ParamSpec(
+            name="background_uncertainty",
+            description="Relative uncertainty on the background in a window, "
+                        "for expected_limit only (S/sqrt(B) ignores it): a fixed "
+                        "systematic, e.g. 0.2 for 20%. The limit's window is "
+                        "re-optimized with it, so a larger value favours "
+                        "narrower windows with less background. 0 (the "
+                        "default) gives the statistics-only limit.",
+            default=0.0, minimum=0.0,
+        ),
+        ParamSpec(
+            name="cosmic_measurement_live_ratio",
+            description="For expected_limit only: the live time of the sample "
+                        "the cosmic background is measured in (e.g. off-spill "
+                        "data) over the on-spill time npot implies. Adds that "
+                        "measurement's statistics to the background "
+                        "uncertainty (variance = the window's cosmics / this "
+                        "ratio), which shrinks relative to the background as "
+                        "npot grows, unlike background_uncertainty. 0 (the "
+                        "default) adds none.",
             default=0.0, minimum=0.0,
         ),
         ParamSpec(
