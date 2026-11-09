@@ -34,11 +34,11 @@ from pathlib import Path
 
 import numpy as np
 
+from ..eventntuple import NtupleError, _flat, _numpy, open_tree
 from ..selection import SelectionError, apply_selection
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from ..spectrum import Spectrum
 from .momentum_resolution_ntuple import histogram, summary
-from .trigger_efficiency_ntuple import NtupleError, _flat, _numpy, open_tree
 
 RECO_LEAVES = {
     "energy": "caloclusters.energyDep_",

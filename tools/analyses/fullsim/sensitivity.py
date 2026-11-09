@@ -41,6 +41,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ...eventntuple import ORIGIN_NAMES, SID_TT_FRONT, TREE_PATH
 from ...spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from ...spectrum import Kernel, Spectrum
 from ..approx_ce_sensitivity import (COSMIC_RATE_PER_SECOND_PER_MEV,
@@ -50,8 +51,7 @@ from ..approx_ce_sensitivity import (COSMIC_RATE_PER_SECOND_PER_MEV,
                                      scan_signal_box)
 from .cuts import (CUT_DESCRIPTIONS, CUT_SET, DEFAULT_CUTS, TRKPID_MIN,
                    TRKQUAL_MIN, CutError, active_cuts, apply_cuts, cut_masks)
-from .eventntuple import (DEFAULT_TRIGGERS, ORIGIN_NAMES, SID_TT_FRONT,
-                          TREE_PATH, EventNtupleError, origin_codes,
+from .eventntuple import (DEFAULT_TRIGGERS, EventNtupleError, origin_codes,
                           parse_trigger_paths, read_eventntuple)
 from .normalization import (CAPTURES_PER_STOPPED_MUON, DIO_PER_STOPPED_MUON,
                             STOP_CHAIN, STOP_CHAIN_DATASETS,

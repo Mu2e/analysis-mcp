@@ -12,7 +12,7 @@ truth of the particle that made it gives two distributions:
 Their difference is fullsim_sensitivity's "response" (reconstructed at
 TT_Front minus true at birth), which folds both together.
 
-The truth is trigger_efficiency_ntuple's MC_VARIABLES (from `trkmcsim` and
+The truth is tools/eventntuple.py's MC_VARIABLES (from `trkmcsim` and
 `trksegsmc`): `resolution` is p_front - mc_p_front and `energy_loss` is
 mc_p_start - mc_p_front, both at the downstream-going TT_Front crossing (the
 earliest true one with pz > 0, as the true steps are not stored in time
@@ -27,13 +27,12 @@ from pathlib import Path
 
 import numpy as np
 
+from ..eventntuple import (MC_LEAVES, MC_VARIABLES, TRACK_VARIABLES, NtupleError,
+                           open_tree, read_track_arrays, track_variables)
 from ..selection import SelectionError, apply_selection
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from ..spectrum import Spectrum
-from .trigger_efficiency_ntuple import (DEFAULT_SELECTION, MC_LEAVES,
-                                        MC_VARIABLES, TRACK_VARIABLES,
-                                        NtupleError, open_tree,
-                                        read_track_arrays, track_variables)
+from .trigger_efficiency_ntuple import DEFAULT_SELECTION
 
 # Added to the track and MC variables, for selections as well as the plots.
 RESPONSE_VARIABLES: dict[str, str] = {

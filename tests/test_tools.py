@@ -38,6 +38,7 @@ from tools.analyses.muon_stop_rate import (PRESCALE_FILTER, job_fcl_text,
 from tools.analyses.stop_materials import combine_tables, material_rates
 from tools.analyses import trigger as trig
 from tools.analyses.trigger_efficiency import efficiency_metrics
+from tools import eventntuple as ntup
 from tools.analyses import trigger_efficiency_ntuple as ntrig
 from tools.analyses import trigger_efficiency_ntuple_binned as bntrig
 from tools.analyses import selection_efficiency_ntuple as nsel
@@ -1064,6 +1065,92 @@ def test_generated_events_refuses_a_merged_file(tmp_dir):
         raise AssertionError("a merged file was accepted")
 
 
+# --- approx_ce_sensitivity: overlay with a reference configuration ------------
+
+def test_sensitivity_without_a_reference_reports_minus_one_reference_metrics(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          output_dir=tmp_dir, parameters={"sig_eff": 1e-3})
+    assert result.status == "success", result.message
+    for name in ("reference_sensitivity", "reference_signal_rate",
+                 "reference_total_background", "reference_signal_mpv_mev",
+                 "reference_signal_fwhm_mev", "sensitivity_ratio"):
+        assert result.metadata[name] == -1.0, name
+    assert not any("overlay" in f for f in result.files), result.files
+    assert "Reference" not in result.message
+    ce = list_analyses().metadata["analyses"]["approx_ce_sensitivity"]
+    assert ce["takes_reference"] is True and ce["reference_optional"] is True
+
+
+def test_sensitivity_against_itself_overlays_a_ratio_of_one(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+    result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                          reference_file=str(path), output_dir=tmp_dir,
+                          parameters={"sig_eff": 1e-3, "label": "No IPA",
+                                      "reference_label": "nominal"})
+    assert result.status == "success", result.message
+    meta = result.metadata
+    assert meta["reference_sensitivity"] == meta["sensitivity"]
+    assert meta["reference_signal_mpv_mev"] == meta["signal_mpv_mev"]
+    assert meta["sensitivity_ratio"] == 1.0
+    assert meta["reference_label"] == "nominal" and meta["n_reference_files"] == 1
+    names = {Path(f).name for f in result.files}
+    assert {"sig_vs_bkg.png", "sig_vs_bkg_overlay.png", "signal_shape_overlay.png",
+            "response_overlay.png"} <= names, names
+    assert "Reference: S/sqrt(B)" in result.message, result.message
+    log = (Path(tmp_dir) / "approx_ce_sensitivity.log").read_text()
+    assert "Reference (nominal)" in log and "No IPA / nominal = 1" in log, log
+
+
+def test_reference_keeps_its_own_stopping_rate(tmp_dir):
+    new, ref = Path(tmp_dir) / "new.root", Path(tmp_dir) / "ref.root"
+    _write_edep_tree(new, n=4000, ngen_total=8000)       # acceptance 0.5
+    _write_edep_tree(ref, n=4000, ngen_total=10000)      # acceptance 0.4
+    params = {"stops_per_pot": 2e-3, "selection": ""}
+    same = run_analysis(analysis="approx_ce_sensitivity", data_file=str(new),
+                        reference_file=str(ref), output_dir=str(Path(tmp_dir) / "a"),
+                        parameters=params)
+    own = run_analysis(analysis="approx_ce_sensitivity", data_file=str(new),
+                       reference_file=str(ref), output_dir=str(Path(tmp_dir) / "b"),
+                       parameters={**params, "reference_stops_per_pot": 3e-3})
+    assert same.status == own.status == "success", (same.message, own.message)
+    # 0 means the input's stopping rate, times the reference's own acceptance
+    assert same.metadata["reference_stops_per_pot"] == 2e-3
+    assert np.isclose(same.metadata["reference_sig_eff"], 2e-3 * 0.4)
+    assert np.isclose(own.metadata["reference_sig_eff"], 3e-3 * 0.4)
+    assert own.metadata["sig_eff"] == same.metadata["sig_eff"] == 1e-3
+    assert own.metadata["reference_sensitivity"] > same.metadata["reference_sensitivity"]
+    assert own.metadata["sensitivity"] == same.metadata["sensitivity"]
+
+
+def test_sensitivity_refuses_reference_inputs_that_do_not_fit(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+
+    def attempt(**kwargs):
+        params = kwargs.pop("parameters")
+        return run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                            output_dir=tmp_dir, parameters=params, **kwargs)
+
+    alone = attempt(parameters={"sig_eff": 1e-3, "reference_sig_eff": 2e-3})
+    assert alone.status == "error" and "reference_file" in alone.message, alone.message
+    mixed = attempt(reference_file=str(path),
+                    parameters={"sig_eff": 1e-3, "reference_stops_per_pot": 2e-3})
+    assert mixed.status == "error" and "same way" in mixed.message, mixed.message
+    two = attempt(reference_files=[str(path), str(path)],
+                  parameters={"sig_eff": 1e-3})
+    assert two.status == "error" and "one reference file" in two.message, two.message
+    other = Path(tmp_dir) / "other.root"
+    _write_edep_tree(other)
+    tight = attempt(reference_file=str(other),
+                    parameters={"sig_eff": 1e-3,
+                                "selection": "event_calo_edep_vis > 1000"})
+    assert tight.status == "error"     # the input fails first, as before
+    assert "reference" not in tight.message, tight.message
+
+
 def test_sensitivity_refuses_a_nan_efficiency_input(tmp_dir):
     path = Path(tmp_dir) / "nts.owner.edep.test.root"
     _write_edep_tree(path, n=100, ngen_total=200)
@@ -1591,12 +1678,12 @@ NTUPLE_FILE = Path("/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/"
 
 
 def test_ntuple_trigger_names_drop_the_prefix_and_refuse_typos():
-    assert ntrig.parse_trigger_names("apr_TrkDe_80m70p, trig_cpr_TrkDe_80m70p") == [
+    assert ntup.parse_trigger_names("apr_TrkDe_80m70p, trig_cpr_TrkDe_80m70p") == [
         "apr_TrkDe_80m70p", "cpr_TrkDe_80m70p"]
     for bad in ("", "apr_TrkDe, trig_apr_TrkDe", "bad-name"):
         try:
-            ntrig.parse_trigger_names(bad)
-        except ntrig.NtupleError:
+            ntup.parse_trigger_names(bad)
+        except ntup.NtupleError:
             pass
         else:
             raise AssertionError(f"{bad!r} should have been refused")
@@ -1632,13 +1719,13 @@ def _ntuple_arrays():
                           [[pars(40.0, 0.4)]]],
         "event": [5, 6], "run": [1, 1], "subrun": [0, 0],
     }
-    for name in ntrig._TRK_FIELDS:
+    for name in ntup.TRK_FIELDS:
         tracks.setdefault(f"trk.{name}", [[0, 0], [0]])
     return {name: ak.Array(values) for name, values in tracks.items()}
 
 
 def test_ntuple_track_variables_take_the_downstream_front_and_the_mid_fit():
-    v = ntrig.track_variables(_ntuple_arrays())
+    v = ntup.track_variables(_ntuple_arrays())
     assert v["_event"].tolist() == [0, 0, 1]
     assert abs(v["p_front"][0] - 104.0) < 0.01               # not the upstream leg
     assert v["t_front"][0] == 900.0 and v["downstream"].tolist() == [True, False, False]
@@ -1650,13 +1737,13 @@ def test_ntuple_track_variables_take_the_downstream_front_and_the_mid_fit():
     assert v["calo_edep"][0] == 95.0 and np.isnan(v["calo_edep"][1])
     assert v["charge"].tolist() == [-1.0, -1.0, 1.0]
     assert v["ntrk"].tolist() == [2.0, 2.0, 1.0] and v["event"].tolist() == [5, 5, 6]
-    assert set(v) - {"_event"} == set(ntrig.TRACK_VARIABLES)
-    for name in ntrig.TRACK_VARIABLES:            # every advertised one is usable
+    assert set(v) - {"_event"} == set(ntup.TRACK_VARIABLES)
+    for name in ntup.TRACK_VARIABLES:            # every advertised one is usable
         apply_selection(f"{name} == {name}", v, v["_event"].size)
 
 
 def test_ntuple_efficiency_is_over_events_with_a_selected_track():
-    v = ntrig.track_variables(_ntuple_arrays())
+    v = ntup.track_variables(_ntuple_arrays())
     triggers = {"a": np.array([True, True]), "b": np.array([False, True])}
     counts = ntrig.efficiency_counts(v, triggers, 2, ntrig.DEFAULT_SELECTION)
     assert counts["n_selected"] == 1 and counts["n_tracks_selected"] == 1
@@ -1677,23 +1764,37 @@ def _ntuple_mc_arrays():
         return {"sid": sid, "time": time,
                 "mom": {"fCoordinates": {"fX": 0.0, "fY": pt, "fZ": pz}}}
 
-    def sim(pdg, code, p):
+    def sim(pdg, code, p, rank=0, trkrel=0, prirel=0, pos=(0.0, 0.0, 0.0),
+            endpos=(0.0, 0.0, 0.0), endp=10.0):
         return {"pdg": pdg, "startCode": code, "gen": 0, "time": 600.0,
-                "nhits": 30, "nactive": 28,
-                "mom": {"fCoordinates": {"fX": 0.0, "fY": 0.0, "fZ": p}}}
+                "nhits": 30, "nactive": 28, "rank": rank,
+                "trkrel": {"_rel": trkrel, "_rem": 0},
+                "prirel": {"_rel": prirel, "_rem": 0},
+                "mom": {"fCoordinates": {"fX": 0.0, "fY": 0.0, "fZ": p}},
+                "pos": {"fCoordinates": dict(zip(("fX", "fY", "fZ"), pos))},
+                "endpos": {"fCoordinates": dict(zip(("fX", "fY", "fZ"), endpos))},
+                "endmom": {"fCoordinates": {"fX": 0.0, "fY": 0.0, "fZ": endp}}}
 
     arrays = _ntuple_arrays()
     arrays["trksegsmc"] = ak.Array([
         [[step(1, 60.0, 905.0, 80.0), step(0, -60.0, 850.0, 80.0),
           step(0, 63.0, 901.0, 84.0), step(0, 70.0, 990.0, 10.0)], []], [[]]])
-    arrays["trkmcsim"] = ak.Array([[[sim(11, 168, 104.9), sim(13, 0, 50.0)], []],
-                                   [[sim(-11, 179, 70.0)]]])
-    arrays[ntrig.NPOT_BRANCH] = ak.Array([3.0e7, 1.5e7])
+    # The CE e- (the primary, placed at the stop), then its muon, killed at a
+    # stage boundary (not at rest), then a delta ray matched as rank 1. The
+    # e+ is from pileup: no primary in its chain, and its muon came to rest.
+    arrays["trkmcsim"] = ak.Array([
+        [[sim(11, 168, 104.9, pos=(30.0, 40.0, -4300.0)),
+          sim(13, 0, 50.0, rank=-1, trkrel=2, prirel=2, endpos=(9.0, 9.0, -5970.0)),
+          sim(11, 17, 2.0, rank=1, trkrel=1, prirel=1)], []],
+        [[sim(-11, 179, 70.0, prirel=-1),
+          sim(-13, 0, 40.0, rank=-1, trkrel=2, prirel=-1, endpos=(0.0, 90.0, -4500.0),
+              endp=0.0)]]])
+    arrays[ntup.NPOT_BRANCH] = ak.Array([3.0e7, 1.5e7])
     return arrays
 
 
 def test_ntuple_mc_variables_take_the_earliest_downstream_front_crossing():
-    v = ntrig.track_variables(_ntuple_mc_arrays())
+    v = ntup.track_variables(_ntuple_mc_arrays())
     assert abs(v["mc_p_front"][0] - 105.0) < 1e-4 and v["mc_t_front"][0] == 901.0
     assert abs(v["mc_cos_front"][0] - 63.0 / 105.0) < 1e-6
     assert v["mc_p_mid"][0] == 100.0 and v["mc_has_front"].tolist() == [True, False, False]
@@ -1701,17 +1802,90 @@ def test_ntuple_mc_variables_take_the_earliest_downstream_front_crossing():
     assert v["mc_pdg"].tolist()[::2] == [11, -11] and v["mc_start_code"][2] == 179
     assert abs(v["mc_p_start"][0] - 104.9) < 1e-4
     assert v["mc_npot"].tolist() == [3.0e7, 3.0e7, 1.5e7]     # per event
-    assert set(v) - {"_event"} == set(ntrig.TRACK_VARIABLES) | set(ntrig.MC_VARIABLES)
-    for name in ntrig.MC_VARIABLES:
+    assert v["mc_origin"].tolist() == [168, -2, 179]
+    assert v["mc_mother_pdg"][0] == 13 and v["mc_mother_pdg"][2] == -13
+    assert set(v) - {"_event"} == set(ntup.TRACK_VARIABLES) | set(ntup.MC_VARIABLES)
+    for name in ntup.MC_VARIABLES:
         apply_selection(f"{name} == {name}", v, v["_event"].size)
 
 
-def test_ntuple_mc_variables_on_data_say_there_is_no_truth():
-    v = ntrig.track_variables(_ntuple_arrays())
-    ntrig.check_mc_names(v, "p_front > 80")                   # no MC asked for
+def test_ntuple_mc_generated_momentum_is_the_primary_in_the_tracks_chain():
+    v = ntup.track_variables(_ntuple_mc_arrays())
+    assert abs(v["mc_p_gen"][0] - 104.9) < 1e-4                # the CE itself
+    assert v["mc_pdg_gen"][0] == 11 and v["mc_start_code_gen"][0] == 168
+    assert np.isnan(v["mc_p_gen"][2]) and np.isnan(v["mc_pdg_gen"][2])  # pileup
+
+
+def test_ntuple_mc_stop_is_the_resting_muon_or_the_generated_particle():
+    v = ntup.track_variables(_ntuple_mc_arrays())
+    # CE: its muon was killed at a stage boundary, so the CE's start is the stop
+    assert (v["mc_stop_x"][0], v["mc_stop_y"][0], v["mc_stop_z"][0]) == (30.0, 40.0, -4300.0)
+    assert v["mc_stop_rho"][0] == 50.0
+    # e+ from an RPC (not a muon-stop process): its muon's end, at rest
+    assert (v["mc_stop_y"][2], v["mc_stop_z"][2]) == (90.0, -4500.0)
+    assert v["mc_has_stop"].tolist() == [True, False, True]
+    assert np.isnan(v["mc_stop_z"][1])                          # no MC
+
+
+def _ntuple_crv_arrays():
+    """_ntuple_arrays with CRV coincidences: two in event 0 (at 700 and
+    880 ns), none in event 1."""
+    import awkward as ak
+
+    arrays = _ntuple_arrays()
+    for leaf, values in (("time", [[700.0, 880.0], []]), ("PEs", [[40.0, 90.0], []]),
+                         ("nHits", [[4, 8], []]), ("nLayers", [[3, 4], []]),
+                         ("sectorType", [[1, 3], []]),
+                         ("pos.fCoordinates.fX", [[0.0, 10.0], []]),
+                         ("pos.fCoordinates.fY", [[4800.0, 2600.0], []]),
+                         ("pos.fCoordinates.fZ", [[-4000.0, 100.0], []])):
+        arrays[f"crvcoincs.{leaf}"] = ak.Array(values)
+    return arrays
+
+
+def test_ntuple_crv_variables_take_the_coincidence_nearest_the_track():
+    v = ntup.track_variables(_ntuple_crv_arrays())
+    assert v["crv_n"].tolist() == [2.0, 2.0, 0.0]
+    # the e- at TT_Front at 900 ns: 880 is nearer than 700
+    assert v["crv_dt"][0] == 20.0 and v["crv_time"][0] == 880.0
+    assert (v["crv_pes"][0], v["crv_nlayers"][0], v["crv_sector"][0]) == (90.0, 4.0, 3.0)
+    assert (v["crv_x"][0], v["crv_y"][0], v["crv_z"][0]) == (10.0, 2600.0, 100.0)
+    assert np.isnan(v["crv_dt"][1]) and np.isnan(v["crv_pes"][1])  # no time
+    assert np.isnan(v["crv_dt"][2]) and np.isnan(v["crv_time"][2])  # no coincidence
+    assert set(v) - {"_event"} == set(ntup.TRACK_VARIABLES) | set(ntup.CRV_VARIABLES)
+    for name in ntup.CRV_VARIABLES:
+        apply_selection(f"{name} == {name}", v, v["_event"].size)
+    ntup.check_names(v, "crv_dt > 0")
     try:
-        ntrig.check_mc_names(v, "p_front > 80", "mc_npot / 1e6")
-    except ntrig.NtupleError as exc:
+        ntup.check_names(ntup.track_variables(_ntuple_arrays()), "crv_dt > 0")
+    except ntup.NtupleError as exc:
+        assert "crv_dt" in str(exc) and "crvcoincs" in str(exc)
+    else:
+        raise AssertionError("crv_dt on a file without crvcoincs should be refused")
+
+
+def test_ntuple_new_variables_on_a_real_file():
+    if not NTUPLE_FILE.exists():
+        return
+    v, _, n_events = ntup.read_file(NTUPLE_FILE, [])
+    assert set(v) - {"_event"} == (set(ntup.TRACK_VARIABLES) | set(ntup.MC_VARIABLES)
+                                   | set(ntup.CRV_VARIABLES))
+    ce = v["mc_start_code_gen"] == 168              # the track descends from the CE
+    assert ce.sum() > 0.5 * v["_event"].size and (v["mc_origin"][ce] == 168).all()
+    # the generated CE momentum is the leading-log spectrum, below the endpoint
+    assert np.nanmax(v["mc_p_gen"][ce]) < 105.1 and np.nanmedian(v["mc_p_gen"][ce]) > 100.0
+    # every CE was placed at a muon stop on the stopping target
+    assert v["mc_has_stop"][ce].all()
+    assert np.nanmax(v["mc_stop_rho"][ce]) <= ntup.IPA_MIN_RHO_MM
+    assert v["crv_n"].max() >= 1
+
+
+def test_ntuple_mc_variables_on_data_say_there_is_no_truth():
+    v = ntup.track_variables(_ntuple_arrays())
+    ntup.check_names(v, "p_front > 80")                   # no MC asked for
+    try:
+        ntup.check_names(v, "p_front > 80", "mc_npot / 1e6")
+    except ntup.NtupleError as exc:
         assert "mc_npot" in str(exc) and "no " in str(exc)
     else:
         raise AssertionError("mc_npot on a file without MC should be refused")
@@ -1741,7 +1915,7 @@ def test_binned_ntuple_edges_are_uniform_or_explicit():
                  (3, 0, 1, "5"), (3, 0, 1, "a, b")):
         try:
             bntrig.bin_edges(*args)
-        except ntrig.NtupleError:
+        except ntup.NtupleError:
             pass
         else:
             raise AssertionError(f"{args} should have been refused")
@@ -1789,7 +1963,7 @@ def test_ntuple_trigger_efficiency_on_a_real_file(tmp_dir):
 
 
 def test_selection_efficiency_counts_every_ntuple_event_by_default():
-    v = ntrig.track_variables(_ntuple_arrays())
+    v = ntup.track_variables(_ntuple_arrays())
     # a third event with no track at all still counts in the denominator
     counts = nsel.efficiency_counts(v, 3, ntrig.DEFAULT_SELECTION)
     assert counts["n_denominator"] == 3 and counts["n_tracks_denominator"] == 3
@@ -1800,7 +1974,7 @@ def test_selection_efficiency_counts_every_ntuple_event_by_default():
 
 
 def test_selection_efficiency_needs_one_track_to_pass_both_cuts():
-    v = ntrig.track_variables(_ntuple_arrays())
+    v = ntup.track_variables(_ntuple_arrays())
     counts = nsel.efficiency_counts(v, 3, "pdg == 11", denominator="nactive >= 25")
     assert counts["n_denominator"] == 2 and counts["n_passed"] == 1
     # event 0's short track passes the denominator and its good track the
@@ -1810,7 +1984,7 @@ def test_selection_efficiency_needs_one_track_to_pass_both_cuts():
 
 
 def test_selection_efficiency_refuses_a_bad_cut_and_needs_a_selection(tmp_dir):
-    v = ntrig.track_variables(_ntuple_arrays())
+    v = ntup.track_variables(_ntuple_arrays())
     try:
         nsel.efficiency_counts(v, 2, "p_front > 100", denominator="no_such_var > 1")
     except SelectionError as exc:
@@ -1828,7 +2002,7 @@ def test_selection_efficiency_refuses_a_bad_cut_and_needs_a_selection(tmp_dir):
 def test_selection_efficiency_checks_each_cut_on_its_own():
     # Combined with the denominator, a bare quantity would coerce to a bool;
     # on its own it is refused, so it is refused here too.
-    v = ntrig.track_variables(_ntuple_arrays())
+    v = ntup.track_variables(_ntuple_arrays())
     for selection, denominator in (("p_front", "nactive >= 25"),
                                    ("pdg == 11", "p_front")):
         try:
@@ -1874,7 +2048,7 @@ def test_selection_efficiency_on_a_real_file(tmp_dir):
 
 def test_resolution_and_energy_loss_come_from_the_shared_mc_variables():
     # the e- track: reconstructed at 104, true 105 at TT_Front, created at 104.9
-    v = ntrig.track_variables(_ntuple_mc_arrays())
+    v = ntup.track_variables(_ntuple_mc_arrays())
     r = nres.response_variables(v)
     assert abs(r["resolution"][0] - (104.0 - 105.0)) < 1e-3
     assert abs(r["energy_loss"][0] - (104.9 - 105.0)) < 1e-4
@@ -2083,7 +2257,7 @@ def test_calo_clusters_read_without_truth_refuse_only_the_mc_names():
     ncalo.check_truth_names(v, "energy > 10", "time")
     try:
         ncalo.check_truth_names(v, "energy > 10", "dt")
-    except ntrig.NtupleError as exc:
+    except ntup.NtupleError as exc:
         assert "dt" in str(exc) and "caloclustersmc" in str(exc)
     else:
         raise AssertionError("dt on a file without truth should have been refused")

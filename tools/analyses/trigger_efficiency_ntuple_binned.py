@@ -21,13 +21,12 @@ from pathlib import Path
 
 import numpy as np
 
+from ..eventntuple import (CRV_VARIABLES, MC_VARIABLES, TRACK_VARIABLES, NtupleError,
+                           check_names, parse_trigger_names, read_file)
 from ..selection import SelectionError, apply_selection, evaluate_expression
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from .trigger import binomial
-from .trigger_efficiency_ntuple import (DEFAULT_SELECTION, MC_VARIABLES,
-                                        TRACK_VARIABLES, NtupleError,
-                                        check_mc_names, efficiency_metrics,
-                                        parse_trigger_names, read_file)
+from .trigger_efficiency_ntuple import DEFAULT_SELECTION, efficiency_metrics
 
 DEFAULT_VARIABLE = "p_front"
 # 2 MeV/c bins over the default selection's momentum range, up to past the
@@ -262,7 +261,7 @@ def run(context: RunContext) -> RunOutcome:
         totals, n_tracks, per_file = None, 0, []
         for path in context.input_paths:
             variables, triggers, n_events = read_file(path, paths)
-            check_mc_names(variables, selection, variable)
+            check_names(variables, selection, variable)
             selected, value, n_passing = event_values(variables, n_events,
                                                       selection, variable)
             counts = binned_counts(selected, value, triggers, edges)
@@ -311,8 +310,9 @@ def summarize(metrics: dict[str, float]) -> str:
             "metadata.bins, with a figure, CSV table and ROOT histograms in files.")
 
 
-_VARIABLE_LIST = (", ".join(TRACK_VARIABLES) + "; and, in simulated files, "
-                  + ", ".join(MC_VARIABLES))
+_VARIABLE_LIST = (", ".join(TRACK_VARIABLES) + "; in simulated files, "
+                  + ", ".join(MC_VARIABLES) + "; and where the file has CRV "
+                  "coincidences, " + ", ".join(CRV_VARIABLES))
 
 SPEC = AnalysisSpec(
     name="trigger_efficiency_ntuple_binned",

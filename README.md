@@ -54,6 +54,9 @@ tools/
                       names -> /pnfs paths; tape staging check
   spectrum.py         bin contents on a uniform grid: rebin, regrid, smear
   selection.py        event selections: a safe cut expression over arrays
+  eventntuple.py      reading EventNtuple/ntuple: the per-track variables
+                      every ntuple analysis shares (track, MC truth, CRV),
+                      the process codes and the MC origin of a track
   registry.py         the catalogue: name -> AnalysisSpec
   analyses/
     edep.py                    energy deposition: fcl + summary parser
@@ -82,7 +85,7 @@ tools/
                                edep.py's job and fcl
     edep_occupancy_combine.py  adds those histograms over pileup components
     fullsim/                   full-simulation analyses of EventNtuple
-      eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
+      eventntuple.py           reading EventNtuple/ntuple in pyfitter's groups
       cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
       sensitivity.py           fullsim_sensitivity: S/sqrt(B) in the best window
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
@@ -122,7 +125,7 @@ workflow can chain several runs and collect `metadata` uniformly.
 | `edep` | art file(s) | average calo/tracker energy deposition per event and per generated event, the events passing a `selection`, and (with an Offline that has the step counts) approximate calo/tracker hit counts from detector steps |
 | `count` | any art file with subrun bookkeeping | events kept per generated event, dividing out a prescale only if you name the filter |
 | `muon_stop_rate` | `sim.*.TargetStops.*.art` | stopped muons per generated event and per POT, from the file's event count, generated-event count and output prescale |
-| `approx_ce_sensitivity` | `nts.*.root` from `edep` | `S/sqrt(B)` for the best momentum window (or, with `cut_mode="box"`, the best momentum/time/R(max)/d0/cos box), with the cuts and its signal/DIO/cosmic counts |
+| `approx_ce_sensitivity` | `nts.*.root` from `edep`, optionally a `reference_file` from another configuration | `S/sqrt(B)` for the best momentum window (or, with `cut_mode="box"`, the best momentum/time/R(max)/d0/cos box), with the cuts and its signal/DIO/cosmic counts; with a reference, the same for it and overlay plots |
 | `stop_materials` | `nts.*.root` file(s) from the stop-finding job (e.g. MuBeam) | muon stops per material, and per generated event for the `n_gen_events` you supply |
 | `fullsim_sensitivity` | reconstructed CE-mixed-with-pileup EventNtuple `nts.*.root` file(s), e.g. CeMLeadingLogMix1BB | `S/sqrt(B)` for the best momentum window, as `approx_ce_sensitivity`, with the signal efficiency and detector response measured after the CE-like cuts |
 | `trigger_efficiency` | signal digi art file(s) | fraction of events passing any of the given trigger paths, and per path |
@@ -271,12 +274,14 @@ physics numbers. `edep` records the `max_events` it ran with next to each file
 it writes (`<file>.edep.json`, not listed in `files`), and
 `approx_ce_sensitivity` refuses such a file when given `stops_per_pot`.
 
-An analysis that `list_analyses` shows with `takes_reference: true` (so far
-`variable_comparison_ntuple`) compares its input with a second, baseline
-sample, which it then requires: pass exactly one of `reference_file`,
+An analysis that `list_analyses` shows with `takes_reference: true`
+(`variable_comparison_ntuple`, `approx_ce_sensitivity`) compares its input
+with a second, baseline sample: pass exactly one of `reference_file`,
 `reference_files` or `reference_dataset`, given and resolved like
 `data_file`, `data_files` and `dataset` (`max_files` cuts either dataset).
-Any other analysis refuses them. The result's metadata lists them as
+It requires one unless it also shows `reference_optional: true`
+(`approx_ce_sensitivity`, which then runs on its input alone). Any other
+analysis refuses them. The result's metadata lists them as
 `reference_files`.
 
 ### Results
@@ -422,7 +427,11 @@ alone and run.
 `dio_background`, `cosmic_background`, `total_background`, the signal peak's
 `signal_mpv_mev` / `signal_fwhm_mev`, and the two assumptions those rates are
 built on — `npot` and `cosmic_rate_per_s_per_mev` — so a number never travels
-without its normalization. The summary line carries them too. Its `metadata`
+without its normalization. With a reference file it adds
+`reference_sensitivity`, `reference_signal_rate`,
+`reference_total_background`, `reference_signal_mpv_mev`,
+`reference_signal_fwhm_mev` and `sensitivity_ratio` (input / reference);
+without one these are -1. The summary line carries them too. Its `metadata`
 also records the rest of the assumptions (`sig_eff`, `signal_br`, the
 `cosmic_rate_per_mev` the cosmic rate works out to over the live time, and
 `onspill_seconds`; with `stops_per_pot`, also `stops_per_pot`,
@@ -616,6 +625,42 @@ stored in time order), and the event's true beam intensity `mc_npot`
 path, since `evtinfo.nprotons` is a different, unfilled leaf). A file without
 those branches is read without them, and naming an `mc_*` variable on it is
 an error saying the file has no MC truth.
+
+The MC truth also says where the track came from:
+
+- `mc_origin`: what made the track, as `fullsim_sensitivity` labels it (168
+  CE-, 166 DIO on the stopping target, 0 DIO on the IPA, 171/172 RMC,
+  178/179 RPC, -1 cosmic, -2 other).
+- `mc_p_gen`, `mc_pdg_gen`, `mc_start_code_gen`: the event's generated
+  (primary) particle, taken when the track's particle is it or descends from
+  it, and NaN for a track from pileup. The track's chain is the leading block
+  of `trkmcsim`: its particle, then that particle's ancestors, up to the next
+  matched particle (rank >= 1).
+- `mc_stop_x/y/z/rho`, `mc_has_stop`: where the parent muon stopped (mm,
+  detector frame). This is the end point of a muon ancestor that came to rest
+  (end momentum below 1 MeV/c), or else the creation point of a particle that
+  a stopped-muon generator (codes 165-176, 195) placed at the stop. MDC2025
+  files need the second: the muon in a CE's chain is the earlier stage's,
+  killed at the stage boundary (stopCode 54, mu2eKillerVolume) and not at
+  rest. On the example file every track descending from the CE has a stop on
+  the target (rho <= 75 mm, -4700 < z < -3900).
+
+Where the file has CRV coincidences (`crvcoincs`, in data as well as in
+simulation), the `crv_*` variables (`CRV_VARIABLES`) describe the
+coincidence nearest in time to the track. `crv_n` is the number of
+coincidences in the event. `crv_dt` is the track time minus the
+coincidence time, using the time at the downstream TT_Front crossing, or at
+TT_Mid where the track has none; it is positive when the coincidence came
+first, and the fullsim CE cuts veto `0 < crv_dt < 150`. The other variables
+are that coincidence's `crv_time`, `crv_pes`, `crv_nhits`, `crv_nlayers`,
+`crv_sector` (the geometry's `crs.sectorType` numbering) and
+`crv_x/y/z`. Every `crv_*` but `crv_n` is NaN for a track in an event with
+no coincidence.
+
+All of these come from `tools/eventntuple.py`, which every EventNtuple
+analysis (`trigger_efficiency_ntuple*`, `selection_efficiency_ntuple`,
+`momentum_resolution_ntuple`, `variable_comparison_ntuple`) reads through,
+so a variable means the same thing in each.
 
 ## trigger_efficiency_ntuple_binned
 
@@ -1099,6 +1144,33 @@ Three deviations from the macro, all deliberate:
   Run-1B CE sample that moves `dio_background` by ~2% and `sensitivity` by
   0.01%.
 
+### Overlaying a reference configuration
+
+Pass a `reference_file` (another configuration's CE `edep` file, e.g. the
+nominal geometry when `data_file` is a test geometry) and the same chain runs
+on it with the same `selection`, `npot` and cosmic rate, each sample in its
+own best window. The efficiency is the reference's own:
+`reference_stops_per_pot` (with `stops_per_pot`; times the reference file's
+CE acceptance) or `reference_sig_eff` (with `sig_eff`), 0 meaning the
+input's. `label` and `reference_label` name the two in the legends. On top of
+the single-sample figures it writes, input solid and reference dashed:
+
+- `figures/sig_vs_bkg_overlay.png`: signal, DIO and cosmics with both best
+  windows, and the signal ratio underneath;
+- `figures/signal_shape_overlay.png`: the smeared signal at unit area, with
+  each MPV and FWHM;
+- `figures/response_overlay.png`: the energy loss before the tracker at unit
+  area, with each mean.
+
+```python
+run_analysis(analysis="approx_ce_sensitivity", output_dir="out/noipa_vs_bb",
+             data_file=".../col5bf_noipa_001/anakit/ce_edep/nts.owner.edep.version.sequencer.root",
+             reference_file=".../col5bf_bb_001/anakit/ce_edep/nts.owner.edep.version.sequencer.root",
+             parameters={"stops_per_pot": 7.4792e-4,
+                         "reference_stops_per_pot": 7.47886e-4,
+                         "label": "No IPA", "reference_label": "nominal"})
+```
+
 ## fullsim_sensitivity
 
 The full-simulation counterpart of `approx_ce_sensitivity`, built the same
@@ -1573,7 +1645,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-256 tests, none of which start a mu2e job or reach SAM or metacat (the
+267 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
