@@ -142,18 +142,25 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   `data_file(s)`; the trigger rate and timing default to
   `mu2e-trig-config/ci/data_files.txt`, found with `Mu2eEnv.find_code_file`
   down the configured code's `backing` chain.
-- **EventNtuple track variables** (`trigger_efficiency_ntuple.py`) are
-  vectorized with awkward and read by leaf name (`filter_name`; uproot's
+- **EventNtuple track variables** (`tools/eventntuple.py`, shared by every
+  EventNtuple analysis; physics, despite living beside the shared machinery)
+  are vectorized with awkward and read by leaf name (`filter_name`; uproot's
   `arrays()` would parse a dotted name as an expression). `*_front` is the
   downstream-going TT_Front crossing, and fit parameters are taken at the
   TT_Mid segment's index. Add a variable to both `TRACK_VARIABLES` and
   `track_variables`; a test checks that every advertised one is usable.
   MC truth (`MC_VARIABLES`, `mc_*`) is optional: read only where the file
-  has the branches, and `check_mc_names` turns a request for it on data into
-  a plain error. `evtinfomc/nprotons` is read by full path, because a leaf
-  name filter would also match `evtinfo`'s unfilled `nprotons`.
-  `trigger_efficiency_ntuple_binned` reuses that module's reading and must
-  keep reporting the same overall counts.
+  has the branches, and `check_names` turns a request for it on data into
+  a plain error; CRV coincidences (`CRV_VARIABLES`, `crv_*`) are optional the
+  same way. The MC chain of a track is the leading block of `trkmcsim`
+  (`ancestry`), not every entry: `trkrel` is relative to each matched
+  particle, so it cannot identify ancestors on its own. A muon ancestor's
+  `endpos` is its stop only if it ended at rest: in staged simulation the
+  muon in a CE's chain was killed at the stage boundary, and the stop is the
+  generated particle's start. `evtinfomc/nprotons` is read by full path,
+  because a leaf name filter would also match `evtinfo`'s unfilled
+  `nprotons`. `trigger_efficiency_ntuple_binned` reuses the shared reading
+  and must keep reporting the same overall counts.
 - **`approx_ce_sensitivity` has a numerics trap.** Window sums run outward
   from each window's own edge, never as differences of prefix sums: the DIO
   spectrum spans ~18 orders of magnitude, and cancellation silently zeroes

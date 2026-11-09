@@ -4,7 +4,7 @@ The input (data_file(s), "new") is compared with a baseline (reference_file(s),
 "ref"), e.g. the same events reprocessed before and after a code change, or
 two configurations of a sample. The variable is a track or calorimeter
 cluster quantity, or an expression of them (tools/selection.py syntax, over
-trigger_efficiency_ntuple's TRACK_VARIABLES/MC_VARIABLES or
+tools/eventntuple.py's TRACK_VARIABLES/MC_VARIABLES/CRV_VARIABLES or
 calo_cluster_resolution_ntuple's CLUSTER_VARIABLES, so they mean the same as
 in those analyses), taken for every object passing a selection.
 
@@ -36,12 +36,13 @@ from typing import Callable
 
 import numpy as np
 
+from .. import eventntuple as tracks
+from ..eventntuple import NtupleError, open_tree
 from ..selection import SelectionError, apply_selection, evaluate_expression
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from . import calo_cluster_resolution_ntuple as calo
-from . import trigger_efficiency_ntuple as tracks
 from .momentum_resolution_ntuple import CENTRAL_FRACTION
-from .trigger_efficiency_ntuple import NtupleError, open_tree
+from .trigger_efficiency_ntuple import DEFAULT_SELECTION
 from .trigger_efficiency_ntuple_binned import _th1
 
 EVENT_LEAVES = ("run", "subrun", "event")
@@ -81,8 +82,9 @@ def _read_tracks(path: Path) -> tuple[dict[str, np.ndarray], int]:
 
 
 LEVELS = {
-    "track": Level("track", {**tracks.TRACK_VARIABLES, **tracks.MC_VARIABLES},
-                   _read_tracks, tracks.check_mc_names),
+    "track": Level("track", {**tracks.TRACK_VARIABLES, **tracks.MC_VARIABLES,
+                             **tracks.CRV_VARIABLES},
+                   _read_tracks, tracks.check_names),
     "cluster": Level("cluster", calo.CLUSTER_VARIABLES,
                      lambda path: calo.read_file(path, require_truth=False),
                      calo.check_truth_names),
@@ -595,7 +597,7 @@ SPEC = AnalysisSpec(
                 "`variable` (comparisons, and/or/not or &&/||/!). Empty (the "
                 "default) takes every track or cluster. For good "
                 "reconstructed electrons use the trigger analyses' cut: "
-                "'" + tracks.DEFAULT_SELECTION + "'. A missing value is NaN "
+                "'" + DEFAULT_SELECTION + "'. A missing value is NaN "
                 "and fails any cut on it."
             ),
         ),

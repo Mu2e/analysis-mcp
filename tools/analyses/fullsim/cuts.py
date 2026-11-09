@@ -20,8 +20,9 @@ the time window is the time_window parameter.
 
 import numpy as np
 
-from .eventntuple import (DEFAULT_TRIGGERS, SID_OPA, SID_ST_BOUNDARY,
-                          SID_ST_FOILS, SID_TT_FRONT, SID_TT_MID, TRIGGER_PREFIX)
+from ...eventntuple import (SID_OPA, SID_ST_BOUNDARY, SID_ST_FOILS, SID_TT_FRONT,
+                            SID_TT_MID, TRIGGER_PREFIX)
+from .eventntuple import DEFAULT_TRIGGERS
 
 # The pyfitter cut set the thresholds come from (pyfitter config.py
 # VERSION_CUTS). '80_1d' and '80_2d' differ only in within_t0's lower edge.

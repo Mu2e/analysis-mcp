@@ -54,6 +54,9 @@ tools/
                       names -> /pnfs paths; tape staging check
   spectrum.py         bin contents on a uniform grid: rebin, regrid, smear
   selection.py        event selections: a safe cut expression over arrays
+  eventntuple.py      reading EventNtuple/ntuple: the per-track variables
+                      every ntuple analysis shares (track, MC truth, CRV),
+                      the process codes and the MC origin of a track
   registry.py         the catalogue: name -> AnalysisSpec
   analyses/
     edep.py                    energy deposition: fcl + summary parser
@@ -82,7 +85,7 @@ tools/
                                edep.py's job and fcl
     edep_occupancy_combine.py  adds those histograms over pileup components
     fullsim/                   full-simulation analyses of EventNtuple
-      eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
+      eventntuple.py           reading EventNtuple/ntuple in pyfitter's groups
       cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
       sensitivity.py           fullsim_sensitivity: S/sqrt(B) in the best window
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
@@ -622,6 +625,42 @@ stored in time order), and the event's true beam intensity `mc_npot`
 path, since `evtinfo.nprotons` is a different, unfilled leaf). A file without
 those branches is read without them, and naming an `mc_*` variable on it is
 an error saying the file has no MC truth.
+
+The MC truth also says where the track came from:
+
+- `mc_origin`: what made the track, as `fullsim_sensitivity` labels it (168
+  CE-, 166 DIO on the stopping target, 0 DIO on the IPA, 171/172 RMC,
+  178/179 RPC, -1 cosmic, -2 other).
+- `mc_p_gen`, `mc_pdg_gen`, `mc_start_code_gen`: the event's generated
+  (primary) particle, taken when the track's particle is it or descends from
+  it, and NaN for a track from pileup. The track's chain is the leading block
+  of `trkmcsim`: its particle, then that particle's ancestors, up to the next
+  matched particle (rank >= 1).
+- `mc_stop_x/y/z/rho`, `mc_has_stop`: where the parent muon stopped (mm,
+  detector frame). This is the end point of a muon ancestor that came to rest
+  (end momentum below 1 MeV/c), or else the creation point of a particle that
+  a stopped-muon generator (codes 165-176, 195) placed at the stop. MDC2025
+  files need the second: the muon in a CE's chain is the earlier stage's,
+  killed at the stage boundary (stopCode 54, mu2eKillerVolume) and not at
+  rest. On the example file every track descending from the CE has a stop on
+  the target (rho <= 75 mm, -4700 < z < -3900).
+
+Where the file has CRV coincidences (`crvcoincs`, in data as well as in
+simulation), the `crv_*` variables (`CRV_VARIABLES`) describe the
+coincidence nearest in time to the track. `crv_n` is the number of
+coincidences in the event. `crv_dt` is the track time minus the
+coincidence time, using the time at the downstream TT_Front crossing, or at
+TT_Mid where the track has none; it is positive when the coincidence came
+first, and the fullsim CE cuts veto `0 < crv_dt < 150`. The other variables
+are that coincidence's `crv_time`, `crv_pes`, `crv_nhits`, `crv_nlayers`,
+`crv_sector` (the geometry's `crs.sectorType` numbering) and
+`crv_x/y/z`. Every `crv_*` but `crv_n` is NaN for a track in an event with
+no coincidence.
+
+All of these come from `tools/eventntuple.py`, which every EventNtuple
+analysis (`trigger_efficiency_ntuple*`, `selection_efficiency_ntuple`,
+`momentum_resolution_ntuple`, `variable_comparison_ntuple`) reads through,
+so a variable means the same thing in each.
 
 ## trigger_efficiency_ntuple_binned
 
@@ -1560,7 +1599,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-254 tests, none of which start a mu2e job or reach SAM or metacat (the
+261 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 

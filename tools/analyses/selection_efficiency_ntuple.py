@@ -17,11 +17,11 @@ from __future__ import annotations
 
 import numpy as np
 
+from ..eventntuple import (CRV_VARIABLES, MC_VARIABLES, TRACK_VARIABLES, NtupleError,
+                           check_names, read_file)
 from ..selection import SelectionError, apply_selection
 from ..spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from .trigger import binomial
-from .trigger_efficiency_ntuple import (MC_VARIABLES, TRACK_VARIABLES, NtupleError,
-                                        check_mc_names, read_file)
 
 
 def efficiency_counts(variables: dict[str, np.ndarray], n_events: int,
@@ -70,7 +70,7 @@ def run(context: RunContext) -> RunOutcome:
     try:
         for path in context.input_paths:
             variables, _, n_events = read_file(path, [])
-            check_mc_names(variables, selection, denominator)
+            check_names(variables, selection, denominator)
             counts = efficiency_counts(variables, n_events, selection, denominator)
             per_file.append({"file": str(path), "n_events": n_events,
                              "n_denominator": counts["n_denominator"],
@@ -102,7 +102,8 @@ _SYNTAX = (
     "Comparisons, arithmetic, and/or/not (or &&/||/!) and "
     "abs/sqrt/hypot/min/max/log/exp over the track variables: "
     + ", ".join(TRACK_VARIABLES) + "; in simulated files also the MC truth "
-    "ones " + ", ".join(MC_VARIABLES) + ". *_front quantities are at the "
+    "ones " + ", ".join(MC_VARIABLES) + "; where the file has CRV coincidences "
+    "also " + ", ".join(CRV_VARIABLES) + ". *_front quantities are at the "
     "downstream-going TT_Front crossing; fit parameters (d0, maxr, tandip, "
     "t0err, ...) at TT_Mid; a missing value is NaN and fails any cut on it."
 )

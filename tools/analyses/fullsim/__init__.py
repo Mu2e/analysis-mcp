@@ -1,7 +1,8 @@
 """Full-simulation analyses: reconstructed EventNtuple files with MC truth.
 
 Modules:
-  eventntuple.py   read EventNtuple/ntuple; the MC origin of a track
+  eventntuple.py   read EventNtuple/ntuple in pyfitter's groups; the MC
+                   origin of each event's first track (tools/eventntuple.py)
   cuts.py          pyfitter's cut-set 80 CE-like track cuts
   normalization.py stopped mu- per POT and rates per stopped mu-, as Production
   provenance.py    events generated to make a file, from SAM dh.gencount
