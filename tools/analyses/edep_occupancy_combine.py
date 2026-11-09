@@ -47,6 +47,11 @@ def _labels(metas: list[dict], paths: list[Path]) -> list[str]:
 
 
 def run(context: RunContext) -> RunOutcome:
+    problem = occ.region_problem(context.params["region_planes"],
+                                 context.params["region_straws"])
+    if problem:
+        return RunOutcome(error=problem)
+    region = occ.region_of(context.params)
     loaded = []
     for path in context.input_paths:
         try:
@@ -91,7 +96,7 @@ def run(context: RunContext) -> RunOutcome:
     total_path = context.outdir / TOTAL_FILE
     context.outdir.mkdir(parents=True, exist_ok=True)
     occ.write_scaled_file(total_path, total, meta)
-    metrics, pos = occ.metrics_from(total, meta)
+    metrics, pos = occ.metrics_from(total, meta, region)
     metrics["n_components"] = float(len(components))
     shares = occ.peak_shares(components, pos, meta["microbunch_ns"])
     plots = occ.make_plots(total, meta, context.outdir, title="total pileup per microbunch")
@@ -113,7 +118,9 @@ def summarize(metrics: dict[str, float]) -> str:
     return (f"{metrics['n_components']:g} components at "
             f"{metrics['events_per_microbunch']:g} events per microbunch: peak straw "
             f"{metrics['trk_peak_straw_hit_rate_khz']:.4g} kHz, peak row "
-            f"{metrics['trk_peak_row_hit_rate_khz']:.4g} kHz, mean straw "
+            f"{metrics['trk_peak_row_hit_rate_khz']:.4g} kHz, peak "
+            f"{metrics['trk_region_planes']:g}-plane x {metrics['trk_region_straws']:g}-straw "
+            f"region {metrics['trk_peak_region_hit_rate_khz']:.4g} kHz, mean straw "
             f"{metrics['trk_mean_straw_hit_rate_khz']:.4g} kHz; peak crystal "
             f"{metrics['calo_peak_crystal_id']:g} at "
             f"{metrics['calo_peak_crystal_hit_rate_khz']:.4g} kHz, disk 0 / 1 radial "
@@ -136,6 +143,7 @@ SPEC = AnalysisSpec(
     ),
     metrics=METRICS,
     units={**occ.COMMON_UNITS},
+    parameters=occ.region_params(),
     produced_by=("edep_occupancy",),
     input_hint=(
         "data_files: the occupancy_per_microbunch.root of each edep_occupancy "

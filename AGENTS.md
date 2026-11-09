@@ -119,7 +119,11 @@ python3 -m analysis_mcp_server --transport stdio [--work-area DIR | --musing 'Si
   are not sums of peaks, so `edep_occupancy_combine` adds the per-channel
   histograms in `occupancy_per_microbunch.root`, not metrics. A tracker "row"
   (same plane and straw number over six panels) is one radius; the calo
-  average is radial in the crystal-centre radius.
+  average is radial in the crystal-centre radius. Its `gen_events_per_pot`
+  mode computes `events_per_microbunch` from the sample's own GenEventCount
+  (EdepAna's summary) for callers that cannot know it in advance; a named
+  `prescale_filter` reuses `count.run_counts_job` (run first, so a wrong
+  stream is refused before EdepAna runs), never a second copy of its parsing.
 - **A stop file holds mu+ stops too** (about 1% in MDC2025). A rate for a
   mu- capture process (conversion, DIO, RMC) is `muon_stop_rate`'s
   `muminus_*`, not `stops_per_*`, which keep counting every stop.
