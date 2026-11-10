@@ -1117,16 +1117,11 @@ S/sqrt(B) is the limit's large-background, no-uncertainty limit. With a few
 background events, or with a background uncertainty, the two rank windows and
 designs differently, and the ranking then depends on `npot` (the run length):
 the background uncertainty grows with the background while its statistics grow
-with its square root, so a long run favours narrower windows. Two parameters
-set the uncertainty, used by the limit only:
-
-- `background_uncertainty`: a fixed relative systematic on the window's
-  background (0.2 for 20%);
-- `cosmic_measurement_live_ratio`: the live time of the sample the cosmics are
-  measured in (e.g. off-spill data) over the on-spill time; it adds that
-  measurement's statistics, variance = the window's cosmics / the ratio.
-
-Both default to 0 (statistics only). The limit is only as good as the
+with its square root, so a long run favours narrower windows. One parameter,
+used by the limit only, sets the uncertainty: `background_uncertainty`, the
+relative uncertainty on the window's background (0.1 for 10%). It defaults to
+0 (statistics only); how well the background is known is an analysis choice,
+so pass the value your study assumes. The limit is only as good as the
 background: `cosmic_rate_per_s_per_mev` must describe the cosmics left after
 the selection and veto the result stands for.
 

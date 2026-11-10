@@ -369,16 +369,12 @@ def expected_signal_limit(background, sigma=0.0):
 
 def scan_limit_window(signal: Spectrum, dio: Spectrum, cosmic: Spectrum,
                       background_uncertainty: float = 0.0,
-                      cosmic_measurement_live_ratio: float = 0.0,
                       box_min_mev: float = SIGNAL_BOX_MIN_MEV) -> dict[str, float]:
     """The momentum window with the lowest expected limit, scanned over the
     same windows as scan_signal_box (edges are bin centers too).
 
     The background's uncertainty is `background_uncertainty` times the
-    background (a fixed relative systematic) and, when the cosmics are
-    measured in a sample `cosmic_measurement_live_ratio` times as long as the
-    on-spill time (e.g. off-spill data), that measurement's statistics: their
-    variance is the window's cosmics over the ratio. `limit_per_signal` is the
+    background (a relative uncertainty; 0 = statistics only). `limit_per_signal` is the
     limit on the signal count divided by the window's signal count, so the
     limit on a rate is it times the rate the signal spectrum assumes.
     """
@@ -393,10 +389,8 @@ def scan_limit_window(signal: Spectrum, dio: Spectrum, cosmic: Spectrum,
         usable = np.flatnonzero((s > 0.0) & (background > 0.0))
         if usable.size == 0:
             continue
-        var = (background_uncertainty * background[usable]) ** 2
-        if cosmic_measurement_live_ratio > 0.0:
-            var = var + c[usable] / cosmic_measurement_live_ratio
-        per_signal = expected_signal_limit(background[usable], np.sqrt(var)) / s[usable]
+        sigma = background_uncertainty * background[usable]
+        per_signal = expected_signal_limit(background[usable], sigma) / s[usable]
         k = int(np.argmin(per_signal))
         if best is None or per_signal[k] < best["limit_per_signal"]:
             j = usable[k]
@@ -1460,8 +1454,7 @@ def run(context: RunContext) -> RunOutcome:
         # (momentum only, in either cut mode)
         limit = scan_limit_window(
             signal_reco, dio_reco, cosmic,
-            background_uncertainty=context.params["background_uncertainty"],
-            cosmic_measurement_live_ratio=context.params["cosmic_measurement_live_ratio"])
+            background_uncertainty=context.params["background_uncertainty"])
 
         # 6. (box mode) the best box in momentum, time, R(max), d0 and cos
         box = None
@@ -1539,9 +1532,8 @@ def run(context: RunContext) -> RunOutcome:
         f"[{limit['low_mev']:.1f}, {limit['high_mev']:.1f}] MeV: "
         f"S = {limit['signal']:.3g}, DIO = {limit['dio']:.3g}, "
         f"cosmic = {limit['cosmic']:.3g} -> B = {limit['background']:.3g} "
-        f"(background uncertainty {context.params['background_uncertainty']:g} "
-        "relative, cosmic measurement live-time ratio "
-        f"{context.params['cosmic_measurement_live_ratio']:g}; 0 = none)",
+        f"(relative background uncertainty {context.params['background_uncertainty']:g}; "
+        "0 = statistics only)",
         "",
         f"Top {len(top)} windows scanned:",
     ]
@@ -1710,23 +1702,11 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="background_uncertainty",
             description="Relative uncertainty on the background in a window, "
-                        "for expected_limit only (S/sqrt(B) ignores it): a fixed "
-                        "systematic, e.g. 0.2 for 20%. The limit's window is "
+                        "for expected_limit only (S/sqrt(B) ignores it), e.g. "
+                        "0.1 for 10%. The limit's window is "
                         "re-optimized with it, so a larger value favours "
                         "narrower windows with less background. 0 (the "
                         "default) gives the statistics-only limit.",
-            default=0.0, minimum=0.0,
-        ),
-        ParamSpec(
-            name="cosmic_measurement_live_ratio",
-            description="For expected_limit only: the live time of the sample "
-                        "the cosmic background is measured in (e.g. off-spill "
-                        "data) over the on-spill time npot implies. Adds that "
-                        "measurement's statistics to the background "
-                        "uncertainty (variance = the window's cosmics / this "
-                        "ratio), which shrinks relative to the background as "
-                        "npot grows, unlike background_uncertainty. 0 (the "
-                        "default) adds none.",
             default=0.0, minimum=0.0,
         ),
         ParamSpec(

@@ -799,10 +799,8 @@ def _limit_spectra():
 
 def test_limit_scan_finds_the_window_with_the_lowest_limit():
     signal, dio, cosmic = _limit_spectra()
-    for rel, live_ratio in ((0.0, 0.0), (0.2, 0.0), (0.1, 2.0)):
-        best = sens.scan_limit_window(signal, dio, cosmic,
-                                      background_uncertainty=rel,
-                                      cosmic_measurement_live_ratio=live_ratio)
+    for rel in (0.0, 0.1, 0.2):
+        best = sens.scan_limit_window(signal, dio, cosmic, background_uncertainty=rel)
         brute = None
         for i in range(signal.nbins):
             for j in range(i + 1, signal.nbins + 1):
@@ -811,8 +809,7 @@ def test_limit_scan_finds_the_window_with_the_lowest_limit():
                 bkg = dio.values[i:j].sum() + c
                 if s <= 0:
                     continue
-                var = (rel * bkg) ** 2 + (c / live_ratio if live_ratio else 0.0)
-                limit = _reference_s_up(bkg, np.sqrt(var)) / s
+                limit = _reference_s_up(bkg, rel * bkg) / s
                 if brute is None or limit < brute[0]:     # bin centers, as the S/sqrt(B) scan
                     brute = (limit, float(signal.centers()[i]),
                              float(signal.centers()[j - 1]))
@@ -823,10 +820,20 @@ def test_limit_scan_finds_the_window_with_the_lowest_limit():
 def test_a_background_uncertainty_never_improves_the_limit():
     signal, dio, cosmic = _limit_spectra()
     stat = sens.scan_limit_window(signal, dio, cosmic)
-    syst = sens.scan_limit_window(signal, dio, cosmic, background_uncertainty=0.2)
-    meas = sens.scan_limit_window(signal, dio, cosmic, background_uncertainty=0.2,
-                                  cosmic_measurement_live_ratio=2.0)
-    assert stat["limit_per_signal"] < syst["limit_per_signal"] < meas["limit_per_signal"]
+    ten = sens.scan_limit_window(signal, dio, cosmic, background_uncertainty=0.1)
+    twenty = sens.scan_limit_window(signal, dio, cosmic, background_uncertainty=0.2)
+    assert stat["limit_per_signal"] < ten["limit_per_signal"] < twenty["limit_per_signal"]
+
+
+def test_the_limit_has_one_uncertainty_setting():
+    """One relative background uncertainty, 0 (statistics only) by default;
+    how well the background is known is the caller's analysis choice."""
+    params = {p.name: p for p in sens.SPEC.parameters}
+    assert params["background_uncertainty"].default == 0.0
+    assert "cosmic_measurement_live_ratio" not in params
+    import inspect
+    assert list(inspect.signature(sens.scan_limit_window).parameters) == [
+        "signal", "dio", "cosmic", "background_uncertainty", "box_min_mev"]
 
 
 def test_sensitivity_reports_the_expected_limit(tmp_dir):
@@ -848,8 +855,7 @@ def test_sensitivity_reports_the_expected_limit(tmp_dir):
 
     syst = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
                         output_dir=tmp_dir,
-                        parameters={"sig_eff": 1e-3, "background_uncertainty": 0.2,
-                                    "cosmic_measurement_live_ratio": 2.0})
+                        parameters={"sig_eff": 1e-3, "background_uncertainty": 0.2})
     assert syst.status == "success", syst.message
     ms = syst.metadata
     assert ms["expected_limit"] > m["expected_limit"]
