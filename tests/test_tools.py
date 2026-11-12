@@ -353,6 +353,24 @@ def test_edep_job_fcl_appends_the_step_parameters_to_the_shipped_fcl():
         "the shipped fcl must stay valid for an Offline without the step counts"
 
 
+def test_edep_fcl_overrides_go_after_the_base_and_before_the_module_parameters():
+    base = (FCL_DIR / "edep.fcl").read_text(encoding="utf-8").rstrip()
+    field = 'services.GeometryService.bFieldFile : "my/bfgeom_scaled.txt"'
+    params = ANALYSES["edep"].resolve_params({"fcl_overrides": field})
+    assert params["fcl_overrides"] == field
+    assert ANALYSES["edep"].resolve_params({})["fcl_overrides"] == ""
+    text = edep_mod.job_fcl_text(params, overrides=field)
+    assert text.startswith(base)
+    assert base.index("GeometryService") < text.index(field) \
+        < text.index("physics.analyzers.EDepAna.TrkStepEnergyThreshold")
+    # an EdepAna without the step counts: the base and the overrides alone
+    old = edep_mod.job_fcl_text(None, overrides=field)
+    assert old == base + "\n\n# --- fcl_overrides, from the request ---\n" + field + "\n"
+    assert "StepEnergyThreshold" not in old
+    # no overrides: nothing between the base and the step parameters
+    assert "fcl_overrides" not in edep_mod.job_fcl_text(params)
+
+
 def test_module_accepts_reads_the_description_once_per_environment(tmp_dir):
     from tools import mu2e_job
     calls = []
@@ -1356,6 +1374,60 @@ def _run_edep_with_fake_job(tmp_dir, has_steps, parameters=None, stdout=None):
     finally:
         edep_mod.run_mu2e_job, _OFFLINE_HAS_STEPS[0] = real, True
     return outcome, calls.fcl
+
+
+def test_edep_geometry_file_goes_on_the_search_path_by_its_basename(tmp_dir):
+    from tools.spec import RunContext
+    geom = Path(tmp_dir) / "geoms" / "geom_point.txt"
+    geom.parent.mkdir()
+    geom.write_text('#include "Offline/Mu2eG4/geom/geom_common.txt"\n'
+                    "double bfield.mapScale.DSMap = 1.1;\n")
+    line = 'services.GeometryService.inputFile : "geom_point.txt"'
+    for has_steps in (True, False):
+        fake, _ = _fake_edep_job(tmp_dir)
+        seen = {}
+
+        def recording(**kwargs):
+            seen.update(kwargs)
+            return fake(**kwargs)
+        real, _OFFLINE_HAS_STEPS[0] = edep_mod.run_mu2e_job, has_steps
+        edep_mod.run_mu2e_job = recording
+        try:
+            outdir = Path(tmp_dir) / f"out{has_steps}"
+            outcome = edep_mod.run(RunContext(
+                input_paths=[Path(tmp_dir) / "in.art"], outdir=outdir,
+                params=ANALYSES["edep"].resolve_params({"geometry_file": str(geom)}),
+                timeout_s=60))
+        finally:
+            edep_mod.run_mu2e_job, _OFFLINE_HAS_STEPS[0] = real, True
+        assert outcome.error is None, outcome.error
+        assert seen["fcl"] == outdir / "edep_job.fcl"
+        assert seen["extra_search_dirs"] == (geom.parent,)
+        text = seen["fcl"].read_text()
+        assert line in text and outcome.extra["geometry_file"] == str(geom)
+        # after the shipped geometry, so it replaces it
+        assert text.index("geom_common.txt") < text.index(line)
+    # the default runs the shipped fcl with nothing added to the path
+    fake, _ = _fake_edep_job(tmp_dir)
+    seen = {}
+
+    def recording(**kwargs):
+        seen.update(kwargs)
+        return fake(**kwargs)
+    real, _OFFLINE_HAS_STEPS[0] = edep_mod.run_mu2e_job, False
+    edep_mod.run_mu2e_job = recording
+    try:
+        outcome = edep_mod.run(RunContext(
+            input_paths=[Path(tmp_dir) / "in.art"], outdir=Path(tmp_dir) / "plain",
+            params=ANALYSES["edep"].resolve_params({}), timeout_s=60))
+    finally:
+        edep_mod.run_mu2e_job, _OFFLINE_HAS_STEPS[0] = real, True
+    assert outcome.error is None and seen["fcl"] == edep_mod.FCL
+    assert seen["extra_search_dirs"] == ()
+    # a relative or missing file is refused before any job
+    for bad, words in (("geom_point.txt", "absolute"), (str(geom) + ".nope", "does not exist")):
+        outcome, fcls = _run_edep_with_fake_job(tmp_dir, True, {"geometry_file": bad})
+        assert outcome.error and words in outcome.error and fcls == [], outcome.error
 
 
 def test_edep_with_the_step_counts_runs_a_per_run_fcl_and_reports_them(tmp_dir):
@@ -5042,6 +5114,54 @@ def test_cosmic_shapes_load_from_the_repo_and_sample_deterministically():
     radius = (one.rmax - one.d0) / 2.0
     p = radius * 0.299792458 * shapes.b_eff_t / np.sqrt(1.0 - one.cos ** 2)
     assert np.all(np.abs(p - (100.1 + 0.2 * (one.bins - 500))) <= 0.1 + 1e-9)
+
+
+def test_cosmic_field_scale_shrinks_helices_about_a_fixed_rmax():
+    shapes = sens.load_cosmic_shapes()
+    axis = Spectrum(np.zeros(750), 0.0, 0.2)
+    p_bins = sens.cosmic_p_bins(axis, shapes)
+    nominal = sens.cosmic_geometry_sample(shapes, axis, p_bins, n=20_000)
+    same = sens.cosmic_geometry_sample(shapes, axis, p_bins, n=20_000, field_scale=1.0)
+    for name in ("rmax", "d0", "cos", "bins"):
+        assert np.array_equal(nominal.column(name), same.column(name)), name
+    radius = (nominal.rmax - nominal.d0) / 2.0
+    for scale in (0.8, 1.25):
+        scaled = sens.cosmic_geometry_sample(shapes, axis, p_bins, n=20_000,
+                                             field_scale=scale)
+        assert np.array_equal(scaled.cos, nominal.cos) and np.array_equal(scaled.bins, nominal.bins)
+        assert np.allclose((scaled.rmax - scaled.d0) / 2.0, radius / scale)
+        center = (scaled.rmax + scaled.d0) / 2.0
+        assert np.all(center >= 0.0)
+        # R(max) stays where the R(max) point still is the outermost one
+        pinned = radius / scale <= nominal.rmax
+        assert pinned.mean() > 0.99
+        assert np.allclose(scaled.rmax[pinned], nominal.rmax[pinned])
+        # past that, the circle crosses the axis: the pinned point is its inner one
+        assert np.allclose(scaled.d0[~pinned], -nominal.rmax[~pinned])
+    stronger = sens.cosmic_geometry_sample(shapes, axis, p_bins, n=20_000, field_scale=1.25)
+    assert np.all(stronger.d0 > nominal.d0)
+
+
+def test_cosmic_field_scale_reshapes_the_box_and_needs_box_mode(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.helix.root"
+    _write_edep_tree(path, n=2000, with_helix=True)
+    bad = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                       output_dir=tmp_dir,
+                       parameters={"sig_eff": 0.5, "cosmic_field_scale": 1.1})
+    assert bad.status == "error" and "cut_mode='box'" in bad.message
+    seen = {}
+    for scale in (1.0, 0.8):
+        result = run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                              output_dir=str(Path(tmp_dir) / f"s{scale}"),
+                              parameters={"sig_eff": 0.5, "cut_mode": "box",
+                                          "cosmic_field_scale": scale})
+        assert result.status == "success", result.message
+        seen[scale] = result.metadata
+        log = (Path(tmp_dir) / f"s{scale}" / "approx_ce_sensitivity.log").read_text()
+        assert f"cosmic field scale {scale:g}" in log
+    # the CE is the same file, the cosmic geometry is not
+    assert seen[1.0]["signal_rate"] > 0.0
+    assert seen[0.8]["cosmic_box_efficiency"] != seen[1.0]["cosmic_box_efficiency"]
 
 
 def test_scan_bins_maximizes_punzi_fom_and_sums_from_each_edge():

@@ -339,6 +339,33 @@ runs unchanged, the step metrics are absent from the result (listed in
 setting any step parameter away from its default is an error naming
 Offline PR #2067. Existing metric names are the same either way.
 
+`edep`'s `geometry_file` (default empty) runs EdepAna with your own geometry
+file instead of `geom_common.txt`, and `fcl_overrides` (default empty) appends
+any FHiCL to `fcl/edep.fcl`; the module's own parameters and `geometry_file`
+come after the overrides and always win, and either one makes the job run a
+per-run `edep_job.fcl`. The main use is the field: EdepAna turns the
+tracker-front step into the helix (`primary_trk_front_r_center`, `_radius`)
+with the field the job's GeometryService loads, so a sample simulated at a
+scaled field must be analysed with the same field, or its helices come out at
+the nominal one (and `approx_ce_sensitivity`'s box cuts with them). Pass the
+geometry file the simulation used, by absolute path, e.g.
+
+```
+#include "Offline/Mu2eG4/geom/geom_common.txt"
+double bfield.mapScale.DSMap       = 1.1;   // Offline PR #2079, v13_43_00+
+double bfield.mapScale.DSExtension = 1.1;
+```
+
+Mu2e finds config files only through MU2E_SEARCH_PATH (an absolute
+`GeometryService.inputFile` fails with "Can't find file", and the path holds
+only the code and DataFiles), so the job appends the file's directory to
+MU2E_SEARCH_PATH and names the file by its basename; files it `#include`s
+beside it are found the same way. Appended, the code's own files win any name
+clash. `fcl_overrides` can still point `services.GeometryService.bFieldFile` at
+a file inside the code. An Offline without PR #2079 silently ignores the
+`mapScale` keys: check the job log for `BFieldManagerMaker: map DSMap scaled
+by`. Neither changes the steps in the file: they are not resimulated.
+
 `count` runs `print_counts.fcl` and reports what any art file with subrun
 bookkeeping can say about itself:
 
@@ -977,6 +1004,25 @@ of [t1, t2] above the cut, eps_t / eps(front_time_min_ns, T).
 `ce_front_time_survival` reports the kept fraction of the selection (-1 in
 momentum mode, which ignores the parameter).
 
+`cosmic_field_scale` (box mode only, default 1; 0.5-2) reshapes the cosmic
+geometry for a detector-solenoid field scaled by s from the one the shapes
+were taken at. A field change leaves each track's momentum and cos(theta)
+alone and scales its helix radius to R/s; the helix is pinned at its R(max)
+point, so R(max) is unchanged, the center moves to |R(max) - R/s| and
+d0 = R(max) - 2R/s (up for a stronger field). R(max) is the pin because the
+loose shapes' R(max) ends sharply at the tracker's outer edge (95%/99% below
+698/714 mm): an acceptance edge, not a production feature, and one a field
+change does not move. Pinning the center instead would put 24% of the tracks
+past 700 mm at s = 0.9, tracks the reconstruction would never have kept. So
+R(max) cut efficiencies do not change with s; d0 cuts (and the TSDA veto,
+through rc and R) do. Limits: it does not rescale the loose cosmic rate, it
+cannot add tracks the nominal field kept out of the tracker, and it does not
+touch the CE: pass an EdepAna file simulated at the same field. The log
+prints the field the CE helices imply (median of p sin(theta)/(c R), truth at
+the tracker front) to check that; compare it with a nominal-field CE run, not
+with the shapes' 1.036 T, which is a reco fit's effective field. The TSDA veto keeps its 2 T / 1 T ratio, right for a field scaled
+uniformly through the TS and DS.
+
 Model. For the cosmics, momentum, time and the (helix-center radius rc, cos)
 distribution are taken as mutually separable; for the CE only time is separable
 from the rest, momentum and geometry are not (see S below). For a box [p1,p2] x [t1,t2] x
@@ -1604,7 +1650,7 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-256 tests, none of which start a mu2e job or reach SAM or metacat (the
+269 tests, none of which start a mu2e job or reach SAM or metacat (the
 catalog tests use a fake). (The `ana` env has no pytest, so
 these are bare asserts.)
 
