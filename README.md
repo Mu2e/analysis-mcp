@@ -923,6 +923,11 @@ momentum window:
 3. **Cosmics** — flat in momentum at `cosmic_rate_per_s_per_mev` (default:
    the rough Run-1A mu- -> e- rate), scaled by the on-spill live time implied
    by `npot`.
+   For a configuration with a scaled detector-solenoid field, pass
+   `ds_field_scale` (0.75 to 1.1, momentum mode only): the rate is multiplied
+   by a measured factor (0.836 at 0.75, 1 at 1, 1.037 at 1.1), reported as
+   `cosmic_ds_field_factor`. A lower field bends higher-momentum cosmic
+   electrons, which are rarer, into the window.
 4. **Window scan** — every `[x1, x2]` with `x1 >= 50 MeV`, keeping the best
    S/sqrt(B). The top 10 windows go to the log.
 
