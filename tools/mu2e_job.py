@@ -9,6 +9,7 @@ for the commands and for where the fcl lives.
 """
 
 import re
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -109,6 +110,7 @@ def run_mu2e_job(
     max_events: int | None = None,
     log_name: str = "mu2e.log",
     env: Mu2eEnv | None = None,
+    extra_search_dirs: tuple[Path, ...] = (),
 ) -> JobOutcome:
     """Run `mu2e -c <fcl> -s|-S <input>` in outdir and capture everything.
 
@@ -121,6 +123,11 @@ def run_mu2e_job(
     default. `fcl` may be relative, in which case it is resolved against the
     environment's code when that is a directory on disk, and otherwise handed
     to art to find on FHICL_FILE_PATH.
+
+    `extra_search_dirs` are appended to MU2E_SEARCH_PATH, where Mu2e looks up
+    geometry and other config files (it never takes an absolute path, and the
+    environment's path holds only the code and DataFiles). Appended, so the
+    code's own files still win any name clash.
     """
     env = env or current_env()
     outdir.mkdir(parents=True, exist_ok=True)
@@ -136,6 +143,8 @@ def run_mu2e_job(
     # positional parameters so paths never need shell quoting.
     script = " && ".join([
         *env.setup_commands(outdir),
+        *(f"export MU2E_SEARCH_PATH=\"$MU2E_SEARCH_PATH\":{shlex.quote(str(d))}"
+          for d in extra_search_dirs),
         'cd "$2"',
         f'mu2e -c "{env.resolve_fcl(fcl, outdir)}" {input_flag} "$1"{nevts}',
     ])

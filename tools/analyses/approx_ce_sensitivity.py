@@ -47,7 +47,9 @@ in momentum and geometry: each CE event keeps its own signal bin and the box's
 signal is the smeared spectrum of the events passing the geometry cuts (see
 `BoxModel`), since a d0 or R(max) cut removes low-energy-loss events more than
 others. As a known first-order approximation, DIO's time and geometry
-efficiencies equal the CE's momentum-integrated ones.
+efficiencies equal the CE's momentum-integrated ones. `cosmic_field_scale`
+reshapes the cosmic helices for a scaled field (R -> R/s, pinned at R(max));
+the CE side comes from a sample simulated at that field.
 
 The numbers are rough by construction — this is a figure of merit for
 comparing beamline configurations, not a sensitivity calculation.
@@ -151,6 +153,9 @@ COSMIC_SHAPES_ROOT = DATA_DIR / "cosmic_shapes.root"
 COSMIC_SHAPES_JSON = DATA_DIR / "cosmic_shapes.json"
 COSMIC_SAMPLE_SIZE = 200_000
 COSMIC_SAMPLE_SEED = 20261101
+# The range cosmic_field_scale may take: the R(max)-pinned rescaling is a
+# first-order reshaping of shapes taken at the nominal field, not a resimulation.
+COSMIC_FIELD_SCALE_RANGE = (0.5, 2.0)
 # R[mm] = p[MeV/c] sin(theta) / (C_LIGHT B[T])
 C_LIGHT_MEV_PER_MM_T = 0.299792458
 
@@ -553,7 +558,8 @@ def cosmic_p_bins(axis: Spectrum, shapes: CosmicShapes) -> tuple[int, int]:
 
 def cosmic_geometry_sample(shapes: CosmicShapes, axis: Spectrum,
                            p_bins: tuple[int, int], n: int = COSMIC_SAMPLE_SIZE,
-                           seed: int = COSMIC_SAMPLE_SEED) -> GeometryPopulation:
+                           seed: int = COSMIC_SAMPLE_SEED,
+                           field_scale: float = 1.0) -> GeometryPopulation:
     """A fixed-seed sample of cosmic tracks.
 
     (rc, cos) is drawn from `rc_vs_cos` (a bin by its content, uniform inside
@@ -561,6 +567,14 @@ def cosmic_geometry_sample(shapes: CosmicShapes, axis: Spectrum,
     flat in momentum), taking the two as independent; then R = p sin(theta)/(c
     B), rmax = rc + R, d0 = rc - R. Each track keeps its momentum bin, so the
     geometry efficiency is counted in the box's own momentum window.
+
+    `field_scale` s rescales the field the shapes were taken at: p and cos are
+    unchanged and R becomes R/s, with the helix pinned at its R(max) point
+    (the shapes' R(max) ends sharply at the tracker's outer edge, an
+    acceptance edge that does not move with the field; pinning the center
+    instead would push a quarter of the tracks past it at s = 0.9). The new
+    center is |R(max) - R/s| from the axis, so a circle that grows past the
+    axis is still handled; s = 1 is exactly the unscaled sample.
     """
     rng = np.random.default_rng(seed)
 
@@ -575,8 +589,11 @@ def cosmic_geometry_sample(shapes: CosmicShapes, axis: Spectrum,
     rc, cos = draw(shapes.rc_vs_cos, shapes.rc_edges, shapes.cos_edges)
     bins = rng.integers(p_bins[0], p_bins[1] + 1, size=n)
     p = axis.edges()[bins] + rng.random(n) * axis.width
-    radius = p * np.sqrt(1.0 - cos ** 2) / (C_LIGHT_MEV_PER_MM_T * shapes.b_eff_t)
-    return GeometryPopulation(rmax=rc + radius, d0=rc - radius, cos=cos,
+    nominal = p * np.sqrt(1.0 - cos ** 2) / (C_LIGHT_MEV_PER_MM_T * shapes.b_eff_t)
+    radius = nominal / field_scale
+    # rmax - R/s, written so that s = 1 gives rc bit for bit
+    center = np.abs(rc + (nominal - radius))
+    return GeometryPopulation(rmax=center + radius, d0=center - radius, cos=cos,
                               weights=np.ones(n), norm=float(n), bins=bins)
 
 
@@ -1209,7 +1226,17 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
 
     shapes = load_cosmic_shapes()
     p_bins_cosmic = cosmic_p_bins(signal, shapes)
-    cosmic_geometry = cosmic_geometry_sample(shapes, signal, p_bins_cosmic)
+    field_scale = float(params["cosmic_field_scale"])
+    cosmic_geometry = cosmic_geometry_sample(shapes, signal, p_bins_cosmic,
+                                             field_scale=field_scale)
+    # The field the CE helices imply (p ~ E for an electron), to check against
+    # the field the cosmics are scaled to: the CE sample must be simulated at it.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ce_field = (variables[SIGNAL_VAR][front]
+                    * np.sqrt(1.0 - ce_geometry.cos ** 2)
+                    / (C_LIGHT_MEV_PER_MM_T * (ce_geometry.rmax - ce_geometry.d0) / 2.0))
+    ce_field = ce_field[np.isfinite(ce_field) & (ce_field > 0.0)]
+    ce_field_t = float(np.median(ce_field)) if ce_field.size else float("nan")
     tsda = bool(params["tsda_veto"])
     if tsda:
         ce_geometry = replace(ce_geometry, survival=1.0 - tsda_hit_fraction(
@@ -1297,6 +1324,12 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
          f"averaged over the helix phase): CE survival {ce_tsda:.4g}, cosmic "
          f"survival {cosmic_tsda:.4g} before the box cuts; DIO takes the CE's"
          if tsda else "  TSDA veto: not applied (tsda_veto = 0)"),
+        (f"  cosmic field scale {field_scale:g}: cosmic helix radii x "
+         f"1/{field_scale:g} with R(max) pinned (field {shapes.b_eff_t:.4g} T x "
+         f"{field_scale:g} = {shapes.b_eff_t * field_scale:.4g} T, reco "
+         f"effective); the CE helices imply {ce_field_t:.4g} T (truth at the "
+         "tracker front: compare with a nominal-field CE run, not with the "
+         "reco value); the loose cosmic rate is not rescaled"),
         (f"  front-time cut: folded tracker-front time >= "
          f"{params['front_time_min_ns']:g} ns kept {front_survival:.4g} of the "
          "selected CEs (in the acceptance and shapes); the box time "
@@ -1315,6 +1348,7 @@ def optimize_box(variables: dict[str, np.ndarray], mask: np.ndarray,
     return {"headline": headline, "metrics": metrics, "log": log,
             "panels": box_panels(model, cuts),
             "cosmic_loose_to_tight_ratio": shapes.loose_to_tight_ratio,
+            "ce_helix_field_t": ce_field_t,
             "start_fom": start["fom"],
             "sweeps": [record["fom"] for record in sweeps]}
 
@@ -1342,6 +1376,13 @@ def run(context: RunContext) -> RunOutcome:
         return RunOutcome(error=(
             f"front_time_min_ns must be in [0, {MICROBUNCH_NS:g}) ns (the "
             f"microbunch), got {front_time_min_ns:g}"))
+    field_scale = context.params["cosmic_field_scale"]
+    if field_scale != 1.0 and cut_mode != "box":
+        return RunOutcome(error=(
+            f"cosmic_field_scale = {field_scale:g} needs cut_mode='box': it "
+            "reshapes the cosmic helices the box's R(max) and d0 cuts act on, "
+            "and momentum mode applies no geometry cut (its cosmic rate is "
+            "flat in momentum, which a field change does not alter)"))
     if context.params["tsda_veto"] and cut_mode != "box":
         return RunOutcome(error=(
             "tsda_veto = 1 needs cut_mode='box': the veto is worked out from "
@@ -1567,6 +1608,8 @@ def run(context: RunContext) -> RunOutcome:
             "cut_mode": cut_mode,
             "cosmic_rate_source": cosmic_rate_source,
             **({} if box is None else {
+                "cosmic_field_scale": float(field_scale),
+                "ce_helix_field_t": box["ce_helix_field_t"],
                 "cosmic_loose_to_tight_ratio": box["cosmic_loose_to_tight_ratio"],
                 "box_start_fom": box["start_fom"],
                 "box_sweeps": box["sweeps"]}),
@@ -1765,6 +1808,24 @@ SPEC = AnalysisSpec(
                         "and ce_tsda_survival / cosmic_tsda_survival report "
                         "the surviving fractions (-1 when off).",
             default=0, minimum=0, maximum=1,
+        ),
+        ParamSpec(
+            name="cosmic_field_scale",
+            description="Box mode: the detector-solenoid field relative to "
+                        "the one the cosmic shapes were taken at (1, the "
+                        "default, leaves them as they are). Each cosmic "
+                        "track keeps its momentum and cos(theta) and its "
+                        "helix radius becomes R/scale, pinned at its R(max) "
+                        "point, so R(max) is unchanged and d0 = R(max) - "
+                        "2R/scale moves (a stronger field raises d0). It "
+                        "does NOT touch the CE: pass an EdepAna file "
+                        "simulated at the same field (the log prints the "
+                        "field the CE helices imply), and it does not rescale "
+                        "the loose cosmic rate, nor add tracks that the "
+                        "nominal field kept out of the tracker. A first-order "
+                        "model, for scans of a few tens of percent.",
+            default=1.0, minimum=COSMIC_FIELD_SCALE_RANGE[0],
+            maximum=COSMIC_FIELD_SCALE_RANGE[1],
         ),
         ParamSpec(
             name="front_time_min_ns",

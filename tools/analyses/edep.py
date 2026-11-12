@@ -526,18 +526,31 @@ def parse_step_counts(stdout: str) -> tuple[dict[str, float], dict[str, dict[str
     return metrics, windows
 
 
-def job_fcl_text(step_params: dict[str, float], base: Path = FCL,
-                 hit_windows: dict[str, float] | None = None) -> str:
-    """The run's fcl: the shipped edep.fcl plus the step-count parameters,
-    and the occupancy hit windows when `hit_windows` is given.
+def job_fcl_text(step_params: dict[str, float] | None, base: Path = FCL,
+                 hit_windows: dict[str, float] | None = None,
+                 overrides: str = "", geometry_name: str = "") -> str:
+    """The run's fcl: the shipped edep.fcl, the caller's `overrides`, then
+    the geometry file's name on the search path (`geometry_name`, see
+    `geometry_search`), the step-count parameters (None for an EdepAna
+    without them) and the occupancy hit windows when `hit_windows` is given.
 
     EdepAna with PR #2067 requires the step parameters (and with PR #2097 the
     hit windows) and an older one rejects them, so they cannot live in
     fcl/edep.fcl. FHiCL cannot `#include` an absolute path, so this is a copy
-    with the lines appended, as the trigger analyses do.
+    with the lines appended, as the trigger analyses do. The overrides come
+    before the module parameters, so those always match what the result
+    reports.
     """
-    lines = [base.read_text(encoding="utf-8").rstrip(), "",
-             "# --- set by tools/analyses/edep.py for this run (Offline PR #2067) ---"]
+    lines = [base.read_text(encoding="utf-8").rstrip(), ""]
+    if overrides.strip():
+        lines += ["# --- fcl_overrides, from the request ---",
+                  overrides.strip(), ""]
+    if geometry_name:
+        lines += ["# --- geometry_file, from the request ---",
+                  f'services.GeometryService.inputFile : "{geometry_name}"', ""]
+    if step_params is None:
+        return "\n".join(lines).rstrip() + "\n"
+    lines.append("# --- set by tools/analyses/edep.py for this run (Offline PR #2067) ---")
     for name, key, *_ in STEP_PARAMS:
         lines.append(f"physics.analyzers.{ANALYZER_LABEL}.{key} : "
                      f"{float(step_params[name])!r}")
@@ -547,6 +560,24 @@ def job_fcl_text(step_params: dict[str, float], base: Path = FCL,
             lines.append(f"physics.analyzers.{ANALYZER_LABEL}.{key} : "
                          f"{float(hit_windows[name])!r}")
     return "\n".join(lines) + "\n"
+
+
+def geometry_search(geometry_file: str) -> tuple[str, tuple[Path, ...]] | str:
+    """(name for GeometryService.inputFile, directories to search) for a
+    caller's geometry file, or a complaint. Mu2e finds the file through
+    MU2E_SEARCH_PATH and never takes an absolute path, so its directory goes
+    on the path (which also finds files it #includes beside it) and the job
+    names it by its basename. "" means the shipped geometry: ("", ())."""
+    if not geometry_file.strip():
+        return "", ()
+    path = Path(geometry_file.strip())
+    if not path.is_absolute():
+        return (f"geometry_file must be an absolute path, got {geometry_file!r}; "
+                "for a file in the code, use fcl_overrides with "
+                "services.GeometryService.inputFile instead")
+    if not path.is_file():
+        return f"geometry_file {path} does not exist"
+    return path.name, (path.parent,)
 
 
 def hit_window_values(params: dict) -> dict[str, float]:
@@ -634,6 +665,15 @@ def run(context: RunContext) -> RunOutcome:
                                 f"EdepAna has the step counts: {exc}")
     extra: dict = {}
     fcl = FCL
+    overrides = str(context.params.get("fcl_overrides", "")).strip()
+    if overrides:
+        extra["fcl_overrides"] = overrides
+    found = geometry_search(str(context.params.get("geometry_file", "")))
+    if isinstance(found, str):
+        return RunOutcome(error=found)
+    geometry_name, search_dirs = found
+    if geometry_name:
+        extra["geometry_file"] = str(search_dirs[0] / geometry_name)
     if with_steps:
         problem = step_param_problem(context.params)
         windows = hit_window_values(context.params) if with_windows else None
@@ -643,7 +683,9 @@ def run(context: RunContext) -> RunOutcome:
             return RunOutcome(error=problem)
         context.outdir.mkdir(parents=True, exist_ok=True)
         fcl = context.outdir / JOB_FCL_NAME
-        fcl.write_text(job_fcl_text(context.params, hit_windows=windows),
+        fcl.write_text(job_fcl_text(context.params, hit_windows=windows,
+                                    overrides=overrides,
+                                    geometry_name=geometry_name),
                        encoding="utf-8")
         extra["job_fcl"] = str(fcl)
     else:
@@ -661,6 +703,13 @@ def run(context: RunContext) -> RunOutcome:
         extra["step_counts"] = ("not available: the configured Offline's EdepAna "
                                 "predates Offline PR #2067, so the *_nsteps_* "
                                 "metrics are absent")
+        if overrides or geometry_name:  # else the shipped fcl runs as-is
+            context.outdir.mkdir(parents=True, exist_ok=True)
+            fcl = context.outdir / JOB_FCL_NAME
+            fcl.write_text(job_fcl_text(None, overrides=overrides,
+                                        geometry_name=geometry_name),
+                           encoding="utf-8")
+            extra["job_fcl"] = str(fcl)
     outcome = run_mu2e_job(
         fcl=fcl,
         input_paths=context.input_paths,
@@ -668,6 +717,7 @@ def run(context: RunContext) -> RunOutcome:
         single=len(context.input_paths) == 1 and not context.wants_file_list,
         timeout_s=context.timeout_s,
         max_events=context.max_events,
+        extra_search_dirs=search_dirs,
     )
     extra["returncode"] = outcome.returncode
     if outcome.file_list_path is not None:
@@ -729,6 +779,40 @@ def run(context: RunContext) -> RunOutcome:
                       log_path=outcome.log_path, extra=extra)
 
 
+# A scaled field for the analysis: EdepAna turns the tracker-front step into
+# the helix (primary_trk_front_r_center/_radius) with the field the job's
+# GeometryService loads, so a sample simulated at a scaled field must be
+# analysed with the same one or its helices come out at the nominal field.
+FCL_OVERRIDES_PARAM = ParamSpec(
+    name="fcl_overrides",
+    description=(
+        "FHiCL text appended to edep.fcl before geometry_file and EdepAna's "
+        "own parameters (which always win). A config file it names (e.g. "
+        "services.GeometryService.bFieldFile) is looked up on "
+        "MU2E_SEARCH_PATH, i.e. in the configured code only; for your own "
+        "geometry file use geometry_file. Empty (the default) adds nothing."
+    ),
+    default="", kind="text", allow_empty=True,
+)
+GEOMETRY_FILE_PARAM = ParamSpec(
+    name="geometry_file",
+    description=(
+        "Absolute path of a Mu2e geometry file to run EdepAna with instead "
+        "of geom_common.txt, e.g. to analyse a sample simulated at a scaled "
+        "field: '#include \"Offline/Mu2eG4/geom/geom_common.txt\"' then "
+        "'double bfield.mapScale.DSMap = 1.1;' and the same for DSExtension "
+        "(per-map scales need Offline PR #2079, v13_43_00 or later; an older "
+        "Offline silently ignores them). Pass the geometry the simulation "
+        "used: EdepAna turns the tracker-front step into the helix "
+        "(primary_trk_front_r_center/_radius) with the job's field, but it "
+        "does not resimulate the steps. Its directory is appended to "
+        "MU2E_SEARCH_PATH, so files it #includes beside it are found. Empty "
+        "(the default) keeps the shipped geometry."
+    ),
+    default="", kind="text", allow_empty=True,
+)
+
+
 SPEC = AnalysisSpec(
     name="edep",
     fcl=FCL,
@@ -759,6 +843,8 @@ SPEC = AnalysisSpec(
         *(ParamSpec(name=name, description=desc, default=default,
                     minimum=lo, maximum=hi)
           for name, _, default, lo, hi, desc in STEP_PARAMS),
+        FCL_OVERRIDES_PARAM,
+        GEOMETRY_FILE_PARAM,
     ),
     summarize=summarize_edep,
     input_hint=(
