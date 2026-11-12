@@ -870,6 +870,59 @@ def test_sensitivity_reports_the_expected_limit(tmp_dir):
     assert bad.status == "error", bad.message
 
 
+def test_cosmic_ds_field_factor_follows_the_measured_points():
+    assert sens.cosmic_ds_field_factor(1.0) == 1.0
+    for scale, factor in zip(sens.COSMIC_DS_FIELD_SCALES, sens.COSMIC_DS_FIELD_FACTORS):
+        assert sens.cosmic_ds_field_factor(scale) == factor
+    # linear between two points
+    assert abs(sens.cosmic_ds_field_factor(0.775) - (0.8357 + 0.8908) / 2) < 1e-12
+    for outside in (0.74, 1.11):
+        try:
+            sens.cosmic_ds_field_factor(outside)
+        except sens.SensitivityError as exc:
+            assert "ds_field_scale" in str(exc)
+        else:
+            raise AssertionError(f"no error at {outside}")
+
+
+def test_sensitivity_scales_the_cosmic_rate_with_the_ds_field(tmp_dir):
+    path = Path(tmp_dir) / "nts.owner.edep.test.root"
+    _write_edep_tree(path)
+
+    def run(**parameters):
+        return run_analysis(analysis="approx_ce_sensitivity", data_file=str(path),
+                            output_dir=tmp_dir,
+                            parameters={"sig_eff": 1e-3, **parameters})
+
+    base = run()
+    assert base.status == "success", base.message
+    m = base.metadata
+    assert m["cosmic_ds_field_factor"] == 1.0
+    # the default is the nominal field: the same numbers as naming it
+    named = run(ds_field_scale=1.0).metadata
+    for name in ("sensitivity", "cosmic_background", "total_background",
+                 "expected_limit"):
+        assert named[name] == m[name], name
+
+    # a cosmic-only background, so the factor shows through exactly
+    high = run(cosmic_rate_per_s_per_mev=1.0e3).metadata
+    low = run(cosmic_rate_per_s_per_mev=1.0e3, ds_field_scale=0.75).metadata
+    assert low["cosmic_ds_field_factor"] == 0.8357
+    # the reported rate stays the nominal-field one
+    assert low["cosmic_rate_per_s_per_mev"] == high["cosmic_rate_per_s_per_mev"]
+    assert (low["signal_box_low_mev"], low["signal_box_high_mev"]) == \
+        (high["signal_box_low_mev"], high["signal_box_high_mev"])
+    assert abs(low["cosmic_background"] / high["cosmic_background"] - 0.8357) < 1e-9
+    assert low["signal_rate"] == high["signal_rate"]
+    assert low["dio_background"] == high["dio_background"]
+    assert low["sensitivity"] > high["sensitivity"]
+
+    outside = run(ds_field_scale=0.5)
+    assert outside.status == "error" and "ds_field_scale" in outside.message
+    box = run(ds_field_scale=0.9, cut_mode="box")
+    assert box.status == "error" and "cut_mode='momentum'" in box.message, box.message
+
+
 def test_sensitivity_rejects_a_file_without_the_tree(tmp_dir):
     """A non-EdepAna ROOT file (or a pre-tree one) is reported, not a crash."""
     import uproot

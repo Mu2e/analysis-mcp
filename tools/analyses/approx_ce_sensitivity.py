@@ -20,7 +20,9 @@ The chain, following the original macro:
    minus energy at birth) and the same tracker resolution.
 4. Cosmic background: flat in momentum at a rough rate per second per MeV/c
    (the `cosmic_rate_per_s_per_mev` parameter), scaled by the live on-spill
-   time implied by NPOT.
+   time implied by NPOT. When the detector-solenoid field is scaled
+   (`ds_field_scale`, momentum mode only) the rate is multiplied by a measured
+   factor, see `cosmic_ds_field_factor`.
 5. Scan every window [x1, x2] with x1 >= 50 MeV and keep the one maximizing
    S/sqrt(B).
 
@@ -118,6 +120,39 @@ def recommended_cosmic_rate(cut_mode: str) -> float:
     if cut_mode == "box":
         return COSMIC_RATE_MOMENTUM_MODE * load_cosmic_shapes().loose_to_tight_ratio
     return COSMIC_RATE_MOMENTUM_MODE
+
+
+# The cosmic rate against the detector-solenoid (DS) field scale, relative to
+# the nominal field, for a selection with no geometry cut (momentum mode). An
+# electron of momentum p in a field scaled by s follows the path of one of
+# momentum p/s in the nominal field, so the rate at scale s is the nominal
+# sample's count N at p/s, times (p/s)^2 to undo the 1/p^2 spectrum the
+# electrons are made with (70% are knock-ons from cosmic muons, and the other
+# processes have the same spectrum to a few percent): A(105/s) / A(105) with
+# A(q) = N(q) q^2. Measured on the 500 files of
+# nts.mu2e.CosmicSignalMix1BB.MDC2025au_best_v1_1-001.root (4.2e6 events,
+# 22,427 downstream electron-fit tracks at 100-110 MeV/c); statistical error
+# 0.01 per point. Not covered: the electrons born at the DS entrance (36%)
+# also cross the downstream TS field, which a study may scale separately, and
+# a selection with fixed-mm geometry cuts falls much faster below 0.9 (set 89:
+# 0.08 at 0.75), which is why box mode refuses a scaled field.
+COSMIC_DS_FIELD_SCALES = (0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10)
+COSMIC_DS_FIELD_FACTORS = (0.8357, 0.8908, 0.9365, 0.9780, 0.9974, 1.0,
+                           1.0068, 1.0366)
+
+
+def cosmic_ds_field_factor(ds_field_scale: float) -> float:
+    """The cosmic rate at a DS field scale over the rate at the nominal field.
+
+    Linear between the measured points; no extrapolation.
+    """
+    low, high = COSMIC_DS_FIELD_SCALES[0], COSMIC_DS_FIELD_SCALES[-1]
+    if not low <= ds_field_scale <= high:
+        raise SensitivityError(
+            f"ds_field_scale must be in [{low:g}, {high:g}], the range the "
+            f"cosmic rate was measured over, got {ds_field_scale:g}")
+    return float(np.interp(ds_field_scale, COSMIC_DS_FIELD_SCALES,
+                           COSMIC_DS_FIELD_FACTORS))
 
 
 # The microbunch is the 1695 ns between proton pulses (the on-spill time per
@@ -1346,6 +1381,13 @@ def run(context: RunContext) -> RunOutcome:
         return RunOutcome(error=(
             "tsda_veto = 1 needs cut_mode='box': the veto is worked out from "
             "the tracker-front helix, which momentum mode does not read"))
+    ds_field_scale = context.params["ds_field_scale"]
+    if ds_field_scale != 1.0 and cut_mode == "box":
+        return RunOutcome(error=(
+            f"ds_field_scale = {ds_field_scale:g} needs cut_mode='momentum': "
+            "box mode's cosmic shapes (R(max), d0, cos) were extracted at the "
+            "nominal field and its cuts are in fixed mm, so its cosmic count "
+            "at a scaled field is not known"))
     sig_eff = context.params["sig_eff"]
     stops_per_pot = context.params["stops_per_pot"]
     if np.isnan(sig_eff) or np.isnan(stops_per_pot):
@@ -1370,6 +1412,7 @@ def run(context: RunContext) -> RunOutcome:
         if cosmic_rate_source == "mode default":
             # box mode reads the cosmic shapes, which may be missing
             cosmic_rate_per_s_per_mev = recommended_cosmic_rate(cut_mode)
+        ds_field_factor = cosmic_ds_field_factor(ds_field_scale)
         variables = read_edep_tree(context.input_path)
         if cut_mode == "box" and HELIX_COLUMNS["rmax"] not in variables:
             raise SensitivityError(
@@ -1442,7 +1485,8 @@ def run(context: RunContext) -> RunOutcome:
         # 4. cosmics: flat rate per MeV/c over the implied on-spill time
         events = npot / mean_pot_per_event
         onspill_seconds = events * ONSPILL_SECONDS_PER_EVENT
-        cosmic_rate = cosmic_rate_per_s_per_mev * onspill_seconds
+        cosmic_rate = (cosmic_rate_per_s_per_mev * ds_field_factor
+                       * onspill_seconds)
         cosmic = replace(
             signal_reco, name="cosmic", title="Cosmics",
             values=np.full(signal_reco.nbins, cosmic_rate * signal_reco.width),
@@ -1482,6 +1526,8 @@ def run(context: RunContext) -> RunOutcome:
         # a number never travels without the normalization behind it.
         "npot": float(npot),
         "cosmic_rate_per_s_per_mev": float(cosmic_rate_per_s_per_mev),
+        # what the rate above (the nominal-field one) was multiplied by
+        "cosmic_ds_field_factor": float(ds_field_factor),
         "momentum_only_sensitivity": float(best["sensitivity"]),
         # The median expected 90% CL limit on R_mue, in its own momentum
         # window (the signal spectrum assumes R_MUE, so the limit is the
@@ -1519,7 +1565,8 @@ def run(context: RunContext) -> RunOutcome:
         f"  signal BR        {SIGNAL_BR:.4g} per stop  (R_mue = {R_MUE:g} per capture "
         f"x {MUON_CAPTURE_RATE:g} captures per stop)",
         f"  cosmic rate      {cosmic_rate_per_s_per_mev:.4g} per s per MeV/c "
-        f"({cosmic_rate_source}) "
+        f"({cosmic_rate_source}) x {ds_field_factor:.4g} (DS field scale "
+        f"{ds_field_scale:g}) "
         f"-> {cosmic_rate:.4g} per MeV/c ({onspill_seconds:.4g} s on-spill)",
         f"  signal entries   {signal.entries:g}",
         f"  MPV / FWHM       {mpv:.3f} / {fwhm:.3f} MeV",
@@ -1629,7 +1676,7 @@ SPEC = AnalysisSpec(
         "sensitivity", "signal_box_low_mev", "signal_box_high_mev",
         "signal_rate", "dio_background", "cosmic_background",
         "total_background", "signal_mpv_mev", "signal_fwhm_mev",
-        "npot", "cosmic_rate_per_s_per_mev",
+        "npot", "cosmic_rate_per_s_per_mev", "cosmic_ds_field_factor",
         "momentum_only_sensitivity", "punzi_fom", *BOX_CUT_METRICS,
         "expected_limit", "expected_limit_box_low_mev",
         "expected_limit_box_high_mev", "expected_limit_signal",
@@ -1698,6 +1745,23 @@ SPEC = AnalysisSpec(
                         "that npot and mean npot per event implies. "
                         + "In 'box' mode it is the cosmic-electron rate for the LOOSE selection the cosmic shapes were extracted with (ConvAna set 81: e-, APR/CPR trigger, upstream-reflection and multi-track vetoes, 100 < p < 110 MeV/c; no t0, cos, R(max) or d0 cut); the box's cosmic count is this rate times the box's cosmic time and geometry efficiencies, with no further scaling. In 'momentum' mode it is the rate after whatever fixed selection the result is meant to represent, applied as-is. The default (0) is, in momentum mode, the Run-1A rate 10/7.8e5 and, in box mode, that rate times the loose/tight yield ratio from the shapes file (the tight Run-1A cuts 540 < t0 < 1650 ns, 0.525 < cos < 0.649, 482 < R(max) < 642.6 mm pass 3.2% of the loose set, so ~31x, ~4.0e-4).",
             default=0.0, minimum=0.0,
+        ),
+        ParamSpec(
+            name="ds_field_scale",
+            description="Scale factor on the detector-solenoid field of the "
+                        "configuration the file was simulated with; 1 (the "
+                        "default) is the nominal field and changes nothing. "
+                        "cosmic_rate_per_s_per_mev stays the rate at the "
+                        "nominal field and is multiplied by a measured factor "
+                        "(0.836 at 0.75, 0.978 at 0.9, 1.037 at 1.1, linear "
+                        "in between; the metric cosmic_ds_field_factor "
+                        "reports it): a lower field brings higher-momentum "
+                        "cosmic electrons, which are rarer, into the window. "
+                        "It does not change the signal or DIO, which come "
+                        "from the file. cut_mode 'momentum' only: 'box' "
+                        "refuses a value other than 1.",
+            default=1.0, minimum=COSMIC_DS_FIELD_SCALES[0],
+            maximum=COSMIC_DS_FIELD_SCALES[-1],
         ),
         ParamSpec(
             name="background_uncertainty",
