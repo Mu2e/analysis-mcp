@@ -5864,7 +5864,7 @@ def test_optimize_evaluate_yields_mask():
 
 def test_optimize_build_cut_string_no_cuts():
     cuts = _synth_cuts()
-    assert build_cut_string(cuts) == "(1)"
+    assert build_cut_string(cuts) == ""
 
 
 def test_optimize_build_cut_string_applied():
@@ -5921,7 +5921,8 @@ def test_optimize_parse_cut_var_specs_veto():
 
 
 def test_optimize_parse_cut_var_specs_errors():
-    for bad in ("", "x:bogus:0:10", "x:both", "x:both:5:3"):
+    for bad in ("", "x:bogus:0:10", "x:both", "x:both:5:3",
+                "x:both:nan:10", "x:both:0:inf"):
         raised = False
         try:
             parse_cut_var_specs(bad)
@@ -6101,12 +6102,160 @@ def test_optimize_parse_component_weights_bad_format():
 
 # -- the SPEC is registered --
 
+# -- NaN handling (finding 1) --
+
+def test_optimize_greedy_with_nan_left():
+    """A left cut on a variable with NaN values must not hang."""
+    rng = np.random.default_rng(42)
+    n = 200
+    x = rng.uniform(0.0, 10.0, n)
+    # Inject NaN into ~10% of values
+    nan_mask = rng.random(n) < 0.1
+    x[nan_mask] = np.nan
+    sig = rng.random(n) < 0.5
+    ev = optmod.Events(
+        vals={"x": x},
+        w_sig=np.where(sig, 1.0, 0.0),
+        w_bkg=np.where(sig, 0.0, 1.0),
+        event_numbers=np.arange(n, dtype=float),
+    )
+    ev.prepare()
+    cuts = [CutVar("x", 0.0, 10.0, cut_type=optmod.LEFT)]
+    s0, _ = evaluate_yields(cuts, ev)
+    path = run_greedy(cuts, ev, s0, 0.02, 0.3, s_over_sqrt_b)
+    # Must return (not hang) and produce some steps
+    assert isinstance(path, list)
+
+
+def test_optimize_greedy_with_nan_right():
+    """A right cut on a variable with NaN values must not hang."""
+    rng = np.random.default_rng(43)
+    n = 200
+    x = rng.uniform(0.0, 10.0, n)
+    x[rng.random(n) < 0.1] = np.nan
+    sig = rng.random(n) < 0.5
+    ev = optmod.Events(
+        vals={"x": x},
+        w_sig=np.where(sig, 1.0, 0.0),
+        w_bkg=np.where(sig, 0.0, 1.0),
+        event_numbers=np.arange(n, dtype=float),
+    )
+    ev.prepare()
+    cuts = [CutVar("x", 0.0, 10.0, cut_type=optmod.RIGHT)]
+    s0, _ = evaluate_yields(cuts, ev)
+    path = run_greedy(cuts, ev, s0, 0.02, 0.3, s_over_sqrt_b)
+    assert isinstance(path, list)
+
+
+def test_optimize_scan_edge_continuous_nan_does_not_hang():
+    """_scan_edge_continuous must not loop on NaN entries — NaN entries
+    should be filtered before calling."""
+    # With NaN filtered, the function returns immediately
+    entries = np.array([[0.1, 1.0, 0.0], [0.5, 0.0, 1.0]])
+    result = optmod._scan_edge_continuous(entries, -np.inf, np.inf, 0.0, 0.0)
+    assert isinstance(result, list)
+
+
+# -- Non-unit weight (finding 2) --
+
+def test_optimize_greedy_nonunit_weight():
+    """run_greedy with non-unit signal weight must terminate."""
+    x = np.array([5., 4., 5., 5., 5., 2., 1., 8., 4., 2., 9.])
+    sig = np.array([1, 1, 1, 0, 1, 1, 0, 0, 1, 0, 1], dtype=bool)
+    ev = optmod.Events(
+        vals={"x": x},
+        w_sig=np.where(sig, 0.1, 0.0),
+        w_bkg=np.where(sig, 0.0, 1.0),
+        event_numbers=np.arange(len(x), dtype=float),
+    )
+    ev.prepare()
+    cuts = [CutVar("x", -1.0, 10.0, cut_type=optmod.RIGHT)]
+    s0, _ = evaluate_yields(cuts, ev)
+    # Must return within MAX_GREEDY_STEPS, not loop forever
+    path = run_greedy(cuts, ev, s0, 0.01, 0.05, s_over_sqrt_b)
+    assert isinstance(path, list) and len(path) < 100
+
+
+def test_optimize_greedy_nonunit_weight_fractional():
+    """Greedy with weight 1/3 must not loop."""
+    ev = _synth_events(200)
+    ev.w_sig = ev.w_sig * (1.0 / 3.0)
+    ev.w_bkg = ev.w_bkg * 0.37
+    ev.prepare()
+    cuts = _synth_cuts()
+    s0, _ = evaluate_yields(cuts, ev)
+    path = run_greedy(cuts, ev, s0, 0.02, 0.3, s_over_sqrt_b)
+    assert isinstance(path, list)
+
+
+# -- Merge with different variables (finding 3) --
+
+def test_optimize_merge_events_different_variables():
+    """Merging Events with different variable sets keeps only the common
+    variables."""
+    from tools.analyses.optimize_selection_ntuple import _merge_events
+    ev1 = optmod.Events(
+        vals={"x": np.array([1.0, 2.0]), "mc_pdg": np.array([11.0, 11.0]),
+              "event": np.array([1.0, 2.0])},
+        w_sig=np.array([1.0, 1.0]), w_bkg=np.array([0.0, 0.0]),
+        event_numbers=np.array([1.0, 2.0]),
+    )
+    ev2 = optmod.Events(
+        vals={"x": np.array([3.0, 4.0]),
+              "event": np.array([3.0, 4.0])},
+        w_sig=np.array([0.0, 0.0]), w_bkg=np.array([1.0, 1.0]),
+        event_numbers=np.array([3.0, 4.0]),
+    )
+    # Must not raise KeyError
+    merged = _merge_events([ev1, ev2], ["x", "event"])
+    assert merged.size == 4
+    assert "x" in merged.vals
+    assert "event" in merged.vals
+    # mc_pdg not in keep_names, so not in merged
+    assert "mc_pdg" not in merged.vals
+
+    # Order does not matter
+    merged2 = _merge_events([ev2, ev1], ["x", "event"])
+    assert merged2.size == 4
+
+
+# -- Default FoM (finding 4) --
+
+def test_optimize_default_fom_is_punzi():
+    spec = ANALYSES["optimize_selection_ntuple"]
+    fom_param = [p for p in spec.parameters if p.name == "fom"][0]
+    assert fom_param.default == "punzi"
+
+
+# -- build_cut_string with preselection (finding 7) --
+
+def test_optimize_build_cut_string_with_preselection():
+    cuts = _synth_cuts()
+    cuts[0].cut_lo = 3.0
+    cuts[0].cut_hi = 7.0
+    cuts[0].applied = True
+    s = build_cut_string(cuts, "pdg == 11 and downstream")
+    assert s.startswith("pdg == 11 and downstream and ")
+    assert "x > 3" in s
+
+
+def test_optimize_build_cut_string_preselection_only():
+    cuts = _synth_cuts()
+    s = build_cut_string(cuts, "pdg == 11")
+    assert s == "pdg == 11"
+
+
+# -- the SPEC is registered --
+
 def test_optimize_selection_ntuple_registered():
     assert "optimize_selection_ntuple" in ANALYSES
     spec = ANALYSES["optimize_selection_ntuple"]
     assert spec.input_kind == "root_file"
     assert spec.combines_files
     assert "best_fom" in spec.metrics
+    assert "best_fom_test" in spec.metrics
+    assert "best_fom_test_relative" in spec.metrics
+    assert "best_efficiency_test" in spec.metrics
     assert any(p.name == "file_labels" for p in spec.parameters)
     assert any(p.name == "signal_label" for p in spec.parameters)
     assert any(p.name == "signal_selection" for p in spec.parameters)
@@ -6114,6 +6263,7 @@ def test_optimize_selection_ntuple_registered():
     assert any(p.name == "optimize_variables" for p in spec.parameters)
     assert any(p.name == "fom" for p in spec.parameters)
     assert any(p.name == "seed_selections" for p in spec.parameters)
+    assert spec.units  # units are declared
 
 
 def main() -> int:

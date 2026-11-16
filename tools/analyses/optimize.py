@@ -11,10 +11,11 @@ Algorithms, adapted from optimize_selection_fast.C:
   tightening (the one with the highest figure-of-merit, subject to a maximum
   signal-efficiency loss per step). The variable with the steepest gradient
   (FoM gain per signal lost) wins, and that edge is applied. The path records
-  every step and stops when signal efficiency drops below ``end_eff`` or
-  background reaches zero. An optional ``top_k`` with an RNG makes the
-  choice stochastic (pick one of the top-k gradients at random), giving
-  different starting points for the local search.
+  every step and stops when signal efficiency drops below ``end_eff``,
+  background reaches zero, the step limit is reached, or no step changes
+  the cuts. An optional ``top_k`` with an RNG makes the choice stochastic
+  (pick one of the top-k gradients at random), giving different starting
+  points for the local search.
 
   **Random grid search** — ``n_trials`` random cut-sets are drawn by
   uniformly sampling each variable's edges within its search range, each
@@ -35,11 +36,23 @@ Algorithms, adapted from optimize_selection_fast.C:
 
 Figures of merit:
 
-  * S / sqrt(B) — classic significance
-  * Asimov Z — sqrt(2 * ((S+B) * log(1 + S/B) - S))
-  * Punzi FoM — S / (a/2 + sqrt(B)), with a = 1.28 (90 % CL)
-  * Expected upper limit — S / N_UL(B), where N_UL(B) is the median
-    expected 90 % CL CLs upper limit (Poisson)
+  * S / sqrt(B) — classic significance. Returns 0 when S <= 0 or B <= 0,
+    so it cannot distinguish selections that remove all background; use
+    Punzi or expected_ul when this is possible.
+  * Asimov Z — sqrt(2 * ((S+B) * log(1 + S/B) - S)). The exact formula
+    diverges as B → 0; a floor of b = 1e-9 is applied, below which the
+    function evaluates to sqrt(2S) instead.
+  * Punzi FoM — S / (a/2 + sqrt(B)), with a = 1.28 (90 % CL). Well-
+    behaved at B = 0.
+  * Expected upper limit — S / N_UL(B), where N_UL(B) is the mean
+    expected 90 % CL CLs upper limit (Poisson), averaged over Poisson-
+    distributed background outcomes.
+
+NaN handling: NaN variable values are excluded from the edge scan entirely.
+A NaN fails every comparison in ``passes_cut`` (and in ``selection.py``),
+so a track with NaN in a variable it is cut on never passes. The scan
+entries are built from finite values only, keeping the scan yields
+consistent with ``evaluate_yields``.
 """
 
 from __future__ import annotations
@@ -61,6 +74,9 @@ LEFT = "left"      # lower bound only: keep events with x > lo
 RIGHT = "right"    # upper bound only: keep events with x < hi
 VETO = "veto"      # exclusion window: keep events with x < lo or x > hi
 CUT_TYPES = (BOTH, LEFT, RIGHT, VETO)
+
+# Maximum greedy steps before stopping, to prevent runaway loops.
+MAX_GREEDY_STEPS = 10000
 
 
 @dataclass
@@ -125,6 +141,16 @@ def passes_cut(var: CutVar, v: np.ndarray) -> np.ndarray:
     return (v < var.cut_lo) | (v > var.cut_hi)
 
 
+def _cuts_equal(a: list[CutVar], b: list[CutVar]) -> bool:
+    """Whether two cut lists have the same edges and applied flags."""
+    for va, vb in zip(a, b):
+        if va.applied != vb.applied:
+            return False
+        if va.applied and (va.cut_lo != vb.cut_lo or va.cut_hi != vb.cut_hi):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # In-memory event store
 # ---------------------------------------------------------------------------
@@ -186,7 +212,12 @@ FigureOfMerit = Callable[[float, float], float]
 
 
 def s_over_sqrt_b(s: float, b: float) -> float:
-    """S / sqrt(B). Returns 0 when S <= 0 or B <= 0."""
+    """S / sqrt(B). Returns 0 when S <= 0 or B <= 0.
+
+    This means a selection that removes all background scores 0, so the
+    optimizer cannot prefer it. Use ``punzi`` or ``expected_ul`` when
+    background can reach zero.
+    """
     if s <= 0.0 or b <= 0.0:
         return 0.0
     return s / math.sqrt(b)
@@ -194,7 +225,12 @@ def s_over_sqrt_b(s: float, b: float) -> float:
 
 def asimov_z(s: float, b: float) -> float:
     """Asimov significance: sqrt(2 * ((S+B) * log(1 + S/B) - S)).
-    Smooth limit sqrt(2S) at B → 0."""
+
+    The exact formula diverges as B → 0. A floor of B = 1e-9 is applied:
+    below it the function returns sqrt(2S), which is the leading term of
+    the Taylor expansion at small B but not the true limit. This avoids a
+    discontinuity where removing one background event would lower the score.
+    """
     if s <= 0.0:
         return 0.0
     if b <= 1e-9:
@@ -251,7 +287,9 @@ def _poisson_cls_ul(n: int, b: float, cl: float = 0.9) -> float:
 
 
 def _expected_ul_events_exact(b: float) -> float:
-    """Expected upper limit on signal events: sum_n P(n|b) * N_UL(n, b)."""
+    """Mean expected upper limit on signal events:
+    sum_n P(n|b) * N_UL(n, b), averaged over Poisson-distributed
+    background-only outcomes."""
     if b <= 0.0:
         return _poisson_cls_ul(0, 0.0)
     n_lo = max(0, int(math.floor(b - 7.0 * math.sqrt(b) - 2.0)))
@@ -281,8 +319,8 @@ def _ensure_ul_table() -> None:
 
 
 def expected_ul_events(b: float) -> float:
-    """Expected 90 % CL CLs upper limit on signal events, interpolated from
-    a lookup table in log10(b) for speed."""
+    """Mean expected 90 % CL CLs upper limit on signal events, interpolated
+    from a lookup table in log10(b) for speed."""
     _ensure_ul_table()
     b = max(b, 0.0)
     if b <= 10.0 ** _UL_LMIN:
@@ -297,7 +335,7 @@ def expected_ul_events(b: float) -> float:
 
 
 def inv_expected_limit(s: float, b: float) -> float:
-    """S / N_UL(B): 1 over the expected 90 % CL CLs upper limit on the
+    """S / N_UL(B): 1 over the mean expected 90 % CL CLs upper limit on the
     signal strength, independent of the signal normalization."""
     if s <= 0.0:
         return 0.0
@@ -354,7 +392,10 @@ def _scan_edge_continuous(entries: np.ndarray, y0: float, y_lim: float,
     """Candidate edges for a continuous variable. ``entries`` is (N, 3):
     oriented value, signal weight, background weight, sorted by value.
     Just below each signal value, so all background beneath it is removed
-    for the same signal loss."""
+    for the same signal loss.
+
+    Entries must contain only finite values (NaN filtered before calling).
+    """
     n = len(entries)
     if n == 0:
         return []
@@ -387,7 +428,10 @@ def _scan_edge_continuous(entries: np.ndarray, y0: float, y_lim: float,
 def _scan_edge_discrete(entries: np.ndarray, y0: float, y_lim: float,
                         s_fixed: float, b_fixed: float) -> list[EdgePoint]:
     """Candidate edges for a discrete (integer-valued) variable: whole-unit
-    moves from y0 towards y_lim."""
+    moves from y0 towards y_lim.
+
+    Entries must contain only finite values (NaN filtered before calling).
+    """
     n = len(entries)
     if n == 0:
         return []
@@ -411,14 +455,18 @@ def _scan_edge_discrete(entries: np.ndarray, y0: float, y_lim: float,
 def _choose_edge(scan: list[EdgePoint], n_sig_0: float,
                  step: float) -> int:
     """The largest move whose signal loss is within ``step``, or the first
-    move if all exceed it. A move losing no signal is taken one further."""
+    move if all exceed it. A move losing no signal (within tolerance) is
+    taken one further."""
     if not scan:
         return -1
     index = 0
     for i, pt in enumerate(scan):
         if 1.0 - pt.n_sig / n_sig_0 <= step:
             index = i
-    if scan[index].n_sig >= n_sig_0 and index + 1 < len(scan):
+    # Use a relative tolerance for the no-signal-loss check to avoid
+    # floating-point loops where cumulative sums differ in the last bit.
+    if (abs(scan[index].n_sig - n_sig_0) < 1e-12 * abs(n_sig_0)
+            and index + 1 < len(scan)):
         index += 1
     return index
 
@@ -489,6 +537,10 @@ def _find_tighten_point(ivar: int, cuts: list[CutVar], events: Events,
             if not pass_mask[i]:
                 continue
             v = vals[i]
+            # Skip NaN values: they fail every cut, so they never pass
+            # and must not enter the scan.
+            if not np.isfinite(v):
+                continue
             if is_veto:
                 movable = v < var.cut_lo if side == 0 else v > var.cut_hi
                 fixed = v > var.cut_hi if side == 0 else v < var.cut_lo
@@ -564,6 +616,9 @@ def _find_loosen_point(ivar: int, cuts: list[CutVar], events: Events,
             if not pass_mask[i]:
                 continue
             v = vals[i]
+            # Skip NaN values
+            if not np.isfinite(v):
+                continue
             if var.cut_type == BOTH:
                 if not (v < var.cut_hi if side == 0 else v > var.cut_lo):
                     continue
@@ -623,8 +678,13 @@ def _tighten_candidates(cuts: list[CutVar], events: Events, step: float,
     for ivar in range(len(cuts)):
         tp = _find_tighten_point(ivar, cuts, events, pass_mask,
                                  n_sig, n_bkg, step, fom)
-        if tp is not None and tp.n_sig < tp.n_sig_0:
-            candidates.append(tp)
+        if tp is None:
+            continue
+        # Reject candidates that do not actually reduce the signal yield
+        # (within floating-point tolerance), to prevent no-op steps.
+        if tp.n_sig >= tp.n_sig_0 * (1.0 - 1e-12):
+            continue
+        candidates.append(tp)
     return candidates
 
 
@@ -648,22 +708,30 @@ def _choose_greedy(candidates: list[TestPoint],
 def run_greedy(cuts: list[CutVar], events: Events, n_sig_ref: float,
                step: float, end_eff: float, fom: FigureOfMerit,
                rng: np.random.Generator | None = None,
-               top_k: int = 1) -> list[Selection]:
+               top_k: int = 1,
+               max_steps: int = MAX_GREEDY_STEPS) -> list[Selection]:
     """Greedy path from a starting selection, recording every step.
 
     ``n_sig_ref`` is the reference signal yield (at no cuts) for the
     efficiency calculation. The path stops when the efficiency drops below
-    ``end_eff`` or background reaches zero.
+    ``end_eff``, background reaches zero, ``max_steps`` is reached, or a
+    step leaves the cuts unchanged.
     """
     working = copy.deepcopy(cuts)
     path: list[Selection] = []
     eff = 1.0
-    while eff > end_eff:
+    for _ in range(max_steps):
+        if eff <= end_eff:
+            break
         candidates = _tighten_candidates(working, events, step, fom)
         idx = _choose_greedy(candidates, rng, top_k)
         if idx < 0:
             break
+        prev = copy.deepcopy(working)
         _apply_point(working, candidates[idx])
+        # Stop if the step did not change the cuts (floating-point edge case)
+        if _cuts_equal(working, prev):
+            break
         sel = Selection(copy.deepcopy(working),
                         candidates[idx].n_sig, candidates[idx].n_bkg)
         path.append(sel)
@@ -877,10 +945,13 @@ def multi_start_optimize(cuts: list[CutVar], events: Events, step: float,
 # Cut-string builder (selection.py-compatible)
 # ---------------------------------------------------------------------------
 
-def build_cut_string(cuts: list[CutVar]) -> str:
+def build_cut_string(cuts: list[CutVar], preselection: str = "") -> str:
     """Build a selection expression from the applied cuts, compatible with
-    tools/selection.py's syntax."""
+    tools/selection.py's syntax. If ``preselection`` is given, it is
+    ANDed in front of the optimized cuts."""
     parts: list[str] = []
+    if preselection.strip():
+        parts.append(preselection.strip())
     for var in cuts:
         if not var.applied:
             continue
@@ -894,7 +965,7 @@ def build_cut_string(cuts: list[CutVar]) -> str:
         elif var.cut_type == VETO:
             parts.append(f"({var.name} < {var.cut_lo:.8g} or "
                          f"{var.name} > {var.cut_hi:.8g})")
-    return " and ".join(parts) if parts else "(1)"
+    return " and ".join(parts) if parts else ""
 
 
 # ---------------------------------------------------------------------------
@@ -929,7 +1000,8 @@ def parse_cut_var_specs(text: str) -> list[CutVar]:
         nactive:left:10:60:discrete
         crv_dt:veto:-150:150:-10:-10
 
-    Raises CutVarSpecError for bad syntax or unknown types.
+    Raises CutVarSpecError for bad syntax, non-finite bounds, or unknown
+    types.
     """
     specs = [s.strip() for s in text.split(",") if s.strip()]
     if not specs:
@@ -959,6 +1031,11 @@ def parse_cut_var_specs(text: str) -> list[CutVar]:
                 f"variable {name!r}: lo={parts[2]!r} and hi={parts[3]!r} "
                 "must be numbers"
             )
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise CutVarSpecError(
+                f"variable {name!r}: lo={lo:g} and hi={hi:g} must be "
+                "finite numbers"
+            )
         if lo >= hi:
             raise CutVarSpecError(
                 f"variable {name!r}: lo={lo:g} must be less than hi={hi:g}"
@@ -983,6 +1060,15 @@ def parse_cut_var_specs(text: str) -> list[CutVar]:
                 raise CutVarSpecError(
                     f"variable {name!r}: seed_lo={remaining[0]!r} and "
                     f"seed_hi={remaining[1]!r} must be numbers"
+                )
+            if not (math.isfinite(seed_lo) and math.isfinite(seed_hi)):
+                raise CutVarSpecError(
+                    f"variable {name!r}: seed values must be finite numbers"
+                )
+            if seed_lo > seed_hi:
+                raise CutVarSpecError(
+                    f"variable {name!r}: seed_lo={seed_lo:g} must be <= "
+                    f"seed_hi={seed_hi:g}"
                 )
         elif remaining:
             raise CutVarSpecError(

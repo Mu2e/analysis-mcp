@@ -3,13 +3,14 @@ refinement, and multi-start search.
 
 Reads EventNtuple track variables (the same ones trigger_efficiency_ntuple
 offers) and optimizes a set of cut variables to maximize a figure of merit
-(S/sqrt(B), Asimov significance, Punzi FoM, or 1/expected upper limit)
-for signal vs. background discrimination.
+(Punzi, S/sqrt(B), Asimov Z, or 1/expected upper limit) for signal vs.
+background discrimination.
 
 Each input file is labeled as a component (e.g. ``signal``, ``DIO``,
 ``cosmic``, ``RPC``). One label is designated as signal; all others are
-background. Each component carries its own weight, so the signal and
-different backgrounds can be normalized independently.
+background. Each component carries its own per-track weight, so the signal
+and different backgrounds can be normalized independently. Each track is
+one entry; an event with multiple passing tracks counts once per track.
 
 Alternatively, when all tracks are in one file (e.g. a mixed signal+pileup
 sample), ``signal_selection`` identifies signal tracks by an MC truth
@@ -20,11 +21,11 @@ pre-sorted indices for fast edge scanning, as in optimize_selection_fast.C.
 A train/test split by event-number parity guards against overtraining.
 
 Outputs:
-  * The optimized cut string (selection.py-compatible)
+  * The optimized cut string (selection.py-compatible, including the
+    preselection)
   * Greedy-path ROC curve and FoM-vs-efficiency (train and test)
   * Random grid scan overlay
   * Multi-start refinement comparison table
-  * Cut flow CSV
 
 The analysis takes EventNtuple root_file(s) with the same interface as
 trigger_efficiency_ntuple, and the core optimization lives in optimize.py
@@ -213,15 +214,23 @@ def _build_events_selection(variables: dict[str, np.ndarray],
     )
 
 
-def _merge_events(parts: list[Events]) -> Events:
-    """Concatenate multiple Events objects into one."""
+def _merge_events(parts: list[Events], keep_names: list[str]) -> Events:
+    """Concatenate multiple Events objects into one, keeping only the
+    variables in ``keep_names`` (the optimized variables plus ``event``).
+    This avoids a KeyError when files have different variable sets (e.g.
+    MC signal and data background that lacks ``mc_*`` branches)."""
     if not parts:
         return Events()
     if len(parts) == 1:
-        return parts[0]
-    all_names = list(parts[0].vals.keys())
+        p = parts[0]
+        return Events(
+            vals={n: p.vals[n] for n in keep_names if n in p.vals},
+            w_sig=p.w_sig, w_bkg=p.w_bkg, event_numbers=p.event_numbers,
+        )
+    names = [n for n in keep_names
+             if all(n in p.vals for p in parts)]
     return Events(
-        vals={n: np.concatenate([p.vals[n] for p in parts]) for n in all_names},
+        vals={n: np.concatenate([p.vals[n] for p in parts]) for n in names},
         w_sig=np.concatenate([p.w_sig for p in parts]),
         w_bkg=np.concatenate([p.w_bkg for p in parts]),
         event_numbers=np.concatenate([p.event_numbers for p in parts]),
@@ -346,6 +355,15 @@ def run(context: RunContext) -> RunOutcome:
                     f"signal_label {signal_label!r} does not appear in "
                     f"file_labels ({', '.join(file_labels)})"
                 )
+            # Refuse unknown labels in component_weights
+            known_labels = set(file_labels)
+            unknown = sorted(set(component_weights) - known_labels)
+            if unknown:
+                raise OptimizeError(
+                    f"component_weights names unknown label(s) "
+                    f"{', '.join(unknown)}; the file_labels are "
+                    f"{', '.join(sorted(known_labels))}"
+                )
             extra["mode"] = "labeled_files"
             extra["signal_label"] = signal_label
             extra["file_labels"] = file_labels
@@ -428,7 +446,9 @@ def run(context: RunContext) -> RunOutcome:
                 label: info for label, info in component_counts.items()
             }
 
-        events = _merge_events(all_parts)
+        # Keep only the optimized variables plus event (for the split)
+        keep = var_names + ["event"]
+        events = _merge_events(all_parts, keep)
         if events.size == 0:
             raise OptimizeError(
                 "no tracks pass the preselection in "
@@ -529,7 +549,7 @@ def run(context: RunContext) -> RunOutcome:
             step_info: dict = {
                 "eff_train": eff_tr,
                 "fom_train": fom_tr,
-                "cuts": build_cut_string(sel.cuts),
+                "cuts": build_cut_string(sel.cuts, preselection),
             }
             if test is not None:
                 s_te, b_te = evaluate_yields(sel.cuts, test)
@@ -565,7 +585,7 @@ def run(context: RunContext) -> RunOutcome:
                 "refined_fom": fom(refined.n_sig, refined.n_bkg) / fom_0 if fom_0 > 0 else 0.0,
                 "refined_lim": (opt.inv_expected_limit(refined.n_sig, refined.n_bkg) / lim_0
                                 if lim_0 > 0 else 0.0),
-                "cuts": build_cut_string(refined.cuts),
+                "cuts": build_cut_string(refined.cuts, preselection),
             }
             if test is not None:
                 s_te, b_te = evaluate_yields(refined.cuts, test)
@@ -577,7 +597,7 @@ def run(context: RunContext) -> RunOutcome:
 
         # Best selection
         best = result["best"]
-        best_cut_string = build_cut_string(best.cuts)
+        best_cut_string = build_cut_string(best.cuts, preselection)
         extra["best_cuts"] = best_cut_string
         best_fom = fom(best.n_sig, best.n_bkg)
         best_eff = best.n_sig / n_sig_0 if n_sig_0 > 0 else 0.0
@@ -765,7 +785,16 @@ SPEC = AnalysisSpec(
         "baseline_signal", "baseline_background", "baseline_fom",
         "n_tracks", "n_signal", "n_background",
         "n_greedy_steps", "n_starts_refined", "n_grid_trials", "n_files",
+        "best_fom_test", "best_fom_test_relative", "best_efficiency_test",
     ),
+    units={
+        "best_signal": "weighted tracks",
+        "best_background": "weighted tracks",
+        "baseline_signal": "weighted tracks",
+        "baseline_background": "weighted tracks",
+        "n_tracks": "tracks", "n_signal": "tracks",
+        "n_background": "tracks", "n_files": "files",
+    },
     parameters=(
         ParamSpec(
             name="optimize_variables",
@@ -818,11 +847,14 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="component_weights",
             description=(
-                "Per-component weights as 'label:weight' pairs, comma-"
-                "separated. Example: 'signal:1.0, DIO:0.5, cosmic:0.01'. "
-                "Labels not listed default to 1.0. In signal_selection mode, "
-                "use 'signal:w, background:w' to set signal and background "
-                "weights."
+                "Per-track weight for each component, as 'label:weight' "
+                "pairs, comma-separated. Each track in a file labeled with "
+                "that component counts with this weight in the S or B sum. "
+                "Example: 'signal:1.0, DIO:0.5, cosmic:0.01'. "
+                "Labels not listed default to 1.0. Labels must appear in "
+                "file_labels; unknown labels are refused. In signal_selection "
+                "mode, use 'signal:w, background:w' to set signal and "
+                "background weights."
             ),
             default="", kind="text", allow_empty=True,
         ),
@@ -842,9 +874,9 @@ SPEC = AnalysisSpec(
                 f"Figure of merit to maximize: {FOM_NAMES}. "
                 "'s_over_sqrt_b' is S/sqrt(B); 'asimov_z' is the Asimov "
                 "significance; 'punzi' is S/(a/2 + sqrt(B)); 'expected_ul' "
-                "is S / N_UL(B), 1 over the expected 90%% CL CLs upper limit."
+                "is S / N_UL(B), 1 over the expected 90% CL CLs upper limit."
             ),
-            default="s_over_sqrt_b", kind="text",
+            default="punzi", kind="text",
         ),
         ParamSpec(
             name="seed_selections",
