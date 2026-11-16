@@ -37,6 +37,12 @@ BRANCHES: dict[str, list[str]] = {
     "trkfit": ["trksegs", "trksegpars_lh"],
     "trkmc": ["trkmcsim"],
 }
+# Read where the file has them: the TSDA intersection flag no_tsda needs
+# (cuts.py refuses no_tsda when it is absent, so a cut set without the veto
+# still reads older ntuples).
+OPTIONAL_BRANCHES: dict[str, list[str]] = {
+    "trk": ["trk.tsdainter"],
+}
 
 # Surface ids a track segment can be extrapolated to, from
 # Offline/DataProducts/inc/SurfaceId.hh (as pyutils.pyselect maps them).
@@ -130,6 +136,10 @@ def read_eventntuple(path: Path, triggers=DEFAULT_TRIGGERS) -> dict:
         branches = dict(BRANCHES, evt=BRANCHES["evt"] + trigger_branches)
         data = {"n_processed": processed_events(rootfile, tree)}
         for group, names in branches.items():
+            # uproot lists a sub-branch by its path ("trk/trk.tsdainter")
+            leaf_names = have | {k.rsplit("/", 1)[-1] for k in have}
+            names = names + [b for b in OPTIONAL_BRANCHES.get(group, [])
+                             if b in leaf_names]
             try:
                 data[group] = tree.arrays(names, library="ak")
             except uproot.KeyInFileError as exc:

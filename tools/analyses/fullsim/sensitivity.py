@@ -5,7 +5,8 @@ but with the signal efficiency, shape and detector response measured from
 reconstructed CE events mixed with pileup (CeMLeadingLogMix1BB EventNtuple
 files) instead of from EdepAna's truth-level tree:
 
-1. Select CE-like tracks with pyfitter's cut-set 80 (cuts.py), file by file.
+1. Select CE-like tracks with a pyfitter cut set (cuts.py: run1a_tsda,
+   with a 540-1650 ns time window, by default, or 80_1d), file by file.
    Each surviving event is represented by its first selected track: its
    momentum and time at the tracker front, its MC origin
    (eventntuple.origin_codes) and its true momentum at birth. Events whose
@@ -48,8 +49,9 @@ from ..approx_ce_sensitivity import (COSMIC_RATE_PER_SECOND_PER_MEV,
                                      ONSPILL_SECONDS_PER_EVENT, SIGNAL_REBIN,
                                      SensitivityError, load_dio_spectrum,
                                      scan_signal_box)
-from .cuts import (CUT_DESCRIPTIONS, CUT_SET, DEFAULT_CUTS, TRKPID_MIN,
-                   TRKQUAL_MIN, CutError, active_cuts, apply_cuts, cut_masks)
+from .cuts import (CUT_ORDER, CUT_SET, CUT_SETS, CutError, active_cuts,
+                   apply_cuts, cut_descriptions, cut_masks, default_cuts,
+                   get_cut_set)
 from .eventntuple import (DEFAULT_TRIGGERS, ORIGIN_NAMES, SID_TT_FRONT,
                           TREE_PATH, EventNtupleError, origin_codes,
                           parse_trigger_paths, read_eventntuple)
@@ -71,7 +73,8 @@ RMUE = 1.0e-13
 
 # The time window at the tracker front (ns) a CE must fall in: pyCount's
 # fixed window, which is also pyfitter's signal-region time window.
-TIME_WINDOW_NS = (640.0, 1650.0)
+# The default time window is the cut set's (CutSet.time_window_ns).
+TIME_WINDOW_NS = CUT_SETS[CUT_SET].time_window_ns
 
 # Reconstructed momentum, binned as approx_ce_sensitivity's signal
 # (EdepAna's trk_front_energy, then rebinned by SIGNAL_REBIN).
@@ -90,19 +93,21 @@ class FullsimError(RuntimeError):
 # --- per-file reduction ------------------------------------------------------
 
 def reduce_file(path: Path, active: list[str], trkqual_min: float,
-                trkpid_min: float, triggers=DEFAULT_TRIGGERS) -> dict:
+                trkpid_min: float, triggers=DEFAULT_TRIGGERS,
+                cut_set: str = CUT_SET) -> dict:
     """One file's selected events, reduced to flat per-event arrays, and its
     cut flow. Done per file so the jagged arrays never all sit in memory."""
     return reduce_data(read_eventntuple(path, triggers), active, trkqual_min,
-                       trkpid_min, triggers)
+                       trkpid_min, triggers, cut_set)
 
 
 def reduce_data(data: dict, active: list[str], trkqual_min: float,
-                trkpid_min: float, triggers=DEFAULT_TRIGGERS) -> dict:
+                trkpid_min: float, triggers=DEFAULT_TRIGGERS,
+                cut_set: str = CUT_SET) -> dict:
     """reduce_file for EventNtuple groups already in memory."""
     import awkward as ak
 
-    masks = cut_masks(data, SIGN, trkqual_min, trkpid_min, triggers)
+    masks = cut_masks(data, SIGN, trkqual_min, trkpid_min, triggers, cut_set)
     track_mask, flow = apply_cuts(masks, active, data["trk"]["trk.pdg"])
     keep = ak.to_numpy(ak.any(track_mask, axis=-1))
 
@@ -298,14 +303,25 @@ def run(context: RunContext) -> RunOutcome:
     extra: dict = {}
 
     try:
-        active = active_cuts(params["enable_cuts"], params["disable_cuts"])
-        extra["cut_set"] = CUT_SET
+        cut_set = params["cut_set"].strip()
+        cs = get_cut_set(cut_set)
+        # A negative threshold means the cut set's own.
+        trkqual_min = (cs.trkqual_min if params["trkqual_min"] < 0
+                       else params["trkqual_min"])
+        trkpid_min = (cs.trkpid_min if params["trkpid_min"] < 0
+                      else params["trkpid_min"])
+        active = active_cuts(params["enable_cuts"], params["disable_cuts"], cut_set)
+        extra["cut_set"] = cut_set
+        extra["trkqual_min"] = trkqual_min
+        extra["trkpid_min"] = trkpid_min
         extra["cuts"] = active
         triggers = parse_trigger_paths(params["trigger_paths"])
         extra["trigger_paths"] = triggers
-        t_lo, t_hi = parse_time_window(params["time_window"])
-        parts = [reduce_file(path, active, params["trkqual_min"],
-                             params["trkpid_min"], triggers)
+        t_lo, t_hi = (parse_time_window(params["time_window"])
+                      if params["time_window"].strip() else cs.time_window_ns)
+        extra["time_window"] = [t_lo, t_hi]
+        parts = [reduce_file(path, active, trkqual_min, trkpid_min, triggers,
+                             cut_set)
                  for path in context.input_paths]
         ev = combine(parts)
         if n_generated <= 0:
@@ -409,7 +425,8 @@ def run(context: RunContext) -> RunOutcome:
     }
 
     flow_rows = [("No cuts", ev["n_events"], "no selection")] + [
-        (name, n, CUT_DESCRIPTIONS[name]) for name, n in zip(active, ev["flow"])]
+        (name, n, cut_descriptions(cut_set)[name])
+        for name, n in zip(active, ev["flow"])]
     flow_path = outdir / "cut_flow.csv"
     flow_path.write_text(
         "cut,events_passing,description\n"
@@ -426,7 +443,7 @@ def run(context: RunContext) -> RunOutcome:
     lines = [
         "fullsim_sensitivity",
         *(f"  input            {path}" for path in context.input_paths),
-        f"  cut set          pyfitter {CUT_SET}",
+        f"  cut set          pyfitter {cut_set}",
         f"  trigger paths    any of {', '.join(triggers)}",
         f"  time window      {t_lo:g}-{t_hi:g} ns at the tracker front",
         f"  NPOT             {npot:g}",
@@ -502,7 +519,7 @@ SPEC = AnalysisSpec(
         "approx_ce_sensitivity: the signal efficiency, momentum shape and "
         "detector response are measured from reconstructed CE mixed with "
         "pileup (CeMLeadingLogMix1BB EventNtuple files) after pyfitter's "
-        f"cut-set {CUT_SET} CE-like cuts. Signal and DIO (theory spectrum "
+        "CE-like cuts (cut_set: 80_1d or run1a_tsda). Signal and DIO (theory spectrum "
         "folded with that response) are normalized to the stopped mu- NPOT "
         "gives, as Production's normalizations.py; cosmics are flat per "
         "MeV/c over the on-spill time; the best-window scan is "
@@ -614,10 +631,12 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="time_window",
             description="'t_low,t_high' (ns): the window a CE's time at the "
-                        "tracker front must fall in (open interval). The "
-                        "default is pyfitter's signal-region time window. The "
-                        "momentum window is scanned.",
-            default="{:g},{:g}".format(*TIME_WINDOW_NS), kind="text",
+                        "tracker front must fall in (open interval). Empty, "
+                        "the default: cut_set's ("
+                        + "; ".join("{}: {:g},{:g}".format(n, *c.time_window_ns)
+                                    for n, c in CUT_SETS.items())
+                        + "). The momentum window is scanned.",
+            default="", kind="text", allow_empty=True,
         ),
         ParamSpec(
             name="trigger_paths",
@@ -629,14 +648,21 @@ SPEC = AnalysisSpec(
             default=", ".join(DEFAULT_TRIGGERS), kind="text",
         ),
         ParamSpec(
+            name="cut_set",
+            description="The pyfitter cut set (config.py VERSION_CUTS) the "
+                        "thresholds and default cuts come from: "
+                        + "; ".join(f"{name}: {', '.join(default_cuts(name))}"
+                                    for name in CUT_SETS)
+                        + ". run1a_tsda adds the signed-d0 window and the TSDA "
+                        "veto (needs trk.tsdainter).",
+            default=CUT_SET, kind="text",
+        ),
+        ParamSpec(
             name="enable_cuts",
-            description="Comma-separated cuts to apply on top of the default "
-                        f"set (pyfitter cut-set {CUT_SET}: "
-                        f"{', '.join(DEFAULT_CUTS)}). The others, pyfitter's "
-                        "fit ranges, which the momentum scan and time_window "
-                        "stand in for here: "
-                        + ", ".join(n for n in CUT_DESCRIPTIONS
-                                    if n not in DEFAULT_CUTS) + ".",
+            description="Comma-separated cuts to apply on top of cut_set's "
+                        "defaults. Known cuts: " + ", ".join(CUT_ORDER) + ". "
+                        "in_mom_range and within_t0 are pyfitter's fit ranges, "
+                        "which the momentum scan and time_window stand in for.",
             default="", kind="text", allow_empty=True,
         ),
         ParamSpec(
@@ -648,14 +674,16 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="trkqual_min",
             description="good_trkqual threshold: keep tracks with TrkQual "
-                        f"above this. Default: pyfitter cut-set {CUT_SET}'s.",
-            default=TRKQUAL_MIN, minimum=0.0, maximum=1.0,
+                        "above this. Negative (the default): cut_set's "
+                        f"({', '.join(f'{n} {c.trkqual_min:g}' for n, c in CUT_SETS.items())}).",
+            default=-1.0, minimum=-1.0, maximum=1.0,
         ),
         ParamSpec(
             name="trkpid_min",
             description="good_trkpid threshold: keep tracks with TrkPID above "
-                        f"this. Default: pyfitter cut-set {CUT_SET}'s.",
-            default=TRKPID_MIN, minimum=0.0, maximum=1.0,
+                        "this. Negative (the default): cut_set's "
+                        f"({', '.join(f'{n} {c.trkpid_min:g}' for n, c in CUT_SETS.items())}).",
+            default=-1.0, minimum=-1.0, maximum=1.0,
         ),
     ),
     input_hint=(

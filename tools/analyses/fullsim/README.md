@@ -5,8 +5,8 @@ truth. Today there is one, `fullsim_sensitivity`, the full-simulation
 counterpart of `approx_ce_sensitivity`. It computes the same S/sqrt(B) in
 the best momentum window, with the same DIO and cosmic backgrounds, but
 measures the signal efficiency, shape and detector response from
-reconstructed CE mixed with pileup, after pyfitter's cut-set 80 CE-like
-cuts.
+reconstructed CE mixed with pileup, after a pyfitter CE-like cut set:
+`run1a_tsda` with a 540-1650 ns time window by default, or `80_1d`.
 The repo README.md, under `fullsim_sensitivity`, says how each step is
 computed.
 
@@ -16,7 +16,7 @@ computed.
 | `eventntuple.py` | the branch set and reader (`read_eventntuple`), trigger paths, surface ids and process codes, and `origin_codes`: what made each event's first track |
 | `normalization.py` | stopped mu- per POT from the stop chain's stage efficiencies, computed from their SAM datasets as `CreateSimEfficiency.sh` does (`sim_efficiencies`, `stopped_muons_per_pot`), and the captures/DIO per stopped mu-, as Production's `normalizations.py` |
 | `provenance.py` | events generated to make a file: `dh.gencount` of its nearest SAM ancestor that has one (`generated_events`) |
-| `cuts.py` | pyfitter's `Analyze.define_cuts` with cut-set `80_1d`'s thresholds, as track-level masks (`cut_masks`), the default set, toggling by name, and the cut flow |
+| `cuts.py` | pyfitter's `Analyze.define_cuts` with a cut set's thresholds (`CUT_SETS`: `run1a_tsda`, the default, and `80_1d`), as track-level masks (`cut_masks`), each set's default cuts and time window, toggling by name, and the cut flow |
 
 The window scan, DIO spectrum and cosmic normalization are imported from
 `approx_ce_sensitivity`. The signal and DIO normalization is Production's:
@@ -76,19 +76,27 @@ alone: 20000 events were generated and 8212 reached the ntuple (acceptance
 | `rmue` | 1e-13 | R_mue, relative to capture: the expected CE count is NPOT x `stopped_muons_per_pot` x 0.609 x `rmue`. |
 | `n_generated` | 0 (look up in SAM) | Events generated to make the inputs: the efficiency's denominator. |
 | `upstream_eff` | 1 | An extra efficiency factor for a loss `dh.gencount` does not count. Scales the signal and the DIO. |
-| `time_window` | `640,1650` | `t_low,t_high` (ns) a CE's time at the tracker front must fall in. The momentum window is scanned. |
+| `cut_set` | `run1a_tsda` | The pyfitter cut set: `run1a_tsda` (Run 1A selection, signed d0 in (-60, 94) mm, TSDA veto) or `80_1d`. Sets the thresholds, the default cuts and the default `time_window`. |
+| `time_window` | empty (the cut set's) | `t_low,t_high` (ns) a CE's time at the tracker front must fall in: 540,1650 for `run1a_tsda`, 640,1650 for `80_1d`. The momentum window is scanned. |
 | `trigger_paths` | `apr_TrkDe_80m70p, cpr_TrkDe_80m70p` | Paths for `or_trigger`: an event passes if any of them fired. With or without the `trig_` prefix. A path the file does not record is an error that lists the ones it does. |
 | `enable_cuts`, `disable_cuts` | empty | Comma-separated cut names to add to or drop from the default set. An unknown name is an error that lists the known ones. |
-| `trkqual_min`, `trkpid_min` | 0.155, 0.54 | Thresholds of `good_trkqual` and `good_trkpid` (cut-set `80_1d`'s). |
+| `trkqual_min`, `trkpid_min` | -1 (the cut set's) | Thresholds of `good_trkqual` and `good_trkpid`: 0.145, 0.574 for `run1a_tsda`; 0.155, 0.54 for `80_1d`. |
 
 ### Cuts
 
-pyfitter's cut-set 80 (`VERSION_CUTS['80_1d']` in pyfitter's `config.py`,
-applied as its `analyze.py` does), in pyfitter's order: `has_a_track`,
-`is_good_track`, `has_trk_front_seg`, `is_reco_electron_or_positron`,
-`has_downstream`, `charge_selection`, `or_trigger`, `upstream_veto`,
-`no_multi_trk_veto`, `good_trkpid`, `pz_over_pt`, `st_boundary`, `has_st`,
-`no_opa`, `good_trkqual`, `has_hits`, `within_t0err`, `no_crv_veto`. Its
+A pyfitter cut set (`VERSION_CUTS['run1a_tsda']` or `['80_1d']` in
+pyfitter's `config.py`, applied as its `analyze.py` does), in pyfitter's
+order: `has_a_track`, `is_good_track`, `has_trk_front_seg`,
+`is_reco_electron_or_positron`, `has_downstream`, `charge_selection`,
+`or_trigger`, `upstream_veto`, `no_multi_trk_veto`, `good_trkpid`,
+`pz_over_pt`, `within_d0`, `st_boundary`, `has_st`, `no_opa`, `no_tsda`,
+`good_trkqual`, `has_hits`, `within_t0err`, `no_crv_veto`. `within_d0`
+(the signed d0 = maxr - 2|rad| at the tracker front, as Mu2eEvtAna
+`Track_t::D0Front`) and `no_tsda` (`trk.tsdainter == 0`) are on for
+`run1a_tsda` and off, but available, for `80_1d`. A file without
+`trk.tsdainter` is refused when `no_tsda` is on. On the CE mix file above,
+`run1a_tsda`'s relative cut efficiencies match pyfitter's `au_run1a_tsda`
+cut flow within the file's statistics. Its
 fit ranges, `in_mom_range` (100-110 MeV/c) and `within_t0` (540-1650 ns),
 are available with `enable_cuts` but off by default: here the momentum
 window is scanned and the time window is `time_window`. With every cut on,

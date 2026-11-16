@@ -2777,16 +2777,16 @@ def test_stop_materials_names_the_file_in_a_list_that_lacks_the_histogram(tmp_di
 # --- fullsim_sensitivity -----------------------------------------------------
 
 def _seg(sid, time=900.0, p=(0.0, 85.0, 60.0), t0err=0.5, maxr=500.0, d0=50.0,
-         tandip=0.7):
+         tandip=0.7, rad=230.0):
     """One track segment and its loop-helix parameters. The default momentum
     is CE-like: |p| = 104 MeV/c, p_z/p_T = 0.71."""
     return ({"sid": sid, "time": time,
              "mom": {"fCoordinates": {"fX": p[0], "fY": p[1], "fZ": p[2]}}},
-            {"t0err": t0err, "maxr": maxr, "d0": d0, "tanDip": tandip})
+            {"t0err": t0err, "maxr": maxr, "d0": d0, "tanDip": tandip, "rad": rad})
 
 
 def _track(pdg=11, nactive=30, qual=0.9, pid=0.9, status=1, goodfit=1, segs=None,
-           sims=((168, 0, 10.0),)):
+           sims=((168, 0, 10.0),), tsdainter=0):
     """A track passing every default cut unless told otherwise: segments at
     the tracker front and middle, an ST boundary and the ST foils. `sims` are
     (startCode, gen, rho) for the track's particle, then its ancestors."""
@@ -2794,6 +2794,7 @@ def _track(pdg=11, nactive=30, qual=0.9, pid=0.9, status=1, goodfit=1, segs=None
         segs = [_seg(0), _seg(1), _seg(100), _seg(104)]
     return {"pdg": pdg, "nactive": nactive, "qual": qual, "pid": pid,
             "status": status, "goodfit": goodfit, "segs": segs,
+            "tsdainter": tsdainter,
             "sims": [{"startCode": code, "gen": gen,
                       "pos": {"fCoordinates": {"fX": rho, "fY": 0.0}},
                       "mom": {"fCoordinates": {"fX": 0.0, "fY": 84.0, "fZ": 63.0}}}
@@ -2828,7 +2829,8 @@ def _eventntuple(events):
                           "trk.status": [t["status"] for t in trks],
                           "trk.goodfit": [t["goodfit"] for t in trks],
                           "trkqual.result": [t["qual"] for t in trks],
-                          "trkpid.result": [t["pid"] for t in trks]}
+                          "trkpid.result": [t["pid"] for t in trks],
+                          "trk.tsdainter": [t["tsdainter"] for t in trks]}
                          for trks in tracks]),
         "trkfit": ak.Array([{"trksegs": [[s for s, _ in t["segs"]] for t in trks],
                              "trksegpars_lh": [[lh for _, lh in t["segs"]] for t in trks]}
@@ -2852,7 +2854,7 @@ def test_fullsim_each_default_cut_rejects_what_it_should():
         (["is_good_track"], {"tracks": [_track(status=-1)]}),
         (["is_good_track"], {"tracks": [_track(goodfit=0)]}),
         # without a front segment there is no direction or tan(dip) either
-        (["has_downstream", "has_trk_front_seg", "pz_over_pt"],
+        (["has_downstream", "has_trk_front_seg", "pz_over_pt", "within_d0"],
          {"tracks": [_track(segs=[mid, boundary, foils])]}),
         (["charge_selection", "is_reco_electron_or_positron"], {"tracks": [_track(pdg=13)]}),
         (["has_downstream"],
@@ -2867,7 +2869,7 @@ def test_fullsim_each_default_cut_rejects_what_it_should():
         (["has_st"], {"tracks": [_track(segs=[front, mid, boundary])]}),
         (["no_opa"], {"tracks": [_track(segs=[front, mid, boundary, foils, _seg(95)])]}),
         (["good_trkqual"], {"tracks": [_track(qual=0.1)]}),
-        (["has_hits"], {"tracks": [_track(nactive=19)]}),
+        (["has_hits"], {"tracks": [_track(nactive=16)]}),
         # t0err counts at the tracker middle, not the front
         (["within_t0err"],
          {"tracks": [_track(segs=[front, _seg(1, t0err=1.0), boundary, foils])]}),
@@ -2938,6 +2940,64 @@ def test_fullsim_active_cuts_toggle_by_name_and_refuse_unknown_ones():
         assert "Known:" in str(exc), exc
     else:
         raise AssertionError("not_a_cut was accepted")
+
+
+def test_fullsim_run1a_tsda_is_the_default_with_its_thresholds_d0_and_tsda_veto():
+    assert fs_cuts.CUT_SET == "run1a_tsda"
+    run1a = fs_cuts.DEFAULT_CUTS
+    assert run1a == fs_cuts.default_cuts("run1a_tsda")
+    # within_d0 after pz_over_pt, no_tsda after no_opa, as pyfitter
+    assert run1a.index("within_d0") == run1a.index("pz_over_pt") + 1
+    assert run1a.index("no_tsda") == run1a.index("no_opa") + 1
+    # 80_1d keeps the selection it always had
+    old = fs_cuts.default_cuts("80_1d")
+    assert "within_d0" not in old and "no_tsda" not in old
+    assert fs_cuts.CUT_SETS["run1a_tsda"].time_window_ns == (540.0, 1650.0)
+    assert fs_cuts.CUT_SETS["80_1d"].time_window_ns == (640.0, 1650.0)
+
+    def seg0(**kw):
+        return [_seg(0, **kw), _seg(1), _seg(100), _seg(104)]
+    # d0 = maxr - 2|rad| = 500 - 2 rad: (-60, 94) is rad in (203, 280)
+    assert _failed_cuts({"tracks": [_track(segs=seg0(rad=200.0))]}) == ["within_d0"]
+    assert _failed_cuts({"tracks": [_track(segs=seg0(rad=300.0))]}) == ["within_d0"]
+    # d0 is taken at the tracker front, not elsewhere
+    other = [_seg(0), _seg(1, rad=300.0), _seg(100), _seg(104)]
+    assert _failed_cuts({"tracks": [_track(segs=other)]}) == []
+    assert _failed_cuts({"tracks": [_track(tsdainter=1)]}) == ["no_tsda"]
+    # run1a's thresholds, not 80_1d's
+    assert _failed_cuts({"tracks": [_track(nactive=17)]}) == []          # 17, not 20
+    assert _failed_cuts({"tracks": [_track(qual=0.15)]}) == []           # 0.145, not 0.155
+    assert _failed_cuts({"tracks": [_track(pid=0.56)]}) == ["good_trkpid"]  # 0.574, not 0.54
+    assert _failed_cuts({"tracks": [_track(segs=seg0(tandip=0.86))]}) == []  # < 0.8787
+    t0err = [_seg(0), _seg(1, t0err=0.83), _seg(100), _seg(104)]
+    assert _failed_cuts({"tracks": [_track(segs=t0err)]}) == ["within_t0err"]  # 0.81
+    # and 80_1d's on request
+    masks = fs_cuts.cut_masks(_eventntuple([{"tracks": [_track(nactive=17)]}]),
+                              "minus", cut_set="80_1d")
+    assert not masks["has_hits"][0][0]
+
+
+def test_fullsim_a_cut_without_its_branch_is_refused_not_skipped():
+    import awkward as ak
+    data = _eventntuple([{"tracks": [_track()]}])
+    data["trk"] = data["trk"][[f for f in ak.fields(data["trk"])
+                               if f != "trk.tsdainter"]]
+    masks = fs_cuts.cut_masks(data, "minus")
+    assert "no_tsda" not in masks
+    try:
+        fs_cuts.apply_cuts(masks, fs_cuts.active_cuts("", ""), data["trk"]["trk.pdg"])
+    except fs_cuts.CutError as exc:
+        assert "trk.tsdainter" in str(exc), exc
+    else:
+        raise AssertionError("no_tsda without trk.tsdainter was accepted")
+    # 80_1d does not need it
+    fs_cuts.apply_cuts(masks, fs_cuts.active_cuts("", "", "80_1d"), data["trk"]["trk.pdg"])
+    try:
+        fs_cuts.active_cuts("", "", "not_a_set")
+    except fs_cuts.CutError as exc:
+        assert "run1a_tsda" in str(exc), exc
+    else:
+        raise AssertionError("an unknown cut set was accepted")
 
 
 def test_fullsim_origin_is_the_first_classified_particle_in_the_chain():
@@ -3246,7 +3306,8 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
     # no network
     from tools.analyses.fullsim import normalization as norm
     generated = {"n_generated": 20000,
-                 "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
+                 "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT,
+                 "cut_set": "80_1d"}
     result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                           output_dir=tmp_dir, parameters=generated)
     assert result.status == "success", result.message
@@ -3279,6 +3340,22 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
     few = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                        output_dir=tmp_dir, parameters={**generated, "n_generated": 100})
     assert few.status == "error" and "n_generated 100" in few.message
+    # the default, run1a_tsda with 540-1650 ns: its relative cut efficiencies
+    # match pyfitter's au_run1a_tsda CeM_mix cut flow within this file's
+    # statistics (good_trkpid 89.9 vs 89.7%, within_d0 92.9 vs 92.9%,
+    # no_tsda 99.6 vs 99.3%, good_trkqual 97.7 vs 97.7%)
+    del generated["cut_set"]
+    run1a = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                         output_dir=tmp_dir, parameters=generated)
+    assert run1a.status == "success", run1a.message
+    rm = run1a.metadata
+    assert rm["cut_set"] == "run1a_tsda" and rm["time_window"] == [540.0, 1650.0]
+    assert (rm["n_events_selected"], rm["n_events_counted"]) == (4243, 3595)
+    assert np.isclose(rm["signal_efficiency"], 3595 / 20000)
+    assert rm["cut_flow"]["within_d0"] == 4499 and rm["cut_flow"]["no_tsda"] == 4355
+    assert rm["cut_flow"]["good_trkpid"] == 6209 and rm["cut_flow"]["pz_over_pt"] == 4841
+    assert np.isclose(rm["signal_time_low_ns"], 540.0)
+    assert np.isclose(rm["sensitivity"], 4.0711, rtol=1e-4)
 
 
 # --- occupancy (OccupancyAna: digi and reco from a job, ntuple from a file) ---------

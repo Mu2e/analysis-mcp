@@ -83,7 +83,7 @@ tools/
     edep_occupancy_combine.py  adds those histograms over pileup components
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
-      cuts.py                  the CE-like track cuts (pyfitter cut-set 80)
+      cuts.py                  the CE-like track cuts (pyfitter cut sets run1a_tsda, 80_1d)
       sensitivity.py           fullsim_sensitivity: S/sqrt(B) in the best window
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
@@ -1187,13 +1187,16 @@ mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
 `/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/MDC2025au_best_v1_1-001/`.
 `fullsim/README.md` says how to run it.
 
-1. **Cuts**: pyfitter's cut-set 80 (`80_1d`), track by track, as its
+1. **Cuts**: a pyfitter cut set (`cut_set`), track by track, as its
    `Analyze.define_cuts` applies them and in its order (`fullsim/cuts.py`).
-   On by default: every cut pyfitter switches on except its fit ranges
-   (`in_mom_range`, `within_t0`), which the momentum scan and `time_window`
-   stand in for. Add or drop cuts by name with `enable_cuts` /
-   `disable_cuts`, and move the `trkqual_min` / `trkpid_min` thresholds
-   (default 0.155 and 0.54). `or_trigger` passes an event that any of
+   The default, `run1a_tsda`, is the Run 1A track selection with the
+   signed-d0 window and the TSDA veto (ConvAna set 79) and a 540-1650 ns
+   time window (pyfitter's `within_t0_540`); `80_1d` is cut-set 80 with
+   640-1650 ns. On by default: every cut pyfitter switches on for the set
+   except its fit ranges (`in_mom_range`, `within_t0`), which the momentum
+   scan and `time_window` stand in for. Add or drop cuts by name with
+   `enable_cuts` / `disable_cuts`, and move the `trkqual_min` / `trkpid_min`
+   thresholds (default: the set's, 0.145 and 0.574 for `run1a_tsda`). `or_trigger` passes an event that any of
    `trigger_paths` accepted, by default the production tracker paths
    `apr_TrkDe_80m70p` or `cpr_TrkDe_80m70p`, as in pyfitter. With every cut
    on, the cut flow on a CE mix file matches pyfitter's cut for cut. The cut
@@ -1202,7 +1205,8 @@ mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
    first selected track: momentum and time at the tracker front, MC origin,
    and true momentum at birth. An event whose first track has more than one
    front segment is not counted, as in pyCount. The signal is the true CE
-   among these with a time inside `time_window` (default 640-1650 ns, open),
+   among these with a time inside `time_window` (default the cut set's:
+   540-1650 ns for `run1a_tsda`, 640-1650 ns for `80_1d`; open),
    so a pileup track passing the cuts is not signal. Their reconstructed
    momentum, binned as `approx_ce_sensitivity`'s signal (0.2 MeV/c), is
    scaled as Production's `normalizations.py` has it: NPOT x
