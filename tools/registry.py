@@ -22,7 +22,8 @@ _ANALYSIS_MODULES = ("edep", "count", "muon_stop_rate", "approx_ce_sensitivity",
                      "variable_comparison_ntuple",
                      "occupancy_digi", "occupancy_reco", "occupancy_ntuple",
                      "fullsim.sensitivity", "total_edep_per_pot",
-                     "edep_occupancy", "edep_occupancy_combine")
+                     "edep_occupancy", "edep_occupancy_combine",
+                     "optimize_selection_ntuple")
 
 
 def _load() -> dict[str, AnalysisSpec]:

@@ -5652,6 +5652,470 @@ def test_box_plot_nominal_cosmics_carry_the_tsda_veto():
         assert panels[name]["nominal"].sum() < 0.9 * plain[name]["nominal"].sum(), name
 
 
+# --- optimize.py tests -------------------------------------------------------
+
+from tools.analyses import optimize as optmod
+from tools.analyses.optimize import (
+    BOTH, CutVar, CutVarSpecError, Events, FOM_FUNCTIONS, LEFT, RIGHT, VETO,
+    apply_seed_to_vars, asimov_z, best_on_path, build_cut_string,
+    evaluate_yields, evaluate_yields_mask, expected_ul_events,
+    inv_expected_limit, make_discrete, multi_start_optimize,
+    parse_cut_var_specs, parse_seed_selections, passes_cut, punzi_fom,
+    random_grid_search, refine, run_greedy, s_over_sqrt_b,
+)
+
+
+def _synth_events(n=500, seed=42):
+    """Synthetic signal (Gaussian blob) + background (flat) in two variables."""
+    rng = np.random.default_rng(seed)
+    # Signal: Gaussian at x=5, y=5
+    n_sig = n // 2
+    n_bkg = n - n_sig
+    xs = np.concatenate([rng.normal(5.0, 1.0, n_sig),
+                         rng.uniform(0.0, 10.0, n_bkg)])
+    ys = np.concatenate([rng.normal(5.0, 1.0, n_sig),
+                         rng.uniform(0.0, 10.0, n_bkg)])
+    w_sig = np.concatenate([np.ones(n_sig), np.zeros(n_bkg)])
+    w_bkg = np.concatenate([np.zeros(n_sig), np.ones(n_bkg)])
+    ev = Events(
+        vals={"x": xs, "y": ys},
+        w_sig=w_sig, w_bkg=w_bkg,
+        event_numbers=np.arange(n, dtype=float),
+    )
+    ev.prepare()
+    return ev
+
+
+def _synth_cuts():
+    return [CutVar("x", 0.0, 10.0, cut_type=BOTH),
+            CutVar("y", 0.0, 10.0, cut_type=BOTH)]
+
+
+# -- CutVar --
+
+def test_optimize_cutvar_defaults():
+    cv = CutVar("x", 0.0, 10.0)
+    assert cv.cut_lo == 0.0 and cv.cut_hi == 10.0
+    assert cv.cut_type == BOTH
+    assert not cv.applied
+
+
+def test_optimize_cutvar_veto_defaults():
+    cv = CutVar("x", 0.0, 10.0, cut_type=VETO)
+    assert cv.cut_lo == 5.0 and cv.cut_hi == 5.0  # starts empty at midpoint
+
+
+def test_optimize_cutvar_veto_with_seed():
+    cv = CutVar("x", 0.0, 10.0, cut_lo=3.0, cut_hi=3.0, cut_type=VETO)
+    assert cv.cut_lo == 3.0 and cv.cut_hi == 3.0
+
+
+def test_optimize_make_discrete():
+    cv = make_discrete("n", 10, 60, LEFT)
+    assert cv.discrete
+    assert cv.lo == 9.5 and cv.hi == 60.5
+
+
+def test_optimize_cutvar_bad_type():
+    raised = False
+    try:
+        CutVar("x", 0.0, 1.0, cut_type="bogus")
+    except ValueError:
+        raised = True
+    assert raised
+
+
+# -- passes_cut --
+
+def test_optimize_passes_cut_both():
+    cv = CutVar("x", 2.0, 8.0, cut_lo=3.0, cut_hi=7.0, applied=True)
+    vals = np.array([1.0, 3.5, 5.0, 7.5, 10.0])
+    mask = passes_cut(cv, vals)
+    assert list(mask) == [False, True, True, False, False]
+
+
+def test_optimize_passes_cut_left():
+    cv = CutVar("x", 0.0, 10.0, cut_lo=3.0, cut_type=LEFT, applied=True)
+    vals = np.array([1.0, 3.5, 5.0])
+    mask = passes_cut(cv, vals)
+    assert list(mask) == [False, True, True]
+
+
+def test_optimize_passes_cut_right():
+    cv = CutVar("x", 0.0, 10.0, cut_hi=7.0, cut_type=RIGHT, applied=True)
+    vals = np.array([1.0, 5.0, 8.0])
+    mask = passes_cut(cv, vals)
+    assert list(mask) == [True, True, False]
+
+
+def test_optimize_passes_cut_veto():
+    cv = CutVar("x", 0.0, 10.0, cut_lo=3.0, cut_hi=7.0, cut_type=VETO,
+                applied=True)
+    vals = np.array([1.0, 5.0, 8.0])
+    mask = passes_cut(cv, vals)
+    assert list(mask) == [True, False, True]
+
+
+def test_optimize_passes_cut_unapplied():
+    cv = CutVar("x", 2.0, 8.0, cut_lo=3.0, cut_hi=7.0, applied=False)
+    vals = np.array([1.0, 5.0, 10.0])
+    assert all(passes_cut(cv, vals))
+
+
+# -- Events --
+
+def test_optimize_events_prepare_and_size():
+    ev = _synth_events(100)
+    assert ev.size == 100
+    assert "x" in ev.sort_indices and "y" in ev.sort_indices
+    # Sort indices are permutations
+    for name in ("x", "y"):
+        assert len(ev.sort_indices[name]) == 100
+        assert set(ev.sort_indices[name]) == set(range(100))
+
+
+def test_optimize_events_split():
+    ev = _synth_events(200)
+    train, test = ev.split()
+    assert train.size + test.size == ev.size
+    # Weights doubled
+    assert train.w_sig.sum() + test.w_sig.sum() == 2.0 * ev.w_sig.sum()
+    # Indices prepared
+    assert "x" in train.sort_indices and "x" in test.sort_indices
+
+
+# -- Figures of merit --
+
+def test_optimize_s_over_sqrt_b():
+    assert s_over_sqrt_b(10.0, 100.0) == 1.0
+    assert s_over_sqrt_b(0.0, 100.0) == 0.0
+    assert s_over_sqrt_b(10.0, 0.0) == 0.0
+
+
+def test_optimize_asimov_z():
+    # At B → 0, sqrt(2S)
+    assert abs(asimov_z(10.0, 0.0) - math.sqrt(20.0)) < 1e-6
+    assert asimov_z(0.0, 100.0) == 0.0
+    # With both S and B
+    z = asimov_z(10.0, 100.0)
+    assert z > 0
+
+
+def test_optimize_punzi_fom():
+    assert punzi_fom(0.0, 100.0) == 0.0
+    p = punzi_fom(10.0, 100.0)
+    assert abs(p - 10.0 / (0.64 + 10.0)) < 1e-6
+
+
+def test_optimize_expected_ul_events():
+    # At B=0, should be the CLs limit for n=0
+    ul0 = expected_ul_events(0.0)
+    assert ul0 > 0
+    # At larger B, the limit grows
+    assert expected_ul_events(10.0) > ul0
+
+
+def test_optimize_inv_expected_limit():
+    assert inv_expected_limit(0.0, 10.0) == 0.0
+    # S / N_UL(B) for a reasonable B
+    val = inv_expected_limit(5.0, 10.0)
+    assert val > 0 and val < 5.0  # less than S since N_UL > 1
+
+
+# -- evaluate_yields --
+
+def test_optimize_evaluate_yields():
+    ev = _synth_events(100)
+    cuts = _synth_cuts()
+    n_sig, n_bkg = evaluate_yields(cuts, ev)
+    # No cuts applied, should sum to all signal and all background
+    assert n_sig == ev.w_sig.sum()
+    assert n_bkg == ev.w_bkg.sum()
+
+
+def test_optimize_evaluate_yields_with_cut():
+    ev = _synth_events(100)
+    cuts = _synth_cuts()
+    cuts[0].cut_lo = 4.0
+    cuts[0].cut_hi = 6.0
+    cuts[0].applied = True
+    n_sig, n_bkg = evaluate_yields(cuts, ev)
+    assert n_sig <= ev.w_sig.sum()
+    assert n_bkg <= ev.w_bkg.sum()
+    # The window around the signal peak should keep more signal fraction
+    # than background fraction
+    sig_frac = n_sig / ev.w_sig.sum()
+    bkg_frac = n_bkg / ev.w_bkg.sum()
+    assert sig_frac > bkg_frac
+
+
+def test_optimize_evaluate_yields_mask():
+    ev = _synth_events(100)
+    cuts = _synth_cuts()
+    cuts[0].cut_lo = 4.0
+    cuts[0].cut_hi = 6.0
+    cuts[0].applied = True
+    n_sig, n_bkg, mask = evaluate_yields_mask(cuts, ev)
+    assert mask.sum() < ev.size
+    assert mask.dtype == bool
+
+
+# -- build_cut_string --
+
+def test_optimize_build_cut_string_no_cuts():
+    cuts = _synth_cuts()
+    assert build_cut_string(cuts) == "(1)"
+
+
+def test_optimize_build_cut_string_applied():
+    cuts = _synth_cuts()
+    cuts[0].cut_lo = 3.0
+    cuts[0].cut_hi = 7.0
+    cuts[0].applied = True
+    s = build_cut_string(cuts)
+    assert "x > 3" in s and "x < 7" in s
+
+
+def test_optimize_build_cut_string_veto():
+    cv = CutVar("z", 0.0, 10.0, cut_lo=3.0, cut_hi=7.0, cut_type=VETO,
+                applied=True)
+    s = build_cut_string([cv])
+    assert "z < 3" in s and "z > 7" in s
+
+
+def test_optimize_build_cut_string_left_right():
+    cuts = [
+        CutVar("a", 0.0, 10.0, cut_lo=3.0, cut_type=LEFT, applied=True),
+        CutVar("b", 0.0, 10.0, cut_hi=7.0, cut_type=RIGHT, applied=True),
+    ]
+    s = build_cut_string(cuts)
+    assert "a > 3" in s and "b < 7" in s
+
+
+# -- parse_cut_var_specs --
+
+def test_optimize_parse_cut_var_specs_basic():
+    specs = parse_cut_var_specs("x:both:0:10, y:left:0:1")
+    assert len(specs) == 2
+    assert specs[0].name == "x" and specs[0].cut_type == BOTH
+    assert specs[0].lo == 0.0 and specs[0].hi == 10.0
+    assert specs[1].name == "y" and specs[1].cut_type == LEFT
+
+
+def test_optimize_parse_cut_var_specs_discrete():
+    specs = parse_cut_var_specs("n:left:10:60:discrete")
+    assert len(specs) == 1
+    assert specs[0].discrete
+    assert specs[0].lo == 9.5 and specs[0].hi == 60.5
+
+
+def test_optimize_parse_cut_var_specs_with_seed():
+    specs = parse_cut_var_specs("x:both:0:10:3:7")
+    assert specs[0].cut_lo == 3.0 and specs[0].cut_hi == 7.0
+
+
+def test_optimize_parse_cut_var_specs_veto():
+    specs = parse_cut_var_specs("dt:veto:-150:150:-10:-10")
+    assert specs[0].cut_type == VETO
+    assert specs[0].cut_lo == -10.0 and specs[0].cut_hi == -10.0
+
+
+def test_optimize_parse_cut_var_specs_errors():
+    for bad in ("", "x:bogus:0:10", "x:both", "x:both:5:3"):
+        raised = False
+        try:
+            parse_cut_var_specs(bad)
+        except CutVarSpecError:
+            raised = True
+        assert raised, f"expected CutVarSpecError for {bad!r}"
+
+
+# -- parse_seed_selections --
+
+def test_optimize_parse_seed_selections():
+    seeds = parse_seed_selections("x:3:7,y:4:6; x:2:8", ["x", "y"])
+    assert len(seeds) == 2
+    assert "x" in seeds[0] and "y" in seeds[0]
+    assert seeds[1]["x"] == (2.0, 8.0)
+
+
+def test_optimize_parse_seed_selections_empty():
+    assert parse_seed_selections("", ["x"]) == []
+
+
+def test_optimize_parse_seed_selections_unknown_var():
+    raised = False
+    try:
+        parse_seed_selections("z:0:1", ["x", "y"])
+    except CutVarSpecError:
+        raised = True
+    assert raised
+
+
+# -- apply_seed_to_vars --
+
+def test_optimize_apply_seed_to_vars():
+    cuts = _synth_cuts()
+    seed = {"x": (3.0, 7.0)}
+    result = apply_seed_to_vars(cuts, seed)
+    assert result[0].cut_lo == 3.0 and result[0].cut_hi == 7.0
+    assert result[0].applied
+    assert not result[1].applied  # y unchanged
+
+
+# -- greedy optimization --
+
+def test_optimize_greedy_path():
+    ev = _synth_events(500)
+    cuts = _synth_cuts()
+    n_sig_ref = ev.w_sig.sum()
+    path = run_greedy(cuts, ev, n_sig_ref, 0.02, 0.3, s_over_sqrt_b)
+    assert len(path) > 0
+    # FoM should improve along the path initially
+    fom_0 = s_over_sqrt_b(n_sig_ref, ev.w_bkg.sum())
+    best = best_on_path(path, s_over_sqrt_b)
+    assert s_over_sqrt_b(best.n_sig, best.n_bkg) >= fom_0
+
+
+def test_optimize_greedy_path_with_rng():
+    ev = _synth_events(500)
+    cuts = _synth_cuts()
+    rng = np.random.default_rng(99)
+    path = run_greedy(cuts, ev, ev.w_sig.sum(), 0.02, 0.3,
+                      s_over_sqrt_b, rng=rng, top_k=3)
+    assert len(path) > 0
+
+
+# -- random grid search --
+
+def test_optimize_random_grid_search():
+    ev = _synth_events(200)
+    cuts = _synth_cuts()
+    results = random_grid_search(cuts, ev, 100, s_over_sqrt_b)
+    assert len(results) > 0
+    for r in results:
+        assert 0.0 <= r["eff"] <= 1.0
+        assert "n_sig" in r and "n_bkg" in r
+        assert "fom" in r
+
+
+# -- local refinement --
+
+def test_optimize_refine():
+    ev = _synth_events(500)
+    cuts = _synth_cuts()
+    # Start with a reasonable selection
+    cuts[0].cut_lo = 3.0
+    cuts[0].cut_hi = 7.0
+    cuts[0].applied = True
+    n_sig_before, n_bkg_before = evaluate_yields(cuts, ev)
+    fom_before = s_over_sqrt_b(n_sig_before, n_bkg_before)
+    result = refine(cuts, ev, 0.02, s_over_sqrt_b, max_iter=20)
+    fom_after = s_over_sqrt_b(result.n_sig, result.n_bkg)
+    # Refinement should not make it worse
+    assert fom_after >= fom_before * 0.999
+
+
+# -- multi-start optimization --
+
+def test_optimize_multi_start():
+    ev = _synth_events(500)
+    cuts = _synth_cuts()
+    result = multi_start_optimize(cuts, ev, 0.02, 0.3, s_over_sqrt_b,
+                                  n_random=2)
+    assert result["best"] is not None
+    assert len(result["greedy_path"]) > 0
+    assert len(result["starts"]) >= 1  # at least greedy
+    # Best should have better FoM than the baseline
+    n_sig_0 = result["n_sig_ref"]
+    n_bkg_0 = result["n_bkg_ref"]
+    fom_0 = s_over_sqrt_b(n_sig_0, n_bkg_0)
+    best = result["best"]
+    assert s_over_sqrt_b(best.n_sig, best.n_bkg) >= fom_0
+
+
+def test_optimize_multi_start_with_seed():
+    ev = _synth_events(500)
+    cuts = _synth_cuts()
+    seed = [CutVar("x", 0.0, 10.0, cut_lo=4.0, cut_hi=6.0, applied=True),
+            CutVar("y", 0.0, 10.0, cut_lo=4.0, cut_hi=6.0, applied=True)]
+    result = multi_start_optimize(cuts, ev, 0.02, 0.3, s_over_sqrt_b,
+                                  seeds=[seed], n_random=1)
+    assert result["best"] is not None
+    # Should have at least greedy + seed + 1 random = 3 starts
+    assert len(result["starts"]) >= 3
+
+
+# -- all FoM functions are registered --
+
+def test_optimize_fom_registry():
+    for name, func in FOM_FUNCTIONS.items():
+        assert callable(func)
+        # Each should return a float for a simple input
+        result = func(10.0, 100.0)
+        assert isinstance(result, float) and result >= 0
+
+
+# -- file labels and component weights --
+
+from tools.analyses.optimize_selection_ntuple import (
+    OptimizeError, parse_component_weights, parse_file_labels,
+)
+
+
+def test_optimize_parse_file_labels():
+    labels = parse_file_labels("signal, DIO, cosmic", 3)
+    assert labels == ["signal", "DIO", "cosmic"]
+
+
+def test_optimize_parse_file_labels_empty():
+    assert parse_file_labels("", 3) == []
+
+
+def test_optimize_parse_file_labels_mismatch():
+    raised = False
+    try:
+        parse_file_labels("signal, DIO", 3)
+    except OptimizeError:
+        raised = True
+    assert raised
+
+
+def test_optimize_parse_component_weights():
+    cw = parse_component_weights("signal:1.0, DIO:0.5, cosmic:0.01")
+    assert cw == {"signal": 1.0, "DIO": 0.5, "cosmic": 0.01}
+
+
+def test_optimize_parse_component_weights_empty():
+    assert parse_component_weights("") == {}
+
+
+def test_optimize_parse_component_weights_bad_format():
+    raised = False
+    try:
+        parse_component_weights("signal 1.0")
+    except OptimizeError:
+        raised = True
+    assert raised
+
+
+# -- the SPEC is registered --
+
+def test_optimize_selection_ntuple_registered():
+    assert "optimize_selection_ntuple" in ANALYSES
+    spec = ANALYSES["optimize_selection_ntuple"]
+    assert spec.input_kind == "root_file"
+    assert spec.combines_files
+    assert "best_fom" in spec.metrics
+    assert any(p.name == "file_labels" for p in spec.parameters)
+    assert any(p.name == "signal_label" for p in spec.parameters)
+    assert any(p.name == "signal_selection" for p in spec.parameters)
+    assert any(p.name == "component_weights" for p in spec.parameters)
+    assert any(p.name == "optimize_variables" for p in spec.parameters)
+    assert any(p.name == "fom" for p in spec.parameters)
+    assert any(p.name == "seed_selections" for p in spec.parameters)
+
+
 def main() -> int:
     import tempfile
     import traceback
