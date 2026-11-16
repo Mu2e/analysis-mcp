@@ -16,6 +16,9 @@ computed.
 | `eventntuple.py` | the branch set and reader (`read_eventntuple`), trigger paths, surface ids and process codes, and `origin_codes`: what made each event's first track |
 | `normalization.py` | stopped mu- per POT from the stop chain's stage efficiencies, computed from their SAM datasets as `CreateSimEfficiency.sh` does (`sim_efficiencies`, `stopped_muons_per_pot`), and the captures/DIO per stopped mu-, as Production's `normalizations.py` |
 | `provenance.py` | events generated to make a file: `dh.gencount` of its nearest SAM ancestor that has one (`generated_events`) |
+| `optimize.py` | the rectangular-cut search of `cut_mode="optimize"`: a numpy port of M. MacKenzie's `optimize_selection_fast.C` (greedy path, randomized paths, local search; even events choose, odd events report), on the Punzi FoM. Knows nothing about Mu2e |
+| `tune.py` | the optimize mode's table: the preselection's first track per event, the tuned variables, signal and per-event DIO weights in 0.1 MeV bins, the cosmic rows; the momentum-window scan and the window/cut alternation |
+| `cosmic_reference.py` | the fixed cosmic reference table the optimize mode reads (`data/fullsim_cosmic_reference.npz`, made by `scripts/make_fullsim_cosmic_reference.py`), and its normalization |
 | `cuts.py` | pyfitter's `Analyze.define_cuts` with a cut set's thresholds (`CUT_SETS`: `run1a_tsda`, the default, and `80_1d`), as track-level masks (`cut_masks`), each set's default cuts and time window, toggling by name, and the cut flow |
 
 The window scan, DIO spectrum and cosmic normalization are imported from
@@ -132,6 +135,63 @@ In `output_dir`:
 | `n_events_generated`, `acceptance` | events generated for the inputs, and the fraction of them that reached the ntuple |
 | `n_files`, `npot`, `upstream_eff`, `cosmic_rate_per_s_per_mev`, `stopped_muons_per_pot`, `rmue` | the inputs behind the numbers |
 | `n_stopped_muons`, `n_conversions` | stopped mu- for `npot`, and the CE they give at `rmue` before any efficiency |
+| `opt_*` | `cut_mode="optimize"` only, -1 otherwise: see below |
+
+### Tuning the selection: `cut_mode="optimize"`
+
+With `cut_mode="optimize"` the fixed result above is reported unchanged, and
+the selection is also tuned on the inputs:
+
+- **Preselection**: the cut set's vetoes and requirements (trigger, upstream
+  and multi-track vetoes, a calorimeter cluster, no OPA, no TSDA, CRV) and
+  its time window, fixed. The stopping-target cuts are dropped, as in
+  M. MacKenzie's `optimize_target_selection_fast`: they assume the standard
+  target. The time window is not tuned: it stands against radiative pion
+  captures and the beam flash, which this background model does not hold.
+- **Tuned**: rectangular cuts on cos(theta) (from tan(dip)), R(max), signed
+  d0, TrkQual, TrkPID, t0err and N(active), from the cut set's thresholds,
+  and the momentum window, alternating with the cuts.
+- **Signal**: the inputs' true CE, as in the fixed mode.
+- **DIO**: each CE event, with its own momentum change, stands in for a DIO
+  electron: its DIO weight is the theory spectrum integrated over the true
+  energies that land in the window. Summed over events this is the fixed
+  mode's folded DIO; per event it passes or fails the cuts with its CE.
+- **Cosmics**: a fixed reference sample reconstructed like the inputs
+  (`cosmic_reference`), flat over 100-110 MeV/c and scaled to the window,
+  normalized so that the loose set-81 selection gives the loose cosmic rate
+  `approx_ce_sensitivity` uses in box mode.
+- **Search**: the macro's greedy path and five randomized paths from no cut,
+  the cut set and the previous round as further starts, each refined by a
+  local search; on the Punzi FoM `S/(1.28/2 + sqrt(B))`. Cuts and window
+  are chosen on even event numbers and every `opt_*` FoM below is on odd
+  ones, so the gain is not the search's own optimism.
+
+| metric | what it is |
+|---|---|
+| `opt_punzi_test`, `opt_punzi_train` | Punzi FoM of the tuned selection on the odd (reported) and even (chosen) events |
+| `opt_seed_punzi_test`, `opt_seed_punzi_train` | the same for the cut set's own selection (no stopping-target cuts) in its best window |
+| `opt_gain_test` | `opt_punzi_test / opt_seed_punzi_test` |
+| `opt_signal_test`, `opt_background_test`, `opt_seed_*` | S and B behind them, for `npot` |
+| `opt_window_*_mevc`, `opt_seed_window_*_mevc` | the momentum windows |
+| `opt_cut_<var>_low`, `opt_cut_<var>_high` | the tuned cuts; an edge never placed reads as its search range's end |
+| `opt_n_ce_rows`, `opt_n_cosmic_rows` | CE and cosmic rows of the table |
+
+The search was checked against the macro itself: on the macro's own
+in-memory table for `st37plus6up6dn` (dumped from it), the port finds S/sqrt(B)
+2.296 (train) and 2.443 (test) against the macro's 2.299 and 2.451, with the
+same cuts within their flat directions.
+
+The reference must be reconstructed with the same code and conditions as the
+inputs (TrkQual and TrkPID are MVAs that change between releases). Make it
+from the CRY signal-region cosmics, `dts.mu2e.CosmicSignal.MDC2025ap.art`,
+run through the inputs' own reconstruction, then:
+
+```bash
+python3 scripts/make_fullsim_cosmic_reference.py --files 'nts.*.root' \
+    --reco '<code tarball, conditions, run>' --out data/fullsim_cosmic_reference.npz
+```
+
+Its sidecar `.json` records how; every optimized result reports it.
 
 ### Stopped muons per POT for another campaign
 
@@ -209,4 +269,8 @@ POT and the signal/DIO/cosmic normalization on
 synthetic events. When the CeMLeadingLogMix1BB file above is on disk it
 also checks pyfitter's cut flow, the measured efficiency, the window and
 the acceptance and `upstream_eff` scaling on it (with `n_generated`
-given, so it needs no network).
+given, so it needs no network). The optimize mode's search is tested on toy
+tables (the obvious cuts, unplaced edges, half-integer edges, tiny DIO
+weights beside large cosmic ones), its DIO weights against the spectrum, the
+reference's normalization, and, on the CE mix file, a full run with a toy
+reference.

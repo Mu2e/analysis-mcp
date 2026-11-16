@@ -6378,6 +6378,165 @@ def test_optimize_selection_ntuple_registered():
     assert spec.units  # units are declared
 
 
+# --- fullsim cut_mode="optimize" (optimize.py, tune.py, cosmic_reference.py) ---
+
+from tools.analyses.fullsim import optimize as fs_opt
+from tools.analyses.fullsim import tune as fs_tune
+from tools.analyses.fullsim import cosmic_reference as fs_ref
+
+
+def _toy_table(seed=1, ns=3000, nb=12000):
+    """Signal peaked in x and at high q, background flat: the best cuts are
+    obvious, so a search that misses them is broken."""
+    rng = np.random.default_rng(seed)
+    x = np.r_[rng.normal(0, 1, ns), rng.uniform(-5, 5, nb)]
+    q = np.r_[rng.beta(5, 1, ns), rng.uniform(0, 1, nb)]
+    n = np.r_[np.round(rng.normal(30, 5, ns)), rng.integers(10, 61, nb)].astype(float)
+    sw = np.r_[np.full(ns, 5.0 / ns), np.zeros(nb)]
+    bw = np.r_[np.zeros(ns), np.full(nb, 20.0 / nb)]
+    return fs_opt.Table.from_columns({"x": x, "q": q, "n": n}, sw, bw, np.arange(ns + nb))
+
+
+TOY_VARIABLES = (fs_opt.Variable("x", -5, 5), fs_opt.Variable("q", 0, 1, "low"),
+                 fs_opt.Variable("n", 9.5, 60.5, "both", discrete=True))
+
+
+def test_fullsim_optimize_finds_the_obvious_cuts_and_reports_the_held_out_half():
+    table = _toy_table()
+    r = fs_opt.optimize(table, TOY_VARIABLES, {}, n_random=2)
+    lo, hi = r.best.cuts["x"]
+    assert -2.5 < lo < -1.0 and 1.0 < hi < 2.5, r.best.cuts
+    assert 0.3 < r.best.cuts["q"][0] < 0.8 and r.best.cuts["q"][1] == np.inf
+    # integer edges on half-integers
+    for edge in r.best.cuts["n"]:
+        assert not np.isfinite(edge) or edge % 1 == 0.5, r.best.cuts["n"]
+    # far better than no cut, and the odd events agree within the toy's noise
+    assert r.best.fom > 2.0 * r.seed_train.fom
+    assert abs(r.best_test.fom / r.best.fom - 1) < 0.15
+    # every reported selection re-evaluates to its yields
+    again = fs_opt.evaluate(table.half(True), r.best.cuts)
+    assert np.isclose(again.signal, r.best.signal) and np.isclose(again.background, r.best.background)
+
+
+def test_fullsim_optimize_an_unplaced_edge_cuts_nothing():
+    # as the macro's Var_t.applied: values outside the range and at its end
+    # pass until an edge is placed, and a one-sided cut never gets the other
+    t = fs_opt.Table.from_columns({"q": [1.0, 1.0, 0.2, 5.0]}, [1, 1, 0, 1], [0, 0, 1, 0], [0, 2, 4, 6])
+    assert fs_opt.evaluate(t, fs_opt.open_cuts([fs_opt.Variable("q", 0, 1, "low")])).signal == 3
+    assert fs_opt.evaluate(t, {"q": (0.5, np.inf)}).signal == 3
+
+
+def test_fullsim_optimize_keeps_tiny_weights_beside_large_ones():
+    # a DIO stand-in of 1e-17 next to cosmics of 1: a total minus a prefix
+    # would round it to 0 (the approx_ce_sensitivity numerics trap)
+    x = np.array([0.0, 1.0, 2.0, 3.0])
+    t = fs_opt.Table.from_columns({"x": x}, [1, 1, 0, 0], [1e-17, 2e-17, 1.0, 1.0], [0, 2, 4, 6])
+    edges, s, b = fs_opt._scan(t, {"x": (-np.inf, np.inf)}, fs_opt.Variable("x", -1, 4), upper=True)
+    kept_two = edges[(edges > 1.0) & (edges < 2.0)]
+    i = list(edges).index(kept_two[0]) if kept_two.size else None
+    assert i is not None and b[i] == 3e-17 and s[i] == 2, (edges, s, b)
+
+
+def test_fullsim_optimize_matches_the_macro_semantics_on_s_over_sqrt_b():
+    table = _toy_table(seed=3)
+    r = fs_opt.optimize(table, TOY_VARIABLES, {}, n_random=1, fom="s_over_sqrt_b")
+    sel = fs_opt.evaluate(table.half(True), r.best.cuts)
+    assert np.isclose(r.best.signal / np.sqrt(r.best.background),
+                      sel.signal / np.sqrt(sel.background))
+    # the module's figure of merit is back to Punzi afterwards
+    assert fs_opt._fom is fs_opt.punzi_fom
+    try:
+        fs_opt.optimize(table, TOY_VARIABLES, {}, fom="nope")
+    except fs_opt.OptimizeError as exc:
+        assert "punzi" in str(exc)
+    else:
+        raise AssertionError("an unknown fom was accepted")
+
+
+def test_fullsim_dio_weights_integrate_the_spectrum_per_bin():
+    dio = sens.load_dio_spectrum()
+    edges = fs_tune.p_edges()
+    w = fs_tune.dio_bin_weights(np.array([0.0, -1.0]), dio, edges)
+    x = dio.xmin + dio.width * (np.arange(dio.values.size) + 0.5)
+    inside = (x > edges[0]) & (x < edges[-1])
+    # no energy change: the spectrum over 100-106 MeV
+    assert np.isclose(w[0].sum(), dio.values[inside].sum() * dio.width, rtol=1e-3)
+    # a 1 MeV loss reads the spectrum 1 MeV higher, where it is far smaller
+    assert 0.1 * w[0].sum() < w[1].sum() < 0.5 * w[0].sum()
+    assert (w >= 0).all()
+
+
+def test_fullsim_cosmic_reference_normalizes_to_the_loose_rate(tmp_dir):
+    n = 40
+    rows = {name: np.full(n, 0.5) for name in fs_tune.VARIABLE_NAMES}
+    rows.update({"t0": np.full(n, 900.0), "p": np.linspace(96, 114, n),
+                 "event": np.arange(n), "mc_pdg": np.where(np.arange(n) % 4 == 0, 13, 11),
+                 "has_calo": np.ones(n, bool), "no_opa": np.ones(n, bool),
+                 "no_tsda": np.arange(n) % 2 == 0, "no_crv_veto": np.ones(n, bool)})
+    path = Path(tmp_dir) / "ref.npz"
+    fs_ref.save(path, rows, {"dataset": "test", "reco": "test"})
+    loaded, meta = fs_ref.load(path)
+    assert meta["n_normalizing"] == fs_ref.normalizing_count(rows) > 0
+    kept, per_mev = fs_ref.rows_for(loaded, ("no_tsda",), 2.0, 3.0)
+    # rate x time over the normalizing count, per MeV of window
+    assert np.isclose(per_mev * meta["n_normalizing"], 2.0 * 3.0)
+    assert (np.abs(kept["mc_pdg"]) == 11).all() and kept["no_tsda"].all()
+    try:
+        fs_ref.load(Path(tmp_dir) / "missing.npz")
+    except fs_ref.ReferenceError as exc:
+        assert "make_fullsim_cosmic_reference" in str(exc)
+    else:
+        raise AssertionError("a missing reference was accepted")
+
+
+def test_fullsim_seed_is_the_cut_set_without_the_target_cuts():
+    seed = fs_tune.seed_cuts("run1a_tsda", (540.0, 1650.0))
+    assert seed["d0"] == (-60.0, 94.0) and seed["trkqual"] == (0.145, np.inf)
+    assert seed["nactive"] == (16.5, np.inf) and seed["rmax"] == (-np.inf, np.inf)
+    assert "t0" not in seed            # the time window is applied, not tuned
+    pre = fs_tune.preselection("run1a_tsda")
+    assert "has_st" not in pre and "st_boundary" not in pre and "no_tsda" in pre
+    assert not set(fs_tune.TUNED_CUTS) & set(pre)
+
+
+def test_fullsim_optimize_mode_runs_and_fixed_mode_reports_minus_one(tmp_dir):
+    if not CE_MIX_FILE.exists():
+        print("     (skipped: CE mix file not on disk)")
+        return
+    from tools.analyses.fullsim import normalization as norm
+    base = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
+    fixed = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                         output_dir=tmp_dir, parameters=base)
+    assert fixed.status == "success" and fixed.metadata["opt_punzi_test"] == -1.0
+    # a reference of cosmics spread over the tuned variables
+    rng = np.random.default_rng(5)
+    n = 400
+    rows = {"cos": rng.uniform(0.3, 0.9, n), "t0": rng.uniform(450, 1700, n),
+            "rmax": rng.uniform(350, 700, n), "d0": rng.uniform(-200, 200, n),
+            "trkqual": rng.uniform(0, 1, n), "trkpid": rng.uniform(0, 1, n),
+            "t0err": rng.uniform(0.3, 2, n), "nactive": rng.integers(10, 60, n).astype(float),
+            "p": rng.uniform(100, 110, n), "event": np.arange(n), "mc_pdg": np.full(n, 11),
+            "has_calo": np.ones(n, bool), "no_opa": np.ones(n, bool),
+            "no_tsda": np.ones(n, bool), "no_crv_veto": np.ones(n, bool)}
+    ref = Path(tmp_dir) / "ref.npz"
+    fs_ref.save(ref, rows, {"dataset": "toy", "reco": "toy"})
+    r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                     output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                     "cosmic_reference": str(ref)})
+    assert r.status == "success", r.message
+    m = r.metadata
+    # the fixed result is reported unchanged alongside
+    assert m["sensitivity"] == fixed.metadata["sensitivity"]
+    assert m["opt_punzi_test"] > 0 and m["opt_seed_punzi_test"] > 0
+    assert np.isclose(m["opt_gain_test"], m["opt_punzi_test"] / m["opt_seed_punzi_test"])
+    assert m["opt_n_cosmic_rows"] > 0 and m["opt_cut_trkqual_high"] == 1.0
+    assert 100.0 <= m["opt_window_low_mevc"] < m["opt_window_high_mevc"] <= 106.0
+    bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                       output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                       "cosmic_reference": str(Path(tmp_dir) / "none.npz")})
+    assert bad.status == "error" and "cosmic reference" in bad.message
+
+
 def main() -> int:
     import tempfile
     import traceback
