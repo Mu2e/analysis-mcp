@@ -346,9 +346,17 @@ def _ensure_ul_table() -> None:
         _UL_TABLE.append(_expected_ul_events_exact(b))
 
 
-@functools.lru_cache(maxsize=65536)
-def _expected_ul_events_exact_cached(b: float) -> float:
-    return _expected_ul_events_exact(b)
+# Above the table (B > 10^3), N_UL(B) / sqrt(B) is smooth and slowly
+# varying (1.80 at 10^3, 1.76 at 10^6), so it is interpolated in log10(B)
+# between nodes computed exactly on first use. Interpolation error is
+# below 1e-5 relative.
+_UL_HI_STEP = 0.05
+
+
+@functools.lru_cache(maxsize=None)
+def _ul_ratio_node(k: int) -> float:
+    b = 10.0 ** (_UL_LMAX + k * _UL_HI_STEP)
+    return _expected_ul_events_exact(b) / math.sqrt(b)
 
 
 def expected_ul_events(b: float) -> float:
@@ -360,7 +368,11 @@ def expected_ul_events(b: float) -> float:
         return _UL_TABLE[0]
     l = math.log10(b)
     if l >= _UL_LMAX:
-        return _expected_ul_events_exact_cached(b)
+        x = (l - _UL_LMAX) / _UL_HI_STEP
+        k = int(x)
+        f = x - k
+        ratio = _ul_ratio_node(k) * (1.0 - f) + _ul_ratio_node(k + 1) * f
+        return ratio * math.sqrt(b)
     x = (l - _UL_LMIN) / (_UL_LMAX - _UL_LMIN) * (_UL_NPOINTS - 1)
     i = int(x)
     f = x - i

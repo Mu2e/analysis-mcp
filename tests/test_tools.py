@@ -6158,6 +6158,39 @@ def test_optimize_scan_edge_continuous_nan_does_not_hang():
     assert len(result) == 1 and result.n_sig[0] == 1.0
 
 
+
+def test_optimize_loosen_both_sides_of_window():
+    """A two-sided cut whose upper edge is the one to loosen: the lower-side
+    scan must not leak its mask into the upper-side scan."""
+    x = np.array([2.5, 3.0, 4.0, 6.0, 7.0, 8.0])
+    ev = optmod.Events(vals={"x": x}, w_sig=np.ones(6), w_bkg=np.zeros(6),
+                       event_numbers=np.arange(6, dtype=float))
+    ev.prepare()
+    cuts = [CutVar("x", 0.0, 10.0, cut_lo=2.0, cut_hi=5.0, applied=True)]
+    lp = optmod._find_loosen_point(0, cuts, ev, 0.2, punzi_fom)
+    assert lp is not None and lp.new_hi > 5.0 and lp.new_lo == 2.0
+
+
+def test_optimize_grid_batch_matches_per_trial():
+    """random_grid_search's batched yields equal evaluate_yields per trial."""
+    ev = _synth_events(400)
+    ev.vals["x"][::17] = np.nan
+    cuts = [CutVar("x", 0.0, 10.0, cut_type=BOTH),
+            CutVar("y", 0.0, 10.0, cut_type=VETO)]
+    res = random_grid_search(cuts, ev, 300, punzi_fom,
+                             rng=np.random.default_rng(5))
+    assert res
+    for r in res:
+        s, b = evaluate_yields(r["cuts"], ev)
+        assert abs(s - r["n_sig"]) < 1e-9 and abs(b - r["n_bkg"]) < 1e-9
+
+
+def test_optimize_expected_ul_above_table():
+    """Above B = 10^3 the interpolated N_UL matches the exact sum."""
+    for b in (1000.0, 1234.5, 3.3e4, 2.0e5):
+        exact = optmod._expected_ul_events_exact(b)
+        assert abs(expected_ul_events(b) / exact - 1.0) < 1e-5
+
 # -- Non-unit weight (finding 2) --
 
 def test_optimize_greedy_nonunit_weight():
