@@ -1,0 +1,1251 @@
+"""Generic cut-set optimization: greedy, random grid search, local refinement.
+
+The machinery here knows nothing about physics or file formats — it operates
+on in-memory arrays of variable values and per-event signal/background
+weights. The analysis module (optimize_selection_ntuple.py) reads EventNtuple
+files and builds the ``Events`` and ``CutVar`` objects this code works with.
+
+Algorithms, adapted from optimize_selection_fast.C:
+
+  **Greedy path** — at each step, every variable proposes its best single-edge
+  tightening (the one with the highest figure-of-merit, subject to a maximum
+  signal-efficiency loss per step). The variable with the steepest gradient
+  (FoM gain per signal lost) wins, and that edge is applied. The path records
+  every step and stops when signal efficiency drops below ``end_eff``,
+  background reaches zero, the step limit is reached, or no step changes
+  the cuts. An optional ``top_k`` with an RNG makes the choice stochastic
+  (pick one of the top-k gradients at random), giving different starting
+  points for the local search.
+
+  **Random grid search** — ``n_trials`` random cut-sets are drawn by
+  uniformly sampling each variable's edges within its search range, each
+  variable applied with 50 % probability. Every point is evaluated and the
+  efficiency–rejection pairs are returned.
+
+  **Local refinement** — hill-climbing from a starting selection. Each
+  iteration tries three moves: (a) tighten any one variable by one step,
+  (b) loosen any one variable by one step, (c) loosen one variable then
+  greedily tighten the best other. The move with the largest FoM improvement
+  is accepted; the search stops when no move improves (with a 1e-6
+  tolerance) or ``max_iter`` is reached.
+
+  **Multi-start optimization** — collects starting points from the best
+  greedy-path point, any user-supplied seed selections, and ``n_random``
+  randomized greedy runs (each picking from the top-3 candidates per step).
+  Every starting point is refined, and the best result is returned.
+
+Figures of merit:
+
+  * S / sqrt(B) — classic significance. Returns 0 when S <= 0 or B <= 0,
+    so it cannot distinguish selections that remove all background; use
+    Punzi or expected_ul when this is possible.
+  * Asimov Z — sqrt(2 * ((S+B) * log(1 + S/B) - S)). The exact formula
+    diverges as B → 0; a floor of b = 1e-9 is applied, below which the
+    function evaluates to sqrt(2S) instead.
+  * Punzi FoM — S / (a/2 + sqrt(B)), with a = 1.28 (90 % CL). Well-
+    behaved at B = 0.
+  * Expected upper limit — S / N_UL(B), where N_UL(B) is the mean
+    expected 90 % CL CLs upper limit (Poisson), averaged over Poisson-
+    distributed background outcomes.
+
+NaN handling: NaN variable values are excluded from the edge scan entirely.
+A NaN fails every comparison in ``passes_cut`` (and in ``selection.py``),
+so a track with NaN in a variable it is cut on never passes. The scan
+entries are built from finite values only, keeping the scan yields
+consistent with ``evaluate_yields``.
+"""
+
+from __future__ import annotations
+
+import copy
+import dataclasses
+import functools
+import math
+from dataclasses import dataclass, field
+from typing import Callable
+
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Cut variable
+# ---------------------------------------------------------------------------
+
+# Cut types: a window, a one-sided cut, or a veto (exclusion) window.
+BOTH = "both"      # two-sided: keep events with lo < x < hi
+LEFT = "left"      # lower bound only: keep events with x > lo
+RIGHT = "right"    # upper bound only: keep events with x < hi
+VETO = "veto"      # exclusion window: keep events with x < lo or x > hi
+CUT_TYPES = (BOTH, LEFT, RIGHT, VETO)
+
+# Maximum greedy steps before stopping, to prevent runaway loops.
+MAX_GREEDY_STEPS = 10000
+
+
+@dataclass
+class CutVar:
+    """One cut variable with its current edges and search bounds.
+
+    Attributes:
+        name: Variable name (matches the flat variable names in the event
+            arrays, e.g. ``p_front``, ``trkqual``).
+        lo, hi: Search-range bounds — the loosest the edges may be.
+        cut_lo, cut_hi: Current cut edges (start at ``lo``, ``hi``).
+        cut_type: ``"both"``, ``"left"``, ``"right"``, or ``"veto"``.
+        discrete: Integer-valued variable — edges sit on half-integers and
+            move in whole units.
+        applied: Whether this cut is active.
+    """
+
+    name: str
+    lo: float
+    hi: float
+    cut_lo: float = float("nan")
+    cut_hi: float = float("nan")
+    cut_type: str = BOTH
+    discrete: bool = False
+    applied: bool = False
+
+    def __post_init__(self):
+        if math.isnan(self.cut_lo):
+            self.cut_lo = self.lo
+        if math.isnan(self.cut_hi):
+            self.cut_hi = self.hi
+        if self.cut_type == VETO:
+            # A veto starts with an empty window at the seed (midpoint by
+            # default) and widens into [lo, hi].
+            if self.cut_lo == self.lo and self.cut_hi == self.hi:
+                mid = 0.5 * (self.lo + self.hi)
+                self.cut_lo = mid
+                self.cut_hi = mid
+        if self.cut_type not in CUT_TYPES:
+            raise ValueError(f"unknown cut_type {self.cut_type!r}; "
+                             f"must be one of {CUT_TYPES}")
+
+
+def make_discrete(name: str, lo: int, hi: int,
+                  cut_type: str = BOTH) -> CutVar:
+    """Integer-valued variable: edges shifted by ±0.5 so cuts sit on
+    half-integers (the same convention as optimize_selection_fast.C)."""
+    return CutVar(name, lo - 0.5, hi + 0.5, cut_type=cut_type, discrete=True)
+
+
+def passes_cut(var: CutVar, v: np.ndarray) -> np.ndarray:
+    """Boolean mask: which events pass this cut variable."""
+    if not var.applied:
+        return np.ones(len(v), dtype=bool)
+    if var.cut_type == BOTH:
+        return (v > var.cut_lo) & (v < var.cut_hi)
+    if var.cut_type == LEFT:
+        return v > var.cut_lo
+    if var.cut_type == RIGHT:
+        return v < var.cut_hi
+    # VETO: keep events outside the exclusion window
+    return (v < var.cut_lo) | (v > var.cut_hi)
+
+
+def _cuts_equal(a: list[CutVar], b: list[CutVar]) -> bool:
+    """Whether two cut lists have the same edges and applied flags."""
+    for va, vb in zip(a, b):
+        if va.applied != vb.applied:
+            return False
+        if va.applied and (va.cut_lo != vb.cut_lo or va.cut_hi != vb.cut_hi):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# In-memory event store
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Events:
+    """Variable values and signal/background weights for every event.
+
+    ``vals[name]`` is a 1-D float64 array of one value per event.
+    ``w_sig`` and ``w_bkg`` are the per-event signal and background weights.
+    ``sort_indices[name]`` holds the indices that sort the events by that
+    variable's values, computed once by ``prepare()``.
+
+    Use ``split()`` to partition into train/test halves by event-number
+    parity, each half weighted by 2 to estimate the full-sample yields.
+    """
+
+    vals: dict[str, np.ndarray] = field(default_factory=dict)
+    w_sig: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    w_bkg: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    sort_indices: dict[str, np.ndarray] = field(default_factory=dict)
+    event_numbers: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    # name -> (values, w_sig, w_bkg) in sort_indices order, built on demand
+    _sorted: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = field(
+        default_factory=dict, repr=False)
+
+    @property
+    def size(self) -> int:
+        return len(self.w_sig)
+
+    def prepare(self) -> None:
+        """Pre-sort events by each variable for fast edge scanning."""
+        for name, values in self.vals.items():
+            self.sort_indices[name] = np.argsort(values, kind="stable")
+        self._sorted.clear()
+
+    def sorted_arrays(self, name: str
+                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Values and signal/background weights in ascending order of
+        variable ``name`` (the order of ``sort_indices[name]``), cached."""
+        cached = self._sorted.get(name)
+        if cached is None:
+            order = self.sort_indices[name]
+            cached = (self.vals[name][order], self.w_sig[order],
+                      self.w_bkg[order])
+            self._sorted[name] = cached
+        return cached
+
+    def split(self) -> tuple["Events", "Events"]:
+        """Split by event-number parity: even → train, odd → test, each ×2."""
+        even = (self.event_numbers % 2 == 0)
+        odd = ~even
+        train = Events(
+            vals={n: v[even] for n, v in self.vals.items()},
+            w_sig=self.w_sig[even] * 2.0,
+            w_bkg=self.w_bkg[even] * 2.0,
+            event_numbers=self.event_numbers[even],
+        )
+        test = Events(
+            vals={n: v[odd] for n, v in self.vals.items()},
+            w_sig=self.w_sig[odd] * 2.0,
+            w_bkg=self.w_bkg[odd] * 2.0,
+            event_numbers=self.event_numbers[odd],
+        )
+        train.prepare()
+        test.prepare()
+        return train, test
+
+
+# ---------------------------------------------------------------------------
+# Figures of merit
+# ---------------------------------------------------------------------------
+
+FigureOfMerit = Callable[[float, float], float]
+
+
+def s_over_sqrt_b(s: float, b: float) -> float:
+    """S / sqrt(B). Returns 0 when S <= 0 or B <= 0.
+
+    This means a selection that removes all background scores 0, so the
+    optimizer cannot prefer it. Use ``punzi`` or ``expected_ul`` when
+    background can reach zero.
+    """
+    if s <= 0.0 or b <= 0.0:
+        return 0.0
+    return s / math.sqrt(b)
+
+
+def asimov_z(s: float, b: float) -> float:
+    """Asimov significance: sqrt(2 * ((S+B) * log(1 + S/B) - S)).
+
+    The exact formula diverges as B → 0. A floor of B = 1e-9 is applied:
+    below it the function returns sqrt(2S), which is the leading term of
+    the Taylor expansion at small B but not the true limit. This avoids a
+    discontinuity where removing one background event would lower the score.
+    """
+    if s <= 0.0:
+        return 0.0
+    if b <= 1e-9:
+        return math.sqrt(2.0 * s)
+    return math.sqrt(2.0 * ((s + b) * math.log(1.0 + s / b) - s))
+
+
+def punzi_fom(s: float, b: float, a: float = 1.28) -> float:
+    """Punzi figure of merit: S / (a/2 + sqrt(B)), a = 1.28 for 90 % CL."""
+    if s <= 0.0:
+        return 0.0
+    return s / (a / 2.0 + math.sqrt(max(b, 0.0)))
+
+
+def _poisson_cdf(n, lam):
+    """Cumulative Poisson probability P(X <= n | lambda), using the
+    regularized incomplete gamma function: P(X <= n) = Q(n+1, lam).
+    Accepts scalars or arrays (broadcast)."""
+    from scipy.special import gammaincc
+    n = np.asarray(n, dtype=float)
+    lam = np.asarray(lam, dtype=float)
+    out = gammaincc(n + 1.0, np.where(lam > 0.0, lam, 1.0))
+    out = np.where(lam <= 0.0, 1.0, out)
+    return float(out) if out.ndim == 0 else out
+
+
+def _poisson_pmf(n: int, lam: float) -> float:
+    """Poisson probability P(X = n | lambda)."""
+    if lam <= 0.0:
+        return 1.0 if n == 0 else 0.0
+    return math.exp(n * math.log(lam) - lam - math.lgamma(n + 1))
+
+
+def _poisson_cls_ul(n, b: float, cl: float = 0.9):
+    """90 % CL CLs upper limit on signal events for n observed with known
+    background b, by bisection. ``n`` may be an array: every element is
+    bisected in lock-step, each stopping at its own tolerance."""
+    alpha = 1.0 - cl
+    n_arr = np.atleast_1d(np.asarray(n, dtype=float))
+    cl_b = np.atleast_1d(_poisson_cdf(n_arr, b))
+    valid = cl_b > 0.0
+    safe_cl_b = np.where(valid, cl_b, 1.0)
+
+    def cls(s, idx):
+        return _poisson_cdf(n_arr[idx], s + b) / safe_cl_b[idx]
+
+    lo = np.zeros_like(n_arr)
+    hi = n_arr + 3.0 + 5.0 * np.sqrt(n_arr + 1.0)
+    grow = np.flatnonzero(valid)
+    while grow.size:
+        over = cls(hi[grow], grow) > alpha
+        grow = grow[over]
+        hi[grow] *= 2.0
+    active = np.flatnonzero(valid)
+    for _ in range(100):
+        active = active[hi[active] - lo[active] > 1e-7 * hi[active]]
+        if not active.size:
+            break
+        mid = 0.5 * (lo[active] + hi[active])
+        up = cls(mid, active) > alpha
+        lo[active[up]] = mid[up]
+        hi[active[~up]] = mid[~up]
+    ul = np.where(valid, 0.5 * (lo + hi), 0.0)
+    return float(ul[0]) if np.ndim(n) == 0 else ul
+
+
+def _expected_ul_events_exact(b: float) -> float:
+    """Mean expected upper limit on signal events:
+    sum_n P(n|b) * N_UL(n, b), averaged over Poisson-distributed
+    background-only outcomes."""
+    if b <= 0.0:
+        return _poisson_cls_ul(0, 0.0)
+    n_lo = max(0, int(math.floor(b - 7.0 * math.sqrt(b) - 2.0)))
+    n_hi = int(math.ceil(b + 7.0 * math.sqrt(b) + 5.0))
+    ns = np.arange(n_lo, n_hi + 1)
+    p = np.array([_poisson_pmf(int(k), b) for k in ns])
+    ul = _poisson_cls_ul(ns, b)
+    norm = float(np.cumsum(p)[-1])
+    total = float(np.cumsum(p * ul)[-1])
+    return total / norm if norm > 0.0 else 0.0
+
+
+# Lazily-built lookup table in log10(b), as in the C++ code.
+_UL_TABLE: list[float] = []
+_UL_LMIN = -4.0
+_UL_LMAX = 3.0
+_UL_NPOINTS = 701
+
+
+def _ensure_ul_table() -> None:
+    if _UL_TABLE:
+        return
+    for i in range(_UL_NPOINTS):
+        b = 10.0 ** (_UL_LMIN + i * (_UL_LMAX - _UL_LMIN) / (_UL_NPOINTS - 1))
+        _UL_TABLE.append(_expected_ul_events_exact(b))
+
+
+# Above the table (B > 10^3), N_UL(B) / sqrt(B) is smooth and slowly
+# varying (1.80 at 10^3, 1.76 at 10^6), so it is interpolated in log10(B)
+# between nodes computed exactly on first use. Interpolation error is
+# below 1e-5 relative.
+_UL_HI_STEP = 0.05
+
+
+@functools.lru_cache(maxsize=None)
+def _ul_ratio_node(k: int) -> float:
+    b = 10.0 ** (_UL_LMAX + k * _UL_HI_STEP)
+    return _expected_ul_events_exact(b) / math.sqrt(b)
+
+
+def expected_ul_events(b: float) -> float:
+    """Mean expected 90 % CL CLs upper limit on signal events, interpolated
+    from a lookup table in log10(b) for speed."""
+    _ensure_ul_table()
+    b = max(b, 0.0)
+    if b <= 10.0 ** _UL_LMIN:
+        return _UL_TABLE[0]
+    l = math.log10(b)
+    if l >= _UL_LMAX:
+        x = (l - _UL_LMAX) / _UL_HI_STEP
+        k = int(x)
+        f = x - k
+        ratio = _ul_ratio_node(k) * (1.0 - f) + _ul_ratio_node(k + 1) * f
+        return ratio * math.sqrt(b)
+    x = (l - _UL_LMIN) / (_UL_LMAX - _UL_LMIN) * (_UL_NPOINTS - 1)
+    i = int(x)
+    f = x - i
+    return _UL_TABLE[i] * (1.0 - f) + _UL_TABLE[i + 1] * f
+
+
+def inv_expected_limit(s: float, b: float) -> float:
+    """S / N_UL(B): 1 over the mean expected 90 % CL CLs upper limit on the
+    signal strength, independent of the signal normalization."""
+    if s <= 0.0:
+        return 0.0
+    return s / expected_ul_events(max(b, 0.0))
+
+
+# Registry of named FoM functions.
+FOM_FUNCTIONS: dict[str, FigureOfMerit] = {
+    "s_over_sqrt_b": s_over_sqrt_b,
+    "asimov_z": asimov_z,
+    "punzi": punzi_fom,
+    "expected_ul": inv_expected_limit,
+}
+
+
+# ---------------------------------------------------------------------------
+# Yield evaluation
+# ---------------------------------------------------------------------------
+
+def evaluate_yields(cuts: list[CutVar], events: Events
+                    ) -> tuple[float, float]:
+    """Sum of signal and background weights passing all applied cuts."""
+    mask = np.ones(events.size, dtype=bool)
+    for var in cuts:
+        if var.applied:
+            mask &= passes_cut(var, events.vals[var.name])
+    return float(events.w_sig[mask].sum()), float(events.w_bkg[mask].sum())
+
+
+def evaluate_yields_mask(cuts: list[CutVar], events: Events
+                         ) -> tuple[float, float, np.ndarray]:
+    """Like evaluate_yields, also returning the boolean pass mask."""
+    mask = np.ones(events.size, dtype=bool)
+    for var in cuts:
+        if var.applied:
+            mask &= passes_cut(var, events.vals[var.name])
+    return float(events.w_sig[mask].sum()), float(events.w_bkg[mask].sum()), mask
+
+
+# ---------------------------------------------------------------------------
+# Edge scanning
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EdgePoint:
+    """One candidate edge position and the signal/background yields there."""
+    edge: float
+    n_sig: float
+    n_bkg: float
+
+
+@dataclass
+class EdgeScan:
+    """Candidate edges and yields as parallel arrays (one entry per edge)."""
+    edge: np.ndarray
+    n_sig: np.ndarray
+    n_bkg: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.edge)
+
+    def __getitem__(self, i: int) -> EdgePoint:
+        return EdgePoint(float(self.edge[i]), float(self.n_sig[i]),
+                         float(self.n_bkg[i]))
+
+
+def _empty_scan() -> EdgeScan:
+    z = np.zeros(0)
+    return EdgeScan(z, z, z)
+
+
+def _seqsum(a: np.ndarray) -> float:
+    """Sequential (left-to-right) sum, matching a Python accumulation loop
+    bit for bit (np.sum is pairwise)."""
+    return float(np.cumsum(a)[-1]) if len(a) else 0.0
+
+
+def _sums_above(w: np.ndarray) -> np.ndarray:
+    """Reverse cumulative sums: out[i] = sum of w[i:], out[n] = 0."""
+    out = np.zeros(len(w) + 1)
+    out[:-1] = np.cumsum(w[::-1])[::-1]
+    return out
+
+
+def _scan_edge_continuous(u: np.ndarray, ws: np.ndarray, wb: np.ndarray,
+                          y0: float, y_lim: float,
+                          s_fixed: float, b_fixed: float) -> EdgeScan:
+    """Candidate edges for a continuous variable. ``u`` holds the oriented
+    values (sorted ascending), ``ws``/``wb`` the signal/background weights.
+    An edge sits midway below each distinct value that carries signal, so
+    all background beneath it is removed for the same signal loss.
+
+    Entries must contain only finite values (NaN filtered before calling).
+    """
+    n = len(u)
+    if n == 0:
+        return _empty_scan()
+    s_above = _sums_above(ws)
+    b_above = _sums_above(wb)
+    starts = np.flatnonzero(np.r_[True, u[1:] != u[:-1]])
+    has_signal = np.logical_or.reduceat(ws > 0.0, starts)
+    cand = starts[has_signal & (u[starts] > y0)]
+    if cand.size == 0:
+        return _empty_scan()
+    prev = u[np.maximum(cand - 1, 0)]
+    y = np.where(cand > 0, np.maximum(y0, 0.5 * (prev + u[cand])), y0)
+    stop = np.flatnonzero(y >= y_lim)
+    if stop.size:
+        cand = cand[:stop[0]]
+        y = y[:stop[0]]
+    return EdgeScan(y, s_fixed + s_above[cand], b_fixed + b_above[cand])
+
+
+def _scan_edge_discrete(u: np.ndarray, ws: np.ndarray, wb: np.ndarray,
+                        y0: float, y_lim: float,
+                        s_fixed: float, b_fixed: float) -> EdgeScan:
+    """Candidate edges for a discrete (integer-valued) variable: whole-unit
+    moves from y0 towards y_lim.
+
+    Entries must contain only finite values (NaN filtered before calling).
+    """
+    if len(u) == 0:
+        return _empty_scan()
+    s_above = _sums_above(ws)
+    b_above = _sums_above(wb)
+    n_max = round(y_lim - y0) - 1
+    if n_max < 1:
+        return _empty_scan()
+    y = y0 + np.arange(1, n_max + 1)
+    first = np.searchsorted(u, y, side="right")  # first entry with value > y
+    return EdgeScan(y, s_fixed + s_above[first], b_fixed + b_above[first])
+
+
+def _choose_edge(scan: EdgeScan, n_sig_0: float, step: float) -> int:
+    """The largest move whose signal loss is within ``step``, or the first
+    move if all exceed it. A move losing no signal (within tolerance) is
+    taken one further."""
+    if len(scan) == 0:
+        return -1
+    ok = np.flatnonzero(1.0 - scan.n_sig / n_sig_0 <= step)
+    index = int(ok[-1]) if ok.size else 0
+    # Use a relative tolerance for the no-signal-loss check to avoid
+    # floating-point loops where cumulative sums differ in the last bit.
+    if (abs(scan.n_sig[index] - n_sig_0) < 1e-12 * abs(n_sig_0)
+            and index + 1 < len(scan)):
+        index += 1
+    return index
+
+
+# ---------------------------------------------------------------------------
+# Single-variable tightening and loosening
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TestPoint:
+    """The result of tightening one variable by one step."""
+    ivar: int
+    new_lo: float
+    new_hi: float
+    n_sig_0: float
+    n_bkg_0: float
+    n_sig: float
+    n_bkg: float
+    fom_value: float = 0.0
+    grad: float = 0.0
+
+    def compute_grad(self, fom: FigureOfMerit) -> None:
+        self.fom_value = fom(self.n_sig, self.n_bkg)
+        fom_0 = fom(self.n_sig_0, self.n_bkg_0)
+        ds = self.n_sig_0 - self.n_sig
+        if ds == 0.0 or self.n_bkg_0 <= 0.0:
+            self.grad = 0.0
+        else:
+            self.grad = (self.fom_value - fom_0) / ds
+
+
+def _find_tighten_point(ivar: int, cuts: list[CutVar], events: Events,
+                        pass_mask: np.ndarray, n_sig_0: float,
+                        n_bkg_0: float, step: float,
+                        fom: FigureOfMerit) -> TestPoint | None:
+    """Tighten variable ``ivar`` by about one efficiency step, trying both
+    sides. Returns the side with the larger FoM, or None if neither can
+    tighten."""
+    var = cuts[ivar]
+    sorted_arrays = events.sorted_arrays(var.name)
+    # NaN values fail every cut, so they never pass and must not enter
+    # the scan.
+    pass_sorted = (pass_mask[events.sort_indices[var.name]]
+                   & np.isfinite(sorted_arrays[0]))
+    best: TestPoint | None = None
+
+    for side in (0, 1):  # 0 = lower edge, 1 = upper edge
+        if side == 0 and var.cut_type == RIGHT:
+            continue
+        if side == 1 and var.cut_type == LEFT:
+            continue
+        is_veto = var.cut_type == VETO
+        # Orientation: a cut edge tightens upwards for the lower edge,
+        # a veto edge for the upper edge.
+        sign = (-1.0 if side == 0 else 1.0) if is_veto else (
+            1.0 if side == 0 else -1.0)
+        if is_veto:
+            y0 = -var.cut_lo if side == 0 else var.cut_hi
+            y_lim = -var.lo if side == 0 else var.hi
+        else:
+            y0 = var.cut_lo if side == 0 else -var.cut_hi
+            y_lim = var.cut_hi if side == 0 else -var.cut_lo
+
+        v, ws, wb = sorted_arrays
+        keep = pass_sorted
+        if sign < 0:
+            v, ws, wb, keep = v[::-1], ws[::-1], wb[::-1], keep[::-1]
+        if is_veto:
+            movable = keep & ((v < var.cut_lo) if side == 0
+                              else (v > var.cut_hi))
+            fixed = keep & ((v > var.cut_hi) if side == 0
+                            else (v < var.cut_lo))
+        else:
+            if var.cut_type == BOTH:
+                movable = keep & ((v < var.cut_hi) if side == 0
+                                  else (v > var.cut_lo))
+            else:
+                movable = keep
+            fixed = None
+        s_fixed = b_fixed = 0.0
+        if fixed is not None:
+            s_fixed = _seqsum(ws[fixed])
+            b_fixed = _seqsum(wb[fixed])
+        if not movable.any():
+            continue
+        u = sign * v[movable]
+        use_discrete = var.discrete and not is_veto
+        scan_fn = _scan_edge_discrete if use_discrete else _scan_edge_continuous
+        scan = scan_fn(u, ws[movable], wb[movable], y0, y_lim,
+                       s_fixed, b_fixed)
+        idx = _choose_edge(scan, n_sig_0, step)
+        if idx < 0:
+            continue
+        pt = scan[idx]
+        edge = sign * pt.edge
+        new_lo = edge if side == 0 else var.cut_lo
+        new_hi = edge if side == 1 else var.cut_hi
+        tp = TestPoint(ivar, new_lo, new_hi, n_sig_0, n_bkg_0,
+                       pt.n_sig, pt.n_bkg)
+        tp.compute_grad(fom)
+        if best is None or tp.fom_value > best.fom_value:
+            best = tp
+    return best
+
+
+def _find_loosen_point(ivar: int, cuts: list[CutVar], events: Events,
+                       step: float, fom: FigureOfMerit) -> TestPoint | None:
+    """Loosen an applied cut until about ``step`` of signal is gained.
+    Returns None if the cut cannot be loosened."""
+    var = cuts[ivar]
+    if not var.applied or var.cut_type == VETO:
+        return None
+    n_sig_c, n_bkg_c = evaluate_yields(cuts, events)
+    # Evaluate with this cut removed to get the pass mask of the other cuts
+    others = copy.deepcopy(cuts)
+    others[ivar].applied = False
+    _, _, pass_mask = evaluate_yields_mask(others, events)
+
+    sorted_arrays = events.sorted_arrays(var.name)
+    pass_sorted = (pass_mask[events.sort_indices[var.name]]
+                   & np.isfinite(sorted_arrays[0]))
+    target = n_sig_c * (1.0 + step)
+    best: TestPoint | None = None
+
+    for side in (0, 1):
+        if side == 0 and var.cut_type == RIGHT:
+            continue
+        if side == 1 and var.cut_type == LEFT:
+            continue
+        sign = 1.0 if side == 0 else -1.0
+        y0 = var.lo if side == 0 else -var.hi          # loosest edge
+        y_cur = var.cut_lo if side == 0 else -var.cut_hi  # current edge
+        if y_cur <= y0:
+            continue
+
+        v, ws, wb = sorted_arrays
+        keep = pass_sorted
+        if sign < 0:
+            v, ws, wb, keep = v[::-1], ws[::-1], wb[::-1], keep[::-1]
+        if var.cut_type == BOTH:
+            keep = keep & ((v < var.cut_hi) if side == 0 else (v > var.cut_lo))
+        if not keep.any():
+            continue
+        u = sign * v[keep]
+        ws = ws[keep]
+        wb = wb[keep]
+        loose = u > y0
+        s_loose = _seqsum(ws[loose])
+        b_loose = _seqsum(wb[loose])
+        scan = _scan_edge_continuous(u, ws, wb, y0, y_cur, 0.0, 0.0)
+        # Insert the loosest point at the front
+        scan = EdgeScan(np.r_[y0, scan.edge], np.r_[s_loose, scan.n_sig],
+                        np.r_[b_loose, scan.n_bkg])
+        # Take the tightest position that gains the step
+        ok = np.flatnonzero(scan.n_sig >= target)
+        index = int(ok[-1]) if ok.size else 0
+        if scan[index].n_sig <= n_sig_c:
+            continue
+        edge = sign * scan[index].edge
+        new_lo = edge if side == 0 else var.cut_lo
+        new_hi = edge if side == 1 else var.cut_hi
+        tp = TestPoint(ivar, new_lo, new_hi, n_sig_c, n_bkg_c,
+                       scan[index].n_sig, scan[index].n_bkg)
+        tp.compute_grad(fom)
+        if best is None or tp.fom_value > best.fom_value:
+            best = tp
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Selection state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Selection:
+    """A cut-set and its yields."""
+    cuts: list[CutVar]
+    n_sig: float
+    n_bkg: float
+
+
+def _apply_point(cuts: list[CutVar], tp: TestPoint) -> None:
+    """Apply a TestPoint's edges to the cut list (in place)."""
+    cuts[tp.ivar].cut_lo = tp.new_lo
+    cuts[tp.ivar].cut_hi = tp.new_hi
+    cuts[tp.ivar].applied = True
+
+
+def _tighten_candidates(cuts: list[CutVar], events: Events, step: float,
+                        fom: FigureOfMerit) -> list[TestPoint]:
+    """Test points of all variables from the current selection."""
+    n_sig, n_bkg, pass_mask = evaluate_yields_mask(cuts, events)
+    candidates: list[TestPoint] = []
+    for ivar in range(len(cuts)):
+        tp = _find_tighten_point(ivar, cuts, events, pass_mask,
+                                 n_sig, n_bkg, step, fom)
+        if tp is None:
+            continue
+        # Reject candidates that do not actually reduce the signal yield
+        # (within floating-point tolerance), to prevent no-op steps.
+        if tp.n_sig >= tp.n_sig_0 * (1.0 - 1e-12):
+            continue
+        candidates.append(tp)
+    return candidates
+
+
+def _choose_greedy(candidates: list[TestPoint],
+                   rng: np.random.Generator | None = None,
+                   top_k: int = 1) -> int:
+    """Index into candidates of the greedy choice: the steepest gradient,
+    or a random one of the top_k with ``rng``."""
+    if not candidates:
+        return -1
+    candidates.sort(key=lambda tp: tp.grad, reverse=True)
+    if rng is None:
+        return 0
+    return int(rng.integers(min(top_k, len(candidates))))
+
+
+# ---------------------------------------------------------------------------
+# Greedy path
+# ---------------------------------------------------------------------------
+
+def run_greedy(cuts: list[CutVar], events: Events, n_sig_ref: float,
+               step: float, end_eff: float, fom: FigureOfMerit,
+               rng: np.random.Generator | None = None,
+               top_k: int = 1,
+               max_steps: int = MAX_GREEDY_STEPS) -> list[Selection]:
+    """Greedy path from a starting selection, recording every step.
+
+    ``n_sig_ref`` is the reference signal yield (at no cuts) for the
+    efficiency calculation. The path stops when the efficiency drops below
+    ``end_eff``, background reaches zero, ``max_steps`` is reached, or a
+    step leaves the cuts unchanged.
+    """
+    working = copy.deepcopy(cuts)
+    path: list[Selection] = []
+    eff = 1.0
+    for _ in range(max_steps):
+        if eff <= end_eff:
+            break
+        candidates = _tighten_candidates(working, events, step, fom)
+        idx = _choose_greedy(candidates, rng, top_k)
+        if idx < 0:
+            break
+        prev = copy.deepcopy(working)
+        _apply_point(working, candidates[idx])
+        # Stop if the step did not change the cuts (floating-point edge case)
+        if _cuts_equal(working, prev):
+            break
+        sel = Selection(copy.deepcopy(working),
+                        candidates[idx].n_sig, candidates[idx].n_bkg)
+        path.append(sel)
+        eff = sel.n_sig / n_sig_ref
+        if sel.n_bkg <= 0.0:
+            break
+    return path
+
+
+def best_on_path(path: list[Selection], fom: FigureOfMerit) -> Selection:
+    """The selection on a greedy path with the highest figure of merit."""
+    return max(path, key=lambda s: fom(s.n_sig, s.n_bkg))
+
+
+# ---------------------------------------------------------------------------
+# Local refinement
+# ---------------------------------------------------------------------------
+
+def refine(cuts: list[CutVar], events: Events, step: float,
+           fom: FigureOfMerit, max_iter: int = 100) -> Selection:
+    """Hill-climbing local search from a starting selection.
+
+    Each iteration tries tightening any variable, loosening any variable,
+    and loosening one then tightening the best other. The largest
+    improvement is accepted; the search stops when no move improves.
+    """
+    working = copy.deepcopy(cuts)
+    n_sig, n_bkg = evaluate_yields(working, events)
+    for _ in range(max_iter):
+        best_fom = fom(n_sig, n_bkg) * (1.0 + 1e-6)
+        improved = False
+        best_cuts: list[CutVar] | None = None
+        best_s = 0.0
+        best_b = 0.0
+
+        def consider(test: list[CutVar], s: float, b: float) -> None:
+            nonlocal best_fom, improved, best_cuts, best_s, best_b
+            f = fom(s, b)
+            if f <= best_fom:
+                return
+            best_fom = f
+            best_cuts = copy.deepcopy(test)
+            best_s = s
+            best_b = b
+            improved = True
+
+        # Try tightening each variable
+        for tp in _tighten_candidates(working, events, step, fom):
+            test = copy.deepcopy(working)
+            _apply_point(test, tp)
+            consider(test, tp.n_sig, tp.n_bkg)
+
+        # Try loosening each variable
+        for ivar in range(len(working)):
+            lp = _find_loosen_point(ivar, working, events, step, fom)
+            if lp is None:
+                continue
+            test = copy.deepcopy(working)
+            _apply_point(test, lp)
+            s, b = evaluate_yields(test, events)
+            consider(test, s, b)
+
+            # Loosen one, then tighten the best other
+            tighten = _tighten_candidates(test, events, step, fom)
+            tidx = _choose_greedy(tighten)
+            if tidx >= 0:
+                _apply_point(test, tighten[tidx])
+                consider(test, tighten[tidx].n_sig, tighten[tidx].n_bkg)
+
+        if not improved:
+            break
+        working = best_cuts  # type: ignore[assignment]
+        n_sig = best_s
+        n_bkg = best_b
+
+    return Selection(working, n_sig, n_bkg)
+
+
+# ---------------------------------------------------------------------------
+# Random grid search
+# ---------------------------------------------------------------------------
+
+# Upper bound on the (trials x events) boolean mask built per batch.
+_BATCH_MASK_ELEMENTS = 1 << 22
+
+
+def _evaluate_yields_batch(trials: list[list[CutVar]], events: Events
+                           ) -> tuple[np.ndarray, np.ndarray]:
+    """Signal and background yields of many cut-sets at once.
+
+    Each batch builds a (trials x events) pass mask, one variable at a
+    time, and sums the weights with a matrix-vector product. Equivalent to
+    ``evaluate_yields`` per trial, up to floating-point summation order.
+    """
+    n_trials = len(trials)
+    n_sig = np.zeros(n_trials)
+    n_bkg = np.zeros(n_trials)
+    if n_trials == 0 or events.size == 0:
+        return n_sig, n_bkg
+    names = [v.name for v in trials[0]]
+    batch = max(1, _BATCH_MASK_ELEMENTS // events.size)
+    for start in range(0, n_trials, batch):
+        chunk = trials[start:start + batch]
+        mask = np.ones((len(chunk), events.size), dtype=bool)
+        for k, name in enumerate(names):
+            applied = np.array([t[k].applied for t in chunk])
+            if not applied.any():
+                continue
+            rows = np.flatnonzero(applied)
+            var = chunk[rows[0]][k]
+            lo = np.array([chunk[r][k].cut_lo for r in rows])[:, None]
+            hi = np.array([chunk[r][k].cut_hi for r in rows])[:, None]
+            v = events.vals[name][None, :]
+            if var.cut_type == BOTH:
+                passed = (v > lo) & (v < hi)
+            elif var.cut_type == LEFT:
+                passed = v > lo
+            elif var.cut_type == RIGHT:
+                passed = v < hi
+            else:
+                passed = (v < lo) | (v > hi)
+            mask[rows] &= passed
+        maskf = mask.astype(np.float64)
+        n_sig[start:start + len(chunk)] = maskf @ events.w_sig
+        n_bkg[start:start + len(chunk)] = maskf @ events.w_bkg
+    return n_sig, n_bkg
+
+
+def random_grid_search(cuts: list[CutVar], events: Events,
+                       n_trials: int, fom: FigureOfMerit,
+                       rng: np.random.Generator | None = None,
+                       ) -> list[dict]:
+    """Sample ``n_trials`` random cut-sets and evaluate each one.
+
+    Returns a list of dicts with keys ``eff``, ``rejection``, ``fom``,
+    ``n_sig``, ``n_bkg``, and ``cuts`` (the CutVar list).
+    """
+    if rng is None:
+        rng = np.random.default_rng(90)
+    # Baselines (all cuts unapplied)
+    unapplied = copy.deepcopy(cuts)
+    for v in unapplied:
+        v.applied = False
+    n_sig_0, n_bkg_0 = evaluate_yields(unapplied, events)
+    fom_0 = fom(n_sig_0, n_bkg_0)
+
+    # Draw every trial first (the RNG call sequence is unchanged), then
+    # evaluate all trials in batches as (trials x events) masks.
+    trials: list[list[CutVar]] = []
+    for _ in range(n_trials):
+        test_cuts: list[CutVar] = []
+        for var in cuts:
+            tc = dataclasses.replace(var)
+            tc.applied = rng.random() > 0.5
+            if var.cut_type == VETO:
+                tc.cut_lo = var.lo + rng.random() * (var.hi - var.lo)
+                tc.cut_hi = tc.cut_lo + rng.random() * (var.hi - tc.cut_lo)
+                test_cuts.append(tc)
+                continue
+            if var.discrete:
+                span = round(var.hi - var.lo)
+                if var.cut_type != RIGHT:
+                    tc.cut_lo = var.lo + rng.integers(span)
+                if var.cut_type != LEFT:
+                    remaining = round(var.hi - tc.cut_lo)
+                    if remaining > 0:
+                        tc.cut_hi = var.hi - rng.integers(remaining)
+                test_cuts.append(tc)
+                continue
+            if var.cut_type != RIGHT:
+                tc.cut_lo = var.lo + rng.random() * (var.hi - var.lo)
+            if var.cut_type != LEFT:
+                tc.cut_hi = var.hi - rng.random() * (var.hi - tc.cut_lo)
+            test_cuts.append(tc)
+        trials.append(test_cuts)
+
+    n_sig_all, n_bkg_all = _evaluate_yields_batch(trials, events)
+
+    results: list[dict] = []
+    for test_cuts, n_sig, n_bkg in zip(trials, n_sig_all, n_bkg_all):
+        n_sig = float(n_sig)
+        n_bkg = float(n_bkg)
+        if n_bkg <= 0.0:
+            continue
+        eff = n_sig / n_sig_0 if n_sig_0 > 0 else 0.0
+        rej = 1.0 - n_bkg / n_bkg_0 if n_bkg_0 > 0 else 0.0
+        results.append({
+            "eff": eff,
+            "rejection": rej,
+            "fom": fom(n_sig, n_bkg) / fom_0 if fom_0 > 0 else 0.0,
+            "n_sig": n_sig,
+            "n_bkg": n_bkg,
+            "cuts": test_cuts,
+        })
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Multi-start optimization
+# ---------------------------------------------------------------------------
+
+def multi_start_optimize(cuts: list[CutVar], events: Events, step: float,
+                         end_eff: float, fom: FigureOfMerit,
+                         seeds: list[list[CutVar]] | None = None,
+                         n_random: int = 5,
+                         top_k: int = 3,
+                         ) -> dict:
+    """Multi-start optimization: greedy + seeds + randomized greedy starts,
+    all refined by local search.
+
+    Returns a dict with keys ``best`` (Selection), ``greedy_path``
+    (list[Selection]), ``starts`` (list of dicts with ``name``,
+    ``start``, ``refined``), and ``n_sig_ref``, ``n_bkg_ref`` (the
+    baseline yields).
+    """
+    # Baseline yields (all cuts unapplied)
+    unapplied = copy.deepcopy(cuts)
+    for v in unapplied:
+        v.applied = False
+    n_sig_ref, n_bkg_ref = evaluate_yields(unapplied, events)
+    fom_ref = fom(n_sig_ref, n_bkg_ref)
+
+    # Greedy path
+    path = run_greedy(cuts, events, n_sig_ref, step, end_eff, fom)
+    if not path:
+        return {"best": None, "greedy_path": [], "starts": [],
+                "n_sig_ref": n_sig_ref, "n_bkg_ref": n_bkg_ref,
+                "fom_ref": fom_ref}
+
+    starts: list[dict] = []
+    starts.append({"name": "greedy", "start": best_on_path(path, fom)})
+
+    # User-supplied seed selections
+    for i, seed in enumerate(seeds or []):
+        s, b = evaluate_yields(seed, events)
+        starts.append({"name": f"seed_{i}", "start": Selection(seed, s, b)})
+
+    # Randomized greedy starts
+    for irun in range(n_random):
+        rng = np.random.default_rng(1000 + irun)
+        rpath = run_greedy(cuts, events, n_sig_ref, step, end_eff, fom,
+                           rng=rng, top_k=top_k)
+        if rpath:
+            starts.append({"name": f"random_{irun}",
+                           "start": best_on_path(rpath, fom)})
+
+    # Refine each starting point
+    best_fom_val = -1.0
+    best_sel: Selection | None = None
+    for entry in starts:
+        sel = entry["start"]
+        refined_sel = refine(sel.cuts, events, step, fom)
+        entry["refined"] = refined_sel
+        f = fom(refined_sel.n_sig, refined_sel.n_bkg)
+        if f > best_fom_val:
+            best_fom_val = f
+            best_sel = refined_sel
+
+    return {"best": best_sel, "greedy_path": path, "starts": starts,
+            "n_sig_ref": n_sig_ref, "n_bkg_ref": n_bkg_ref,
+            "fom_ref": fom_ref}
+
+
+# ---------------------------------------------------------------------------
+# Cut-string builder (selection.py-compatible)
+# ---------------------------------------------------------------------------
+
+def build_cut_string(cuts: list[CutVar], preselection: str = "") -> str:
+    """Build a selection expression from the applied cuts, compatible with
+    tools/selection.py's syntax. If ``preselection`` is given, it is
+    ANDed in front of the optimized cuts."""
+    parts: list[str] = []
+    if preselection.strip():
+        parts.append(preselection.strip())
+    for var in cuts:
+        if not var.applied:
+            continue
+        if var.cut_type == BOTH:
+            parts.append(f"{var.name} > {var.cut_lo:.8g} and "
+                         f"{var.name} < {var.cut_hi:.8g}")
+        elif var.cut_type == LEFT:
+            parts.append(f"{var.name} > {var.cut_lo:.8g}")
+        elif var.cut_type == RIGHT:
+            parts.append(f"{var.name} < {var.cut_hi:.8g}")
+        elif var.cut_type == VETO:
+            parts.append(f"({var.name} < {var.cut_lo:.8g} or "
+                         f"{var.name} > {var.cut_hi:.8g})")
+    return " and ".join(parts) if parts else ""
+
+
+# ---------------------------------------------------------------------------
+# Cut variable spec parser
+# ---------------------------------------------------------------------------
+
+class CutVarSpecError(ValueError):
+    """A variable specification string that cannot be parsed, worded for
+    the caller."""
+
+
+def parse_cut_var_specs(text: str) -> list[CutVar]:
+    r"""Parse a comma-separated variable specification string into CutVars.
+
+    Format per variable::
+
+        name:type:lo:hi[:seed_lo:seed_hi]
+
+    or for discrete variables::
+
+        name:type:lo:hi:discrete[:seed_lo:seed_hi]
+
+    ``type`` is ``both``, ``left``, ``right``, or ``veto``.
+
+    ``seed_lo:seed_hi`` sets the initial cut edges (``cut_lo``, ``cut_hi``).
+    Without them, edges start at the search bounds (loosest), or at the
+    midpoint for a veto.
+
+    Examples::
+
+        p_front:both:80:110, trkqual:left:0:1, t_front:both:500:1700
+        nactive:left:10:60:discrete
+        crv_dt:veto:-150:150:-10:-10
+
+    Raises CutVarSpecError for bad syntax, non-finite bounds, or unknown
+    types.
+    """
+    specs = [s.strip() for s in text.split(",") if s.strip()]
+    if not specs:
+        raise CutVarSpecError("optimize_variables is empty: list at least one "
+                              "variable as 'name:type:lo:hi', e.g. "
+                              "'p_front:both:80:110, trkqual:left:0:1'")
+    result: list[CutVar] = []
+    for spec in specs:
+        parts = [p.strip() for p in spec.split(":")]
+        if len(parts) < 4:
+            raise CutVarSpecError(
+                f"variable spec {spec!r} needs at least 'name:type:lo:hi', "
+                f"got {len(parts)} fields"
+            )
+        name = parts[0]
+        cut_type = parts[1].lower()
+        if cut_type not in CUT_TYPES:
+            raise CutVarSpecError(
+                f"variable {name!r}: type {parts[1]!r} must be one of "
+                f"{', '.join(CUT_TYPES)}"
+            )
+        try:
+            lo = float(parts[2])
+            hi = float(parts[3])
+        except ValueError:
+            raise CutVarSpecError(
+                f"variable {name!r}: lo={parts[2]!r} and hi={parts[3]!r} "
+                "must be numbers"
+            )
+        if not (math.isfinite(lo) and math.isfinite(hi)):
+            raise CutVarSpecError(
+                f"variable {name!r}: lo={lo:g} and hi={hi:g} must be "
+                "finite numbers"
+            )
+        if lo >= hi:
+            raise CutVarSpecError(
+                f"variable {name!r}: lo={lo:g} must be less than hi={hi:g}"
+            )
+
+        # Remaining parts: 'discrete' flag and seed_lo:seed_hi
+        remaining = parts[4:]
+        discrete = False
+        seed_lo = float("nan")
+        seed_hi = float("nan")
+        if remaining and remaining[0].lower() == "discrete":
+            discrete = True
+            if discrete:
+                lo = lo - 0.5
+                hi = hi + 0.5
+            remaining = remaining[1:]
+        if len(remaining) == 2:
+            try:
+                seed_lo = float(remaining[0])
+                seed_hi = float(remaining[1])
+            except ValueError:
+                raise CutVarSpecError(
+                    f"variable {name!r}: seed_lo={remaining[0]!r} and "
+                    f"seed_hi={remaining[1]!r} must be numbers"
+                )
+            if not (math.isfinite(seed_lo) and math.isfinite(seed_hi)):
+                raise CutVarSpecError(
+                    f"variable {name!r}: seed values must be finite numbers"
+                )
+            if seed_lo > seed_hi:
+                raise CutVarSpecError(
+                    f"variable {name!r}: seed_lo={seed_lo:g} must be <= "
+                    f"seed_hi={seed_hi:g}"
+                )
+        elif remaining:
+            raise CutVarSpecError(
+                f"variable {name!r}: unexpected fields after type:lo:hi"
+                f"{'[:discrete]' if not discrete else ''}: "
+                f"{':'.join(remaining)}"
+            )
+        cv = CutVar(name, lo, hi, cut_type=cut_type, discrete=discrete)
+        if not math.isnan(seed_lo):
+            cv.cut_lo = seed_lo
+        if not math.isnan(seed_hi):
+            cv.cut_hi = seed_hi
+        cv.applied = False  # starts unapplied
+        result.append(cv)
+    return result
+
+
+def parse_seed_selections(text: str, var_names: list[str]
+                          ) -> list[list[CutVar]]:
+    """Parse seed selections: semicolon-separated cut-sets, each a
+    comma-separated list of ``name:lo:hi``.
+
+    Example::
+
+        trkqual:0.155:1,cos_front:0.5:0.75; trkqual:0.145:1,cos_front:0.56:0.73
+
+    Each seed produces a full CutVar list with the named variables applied
+    at the given edges and all others unapplied at their search bounds.
+    ``var_names`` is the list of variable names from optimize_variables,
+    giving the search bounds.
+
+    Raises CutVarSpecError for bad syntax or unknown variable names.
+    """
+    if not text.strip():
+        return []
+    seeds: list[list[CutVar]] = []
+    for seed_text in text.split(";"):
+        seed_text = seed_text.strip()
+        if not seed_text:
+            continue
+        seed_cuts: dict[str, tuple[float, float]] = {}
+        for item in seed_text.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            parts = [p.strip() for p in item.split(":")]
+            if len(parts) != 3:
+                raise CutVarSpecError(
+                    f"seed cut {item!r} must be 'name:lo:hi', got "
+                    f"{len(parts)} fields"
+                )
+            name = parts[0]
+            if name not in var_names:
+                raise CutVarSpecError(
+                    f"seed variable {name!r} is not in the optimize_variables "
+                    f"list ({', '.join(var_names)})"
+                )
+            try:
+                seed_cuts[name] = (float(parts[1]), float(parts[2]))
+            except ValueError:
+                raise CutVarSpecError(
+                    f"seed cut {item!r}: lo={parts[1]!r} and hi={parts[2]!r} "
+                    "must be numbers"
+                )
+        seeds.append(seed_cuts)
+    return seeds  # type: ignore[return-value] — the dicts are applied below
+
+
+def apply_seed_to_vars(cut_vars: list[CutVar],
+                       seed: dict[str, tuple[float, float]]
+                       ) -> list[CutVar]:
+    """Apply a parsed seed (name → (lo, hi)) to a copy of the CutVar list."""
+    result = copy.deepcopy(cut_vars)
+    for var in result:
+        if var.name in seed:
+            lo, hi = seed[var.name]
+            if var.cut_type != RIGHT:
+                var.cut_lo = lo
+            if var.cut_type != LEFT:
+                var.cut_hi = hi
+            var.applied = True
+    return result
