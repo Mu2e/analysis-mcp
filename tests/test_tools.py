@@ -6151,9 +6151,11 @@ def test_optimize_scan_edge_continuous_nan_does_not_hang():
     """_scan_edge_continuous must not loop on NaN entries — NaN entries
     should be filtered before calling."""
     # With NaN filtered, the function returns immediately
-    entries = np.array([[0.1, 1.0, 0.0], [0.5, 0.0, 1.0]])
-    result = optmod._scan_edge_continuous(entries, -np.inf, np.inf, 0.0, 0.0)
-    assert isinstance(result, list)
+    u = np.array([0.1, 0.5])
+    ws = np.array([1.0, 0.0])
+    wb = np.array([0.0, 1.0])
+    result = optmod._scan_edge_continuous(u, ws, wb, -np.inf, np.inf, 0.0, 0.0)
+    assert len(result) == 1 and result.n_sig[0] == 1.0
 
 
 # -- Non-unit weight (finding 2) --

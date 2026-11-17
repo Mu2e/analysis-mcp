@@ -58,6 +58,7 @@ consistent with ``evaluate_yields``.
 from __future__ import annotations
 
 import copy
+import functools
 import math
 from dataclasses import dataclass, field
 from typing import Callable
@@ -245,13 +246,16 @@ def punzi_fom(s: float, b: float, a: float = 1.28) -> float:
     return s / (a / 2.0 + math.sqrt(max(b, 0.0)))
 
 
-def _poisson_cdf(n: int, lam: float) -> float:
+def _poisson_cdf(n, lam):
     """Cumulative Poisson probability P(X <= n | lambda), using the
-    regularized incomplete gamma function: P(X <= n) = Q(n+1, lam)."""
+    regularized incomplete gamma function: P(X <= n) = Q(n+1, lam).
+    Accepts scalars or arrays (broadcast)."""
     from scipy.special import gammaincc
-    if lam <= 0.0:
-        return 1.0
-    return float(gammaincc(n + 1, lam))
+    n = np.asarray(n, dtype=float)
+    lam = np.asarray(lam, dtype=float)
+    out = gammaincc(n + 1.0, np.where(lam > 0.0, lam, 1.0))
+    out = np.where(lam <= 0.0, 1.0, out)
+    return float(out) if out.ndim == 0 else out
 
 
 def _poisson_pmf(n: int, lam: float) -> float:
@@ -261,29 +265,37 @@ def _poisson_pmf(n: int, lam: float) -> float:
     return math.exp(n * math.log(lam) - lam - math.lgamma(n + 1))
 
 
-def _poisson_cls_ul(n: int, b: float, cl: float = 0.9) -> float:
+def _poisson_cls_ul(n, b: float, cl: float = 0.9):
     """90 % CL CLs upper limit on signal events for n observed with known
-    background b, by bisection."""
+    background b, by bisection. ``n`` may be an array: every element is
+    bisected in lock-step, each stopping at its own tolerance."""
     alpha = 1.0 - cl
-    cl_b = _poisson_cdf(n, b)
-    if cl_b <= 0.0:
-        return 0.0
+    n_arr = np.atleast_1d(np.asarray(n, dtype=float))
+    cl_b = np.atleast_1d(_poisson_cdf(n_arr, b))
+    valid = cl_b > 0.0
+    safe_cl_b = np.where(valid, cl_b, 1.0)
 
-    def cls(s):
-        return _poisson_cdf(n, s + b) / cl_b
+    def cls(s, idx):
+        return _poisson_cdf(n_arr[idx], s + b) / safe_cl_b[idx]
 
-    lo, hi = 0.0, n + 3.0 + 5.0 * math.sqrt(n + 1)
-    while cls(hi) > alpha:
-        hi *= 2.0
+    lo = np.zeros_like(n_arr)
+    hi = n_arr + 3.0 + 5.0 * np.sqrt(n_arr + 1.0)
+    grow = np.flatnonzero(valid)
+    while grow.size:
+        over = cls(hi[grow], grow) > alpha
+        grow = grow[over]
+        hi[grow] *= 2.0
+    active = np.flatnonzero(valid)
     for _ in range(100):
-        if hi - lo <= 1e-7 * hi:
+        active = active[hi[active] - lo[active] > 1e-7 * hi[active]]
+        if not active.size:
             break
-        mid = 0.5 * (lo + hi)
-        if cls(mid) > alpha:
-            lo = mid
-        else:
-            hi = mid
-    return 0.5 * (lo + hi)
+        mid = 0.5 * (lo[active] + hi[active])
+        up = cls(mid, active) > alpha
+        lo[active[up]] = mid[up]
+        hi[active[~up]] = mid[~up]
+    ul = np.where(valid, 0.5 * (lo + hi), 0.0)
+    return float(ul[0]) if np.ndim(n) == 0 else ul
 
 
 def _expected_ul_events_exact(b: float) -> float:
@@ -294,13 +306,12 @@ def _expected_ul_events_exact(b: float) -> float:
         return _poisson_cls_ul(0, 0.0)
     n_lo = max(0, int(math.floor(b - 7.0 * math.sqrt(b) - 2.0)))
     n_hi = int(math.ceil(b + 7.0 * math.sqrt(b) + 5.0))
-    ul = 0.0
-    norm = 0.0
-    for n in range(n_lo, n_hi + 1):
-        p = _poisson_pmf(n, b)
-        ul += p * _poisson_cls_ul(n, b)
-        norm += p
-    return ul / norm if norm > 0.0 else 0.0
+    ns = np.arange(n_lo, n_hi + 1)
+    p = np.array([_poisson_pmf(int(k), b) for k in ns])
+    ul = _poisson_cls_ul(ns, b)
+    norm = float(np.cumsum(p)[-1])
+    total = float(np.cumsum(p * ul)[-1])
+    return total / norm if norm > 0.0 else 0.0
 
 
 # Lazily-built lookup table in log10(b), as in the C++ code.
@@ -318,6 +329,11 @@ def _ensure_ul_table() -> None:
         _UL_TABLE.append(_expected_ul_events_exact(b))
 
 
+@functools.lru_cache(maxsize=65536)
+def _expected_ul_events_exact_cached(b: float) -> float:
+    return _expected_ul_events_exact(b)
+
+
 def expected_ul_events(b: float) -> float:
     """Mean expected 90 % CL CLs upper limit on signal events, interpolated
     from a lookup table in log10(b) for speed."""
@@ -327,7 +343,7 @@ def expected_ul_events(b: float) -> float:
         return _UL_TABLE[0]
     l = math.log10(b)
     if l >= _UL_LMAX:
-        return _expected_ul_events_exact(b)
+        return _expected_ul_events_exact_cached(b)
     x = (l - _UL_LMIN) / (_UL_LMAX - _UL_LMIN) * (_UL_NPOINTS - 1)
     i = int(x)
     f = x - i
@@ -387,85 +403,99 @@ class EdgePoint:
     n_bkg: float
 
 
-def _scan_edge_continuous(entries: np.ndarray, y0: float, y_lim: float,
-                          s_fixed: float, b_fixed: float) -> list[EdgePoint]:
-    """Candidate edges for a continuous variable. ``entries`` is (N, 3):
-    oriented value, signal weight, background weight, sorted by value.
-    Just below each signal value, so all background beneath it is removed
-    for the same signal loss.
+@dataclass
+class EdgeScan:
+    """Candidate edges and yields as parallel arrays (one entry per edge)."""
+    edge: np.ndarray
+    n_sig: np.ndarray
+    n_bkg: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.edge)
+
+    def __getitem__(self, i: int) -> EdgePoint:
+        return EdgePoint(float(self.edge[i]), float(self.n_sig[i]),
+                         float(self.n_bkg[i]))
+
+
+def _empty_scan() -> EdgeScan:
+    z = np.zeros(0)
+    return EdgeScan(z, z, z)
+
+
+def _seqsum(a: np.ndarray) -> float:
+    """Sequential (left-to-right) sum, matching a Python accumulation loop
+    bit for bit (np.sum is pairwise)."""
+    return float(np.cumsum(a)[-1]) if len(a) else 0.0
+
+
+def _sums_above(w: np.ndarray) -> np.ndarray:
+    """Reverse cumulative sums: out[i] = sum of w[i:], out[n] = 0."""
+    out = np.zeros(len(w) + 1)
+    out[:-1] = np.cumsum(w[::-1])[::-1]
+    return out
+
+
+def _scan_edge_continuous(u: np.ndarray, ws: np.ndarray, wb: np.ndarray,
+                          y0: float, y_lim: float,
+                          s_fixed: float, b_fixed: float) -> EdgeScan:
+    """Candidate edges for a continuous variable. ``u`` holds the oriented
+    values (sorted ascending), ``ws``/``wb`` the signal/background weights.
+    An edge sits midway below each distinct value that carries signal, so
+    all background beneath it is removed for the same signal loss.
 
     Entries must contain only finite values (NaN filtered before calling).
     """
-    n = len(entries)
+    n = len(u)
     if n == 0:
-        return []
-    # Reverse cumulative sums (yields of entries [i, n))
-    s_above = np.zeros(n + 1)
-    b_above = np.zeros(n + 1)
-    for i in range(n - 1, -1, -1):
-        s_above[i] = s_above[i + 1] + entries[i, 1]
-        b_above[i] = b_above[i + 1] + entries[i, 2]
-
-    scan: list[EdgePoint] = []
-    i = 0
-    while i < n:
-        j = i
-        has_signal = False
-        while j < n and entries[j, 0] == entries[i, 0]:
-            has_signal = has_signal or entries[j, 1] > 0.0
-            j += 1
-        u = entries[i, 0]
-        if has_signal and u > y0:
-            y = max(y0, 0.5 * (entries[i - 1, 0] + u)) if i > 0 else y0
-            if y >= y_lim:
-                break
-            scan.append(EdgePoint(y, s_fixed + s_above[i],
-                                  b_fixed + b_above[i]))
-        i = j
-    return scan
+        return _empty_scan()
+    s_above = _sums_above(ws)
+    b_above = _sums_above(wb)
+    starts = np.flatnonzero(np.r_[True, u[1:] != u[:-1]])
+    has_signal = np.logical_or.reduceat(ws > 0.0, starts)
+    cand = starts[has_signal & (u[starts] > y0)]
+    if cand.size == 0:
+        return _empty_scan()
+    prev = u[np.maximum(cand - 1, 0)]
+    y = np.where(cand > 0, np.maximum(y0, 0.5 * (prev + u[cand])), y0)
+    stop = np.flatnonzero(y >= y_lim)
+    if stop.size:
+        cand = cand[:stop[0]]
+        y = y[:stop[0]]
+    return EdgeScan(y, s_fixed + s_above[cand], b_fixed + b_above[cand])
 
 
-def _scan_edge_discrete(entries: np.ndarray, y0: float, y_lim: float,
-                        s_fixed: float, b_fixed: float) -> list[EdgePoint]:
+def _scan_edge_discrete(u: np.ndarray, ws: np.ndarray, wb: np.ndarray,
+                        y0: float, y_lim: float,
+                        s_fixed: float, b_fixed: float) -> EdgeScan:
     """Candidate edges for a discrete (integer-valued) variable: whole-unit
     moves from y0 towards y_lim.
 
     Entries must contain only finite values (NaN filtered before calling).
     """
-    n = len(entries)
-    if n == 0:
-        return []
-    s_above = np.zeros(n + 1)
-    b_above = np.zeros(n + 1)
-    for i in range(n - 1, -1, -1):
-        s_above[i] = s_above[i + 1] + entries[i, 1]
-        b_above[i] = b_above[i + 1] + entries[i, 2]
-
+    if len(u) == 0:
+        return _empty_scan()
+    s_above = _sums_above(ws)
+    b_above = _sums_above(wb)
     n_max = round(y_lim - y0) - 1
-    scan: list[EdgePoint] = []
-    for move in range(1, n_max + 1):
-        y = y0 + move
-        # First entry with value > y
-        first = int(np.searchsorted(entries[:, 0], y, side="right"))
-        scan.append(EdgePoint(y, s_fixed + s_above[first],
-                              b_fixed + b_above[first]))
-    return scan
+    if n_max < 1:
+        return _empty_scan()
+    y = y0 + np.arange(1, n_max + 1)
+    first = np.searchsorted(u, y, side="right")  # first entry with value > y
+    return EdgeScan(y, s_fixed + s_above[first], b_fixed + b_above[first])
 
 
-def _choose_edge(scan: list[EdgePoint], n_sig_0: float,
-                 step: float) -> int:
+def _choose_edge(scan: EdgeScan, n_sig_0: float, step: float) -> int:
     """The largest move whose signal loss is within ``step``, or the first
     move if all exceed it. A move losing no signal (within tolerance) is
     taken one further."""
-    if not scan:
+    if len(scan) == 0:
         return -1
-    index = 0
-    for i, pt in enumerate(scan):
-        if 1.0 - pt.n_sig / n_sig_0 <= step:
-            index = i
+    ok = np.flatnonzero(1.0 - scan.n_sig / n_sig_0 <= step)
+    index = int(ok[-1]) if ok.size else 0
     # Use a relative tolerance for the no-signal-loss check to avoid
     # floating-point loops where cumulative sums differ in the last bit.
-    if (abs(scan[index].n_sig - n_sig_0) < 1e-12 * abs(n_sig_0)
+    if (abs(scan.n_sig[index] - n_sig_0) < 1e-12 * abs(n_sig_0)
             and index + 1 < len(scan)):
         index += 1
     return index
@@ -508,7 +538,6 @@ def _find_tighten_point(ivar: int, cuts: list[CutVar], events: Events,
     var = cuts[ivar]
     vals = events.vals[var.name]
     order = events.sort_indices[var.name]
-    n = len(order)
     best: TestPoint | None = None
 
     for side in (0, 1):  # 0 = lower edge, 1 = upper edge
@@ -528,40 +557,36 @@ def _find_tighten_point(ivar: int, cuts: list[CutVar], events: Events,
             y0 = var.cut_lo if side == 0 else -var.cut_hi
             y_lim = var.cut_hi if side == 0 else -var.cut_lo
 
-        entries = []
-        s_fixed = 0.0
-        b_fixed = 0.0
-        indices = order if sign > 0 else order[::-1]
-        for k in range(n):
-            i = int(indices[k])
-            if not pass_mask[i]:
-                continue
-            v = vals[i]
-            # Skip NaN values: they fail every cut, so they never pass
-            # and must not enter the scan.
-            if not np.isfinite(v):
-                continue
-            if is_veto:
-                movable = v < var.cut_lo if side == 0 else v > var.cut_hi
-                fixed = v > var.cut_hi if side == 0 else v < var.cut_lo
-            else:
-                movable = (var.cut_type != BOTH
-                           or (v < var.cut_hi if side == 0 else v > var.cut_lo))
-                fixed = False
-            if movable:
-                entries.append([sign * v, events.w_sig[i], events.w_bkg[i]])
-            elif fixed:
-                s_fixed += events.w_sig[i]
-                b_fixed += events.w_bkg[i]
-
-        if not entries:
-            continue
-        arr = np.array(entries)
-        use_discrete = var.discrete and not is_veto
-        if use_discrete:
-            scan = _scan_edge_discrete(arr, y0, y_lim, s_fixed, b_fixed)
+        idx_sorted = order if sign > 0 else order[::-1]
+        v = vals[idx_sorted]
+        # NaN values fail every cut, so they never pass and must not enter
+        # the scan.
+        keep = pass_mask[idx_sorted] & np.isfinite(v)
+        if is_veto:
+            movable = keep & ((v < var.cut_lo) if side == 0
+                              else (v > var.cut_hi))
+            fixed = keep & ((v > var.cut_hi) if side == 0
+                            else (v < var.cut_lo))
         else:
-            scan = _scan_edge_continuous(arr, y0, y_lim, s_fixed, b_fixed)
+            if var.cut_type == BOTH:
+                movable = keep & ((v < var.cut_hi) if side == 0
+                                  else (v > var.cut_lo))
+            else:
+                movable = keep
+            fixed = None
+        ws = events.w_sig[idx_sorted]
+        wb = events.w_bkg[idx_sorted]
+        s_fixed = b_fixed = 0.0
+        if fixed is not None:
+            s_fixed = _seqsum(ws[fixed])
+            b_fixed = _seqsum(wb[fixed])
+        if not movable.any():
+            continue
+        u = sign * v[movable]
+        use_discrete = var.discrete and not is_veto
+        scan_fn = _scan_edge_discrete if use_discrete else _scan_edge_continuous
+        scan = scan_fn(u, ws[movable], wb[movable], y0, y_lim,
+                       s_fixed, b_fixed)
         idx = _choose_edge(scan, n_sig_0, step)
         if idx < 0:
             continue
@@ -592,7 +617,6 @@ def _find_loosen_point(ivar: int, cuts: list[CutVar], events: Events,
 
     vals = events.vals[var.name]
     order = events.sort_indices[var.name]
-    n = len(order)
     target = n_sig_c * (1.0 + step)
     best: TestPoint | None = None
 
@@ -607,37 +631,26 @@ def _find_loosen_point(ivar: int, cuts: list[CutVar], events: Events,
         if y_cur <= y0:
             continue
 
-        entries = []
-        s_loose = 0.0
-        b_loose = 0.0
-        indices = order if sign > 0 else order[::-1]
-        for k in range(n):
-            i = int(indices[k])
-            if not pass_mask[i]:
-                continue
-            v = vals[i]
-            # Skip NaN values
-            if not np.isfinite(v):
-                continue
-            if var.cut_type == BOTH:
-                if not (v < var.cut_hi if side == 0 else v > var.cut_lo):
-                    continue
-            entries.append([sign * v, events.w_sig[i], events.w_bkg[i]])
-            if sign * v > y0:
-                s_loose += events.w_sig[i]
-                b_loose += events.w_bkg[i]
-
-        if not entries:
+        idx_sorted = order if sign > 0 else order[::-1]
+        v = vals[idx_sorted]
+        keep = pass_mask[idx_sorted] & np.isfinite(v)
+        if var.cut_type == BOTH:
+            keep &= (v < var.cut_hi) if side == 0 else (v > var.cut_lo)
+        if not keep.any():
             continue
-        arr = np.array(entries)
-        scan = _scan_edge_continuous(arr, y0, y_cur, 0.0, 0.0)
+        u = sign * v[keep]
+        ws = events.w_sig[idx_sorted][keep]
+        wb = events.w_bkg[idx_sorted][keep]
+        loose = u > y0
+        s_loose = _seqsum(ws[loose])
+        b_loose = _seqsum(wb[loose])
+        scan = _scan_edge_continuous(u, ws, wb, y0, y_cur, 0.0, 0.0)
         # Insert the loosest point at the front
-        scan.insert(0, EdgePoint(y0, s_loose, b_loose))
+        scan = EdgeScan(np.r_[y0, scan.edge], np.r_[s_loose, scan.n_sig],
+                        np.r_[b_loose, scan.n_bkg])
         # Take the tightest position that gains the step
-        index = 0
-        for i, pt in enumerate(scan):
-            if pt.n_sig >= target:
-                index = i
+        ok = np.flatnonzero(scan.n_sig >= target)
+        index = int(ok[-1]) if ok.size else 0
         if scan[index].n_sig <= n_sig_c:
             continue
         edge = sign * scan[index].edge
