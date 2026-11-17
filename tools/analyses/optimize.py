@@ -58,6 +58,7 @@ consistent with ``evaluate_yields``.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import functools
 import math
 from dataclasses import dataclass, field
@@ -174,6 +175,9 @@ class Events:
     w_bkg: np.ndarray = field(default_factory=lambda: np.zeros(0))
     sort_indices: dict[str, np.ndarray] = field(default_factory=dict)
     event_numbers: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    # name -> (values, w_sig, w_bkg) in sort_indices order, built on demand
+    _sorted: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = field(
+        default_factory=dict, repr=False)
 
     @property
     def size(self) -> int:
@@ -183,6 +187,19 @@ class Events:
         """Pre-sort events by each variable for fast edge scanning."""
         for name, values in self.vals.items():
             self.sort_indices[name] = np.argsort(values, kind="stable")
+        self._sorted.clear()
+
+    def sorted_arrays(self, name: str
+                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Values and signal/background weights in ascending order of
+        variable ``name`` (the order of ``sort_indices[name]``), cached."""
+        cached = self._sorted.get(name)
+        if cached is None:
+            order = self.sort_indices[name]
+            cached = (self.vals[name][order], self.w_sig[order],
+                      self.w_bkg[order])
+            self._sorted[name] = cached
+        return cached
 
     def split(self) -> tuple["Events", "Events"]:
         """Split by event-number parity: even → train, odd → test, each ×2."""
@@ -536,8 +553,11 @@ def _find_tighten_point(ivar: int, cuts: list[CutVar], events: Events,
     sides. Returns the side with the larger FoM, or None if neither can
     tighten."""
     var = cuts[ivar]
-    vals = events.vals[var.name]
-    order = events.sort_indices[var.name]
+    sorted_arrays = events.sorted_arrays(var.name)
+    # NaN values fail every cut, so they never pass and must not enter
+    # the scan.
+    pass_sorted = (pass_mask[events.sort_indices[var.name]]
+                   & np.isfinite(sorted_arrays[0]))
     best: TestPoint | None = None
 
     for side in (0, 1):  # 0 = lower edge, 1 = upper edge
@@ -557,11 +577,10 @@ def _find_tighten_point(ivar: int, cuts: list[CutVar], events: Events,
             y0 = var.cut_lo if side == 0 else -var.cut_hi
             y_lim = var.cut_hi if side == 0 else -var.cut_lo
 
-        idx_sorted = order if sign > 0 else order[::-1]
-        v = vals[idx_sorted]
-        # NaN values fail every cut, so they never pass and must not enter
-        # the scan.
-        keep = pass_mask[idx_sorted] & np.isfinite(v)
+        v, ws, wb = sorted_arrays
+        keep = pass_sorted
+        if sign < 0:
+            v, ws, wb, keep = v[::-1], ws[::-1], wb[::-1], keep[::-1]
         if is_veto:
             movable = keep & ((v < var.cut_lo) if side == 0
                               else (v > var.cut_hi))
@@ -574,8 +593,6 @@ def _find_tighten_point(ivar: int, cuts: list[CutVar], events: Events,
             else:
                 movable = keep
             fixed = None
-        ws = events.w_sig[idx_sorted]
-        wb = events.w_bkg[idx_sorted]
         s_fixed = b_fixed = 0.0
         if fixed is not None:
             s_fixed = _seqsum(ws[fixed])
@@ -615,8 +632,9 @@ def _find_loosen_point(ivar: int, cuts: list[CutVar], events: Events,
     others[ivar].applied = False
     _, _, pass_mask = evaluate_yields_mask(others, events)
 
-    vals = events.vals[var.name]
-    order = events.sort_indices[var.name]
+    sorted_arrays = events.sorted_arrays(var.name)
+    pass_sorted = (pass_mask[events.sort_indices[var.name]]
+                   & np.isfinite(sorted_arrays[0]))
     target = n_sig_c * (1.0 + step)
     best: TestPoint | None = None
 
@@ -631,16 +649,17 @@ def _find_loosen_point(ivar: int, cuts: list[CutVar], events: Events,
         if y_cur <= y0:
             continue
 
-        idx_sorted = order if sign > 0 else order[::-1]
-        v = vals[idx_sorted]
-        keep = pass_mask[idx_sorted] & np.isfinite(v)
+        v, ws, wb = sorted_arrays
+        keep = pass_sorted
+        if sign < 0:
+            v, ws, wb, keep = v[::-1], ws[::-1], wb[::-1], keep[::-1]
         if var.cut_type == BOTH:
-            keep &= (v < var.cut_hi) if side == 0 else (v > var.cut_lo)
+            keep = keep & ((v < var.cut_hi) if side == 0 else (v > var.cut_lo))
         if not keep.any():
             continue
         u = sign * v[keep]
-        ws = events.w_sig[idx_sorted][keep]
-        wb = events.w_bkg[idx_sorted][keep]
+        ws = ws[keep]
+        wb = wb[keep]
         loose = u > y0
         s_loose = _seqsum(ws[loose])
         b_loose = _seqsum(wb[loose])
@@ -827,6 +846,52 @@ def refine(cuts: list[CutVar], events: Events, step: float,
 # Random grid search
 # ---------------------------------------------------------------------------
 
+# Upper bound on the (trials x events) boolean mask built per batch.
+_BATCH_MASK_ELEMENTS = 1 << 22
+
+
+def _evaluate_yields_batch(trials: list[list[CutVar]], events: Events
+                           ) -> tuple[np.ndarray, np.ndarray]:
+    """Signal and background yields of many cut-sets at once.
+
+    Each batch builds a (trials x events) pass mask, one variable at a
+    time, and sums the weights with a matrix-vector product. Equivalent to
+    ``evaluate_yields`` per trial, up to floating-point summation order.
+    """
+    n_trials = len(trials)
+    n_sig = np.zeros(n_trials)
+    n_bkg = np.zeros(n_trials)
+    if n_trials == 0 or events.size == 0:
+        return n_sig, n_bkg
+    names = [v.name for v in trials[0]]
+    batch = max(1, _BATCH_MASK_ELEMENTS // events.size)
+    for start in range(0, n_trials, batch):
+        chunk = trials[start:start + batch]
+        mask = np.ones((len(chunk), events.size), dtype=bool)
+        for k, name in enumerate(names):
+            applied = np.array([t[k].applied for t in chunk])
+            if not applied.any():
+                continue
+            rows = np.flatnonzero(applied)
+            var = chunk[rows[0]][k]
+            lo = np.array([chunk[r][k].cut_lo for r in rows])[:, None]
+            hi = np.array([chunk[r][k].cut_hi for r in rows])[:, None]
+            v = events.vals[name][None, :]
+            if var.cut_type == BOTH:
+                passed = (v > lo) & (v < hi)
+            elif var.cut_type == LEFT:
+                passed = v > lo
+            elif var.cut_type == RIGHT:
+                passed = v < hi
+            else:
+                passed = (v < lo) | (v > hi)
+            mask[rows] &= passed
+        maskf = mask.astype(np.float64)
+        n_sig[start:start + len(chunk)] = maskf @ events.w_sig
+        n_bkg[start:start + len(chunk)] = maskf @ events.w_bkg
+    return n_sig, n_bkg
+
+
 def random_grid_search(cuts: list[CutVar], events: Events,
                        n_trials: int, fom: FigureOfMerit,
                        rng: np.random.Generator | None = None,
@@ -845,11 +910,13 @@ def random_grid_search(cuts: list[CutVar], events: Events,
     n_sig_0, n_bkg_0 = evaluate_yields(unapplied, events)
     fom_0 = fom(n_sig_0, n_bkg_0)
 
-    results: list[dict] = []
+    # Draw every trial first (the RNG call sequence is unchanged), then
+    # evaluate all trials in batches as (trials x events) masks.
+    trials: list[list[CutVar]] = []
     for _ in range(n_trials):
         test_cuts: list[CutVar] = []
         for var in cuts:
-            tc = copy.deepcopy(var)
+            tc = dataclasses.replace(var)
             tc.applied = rng.random() > 0.5
             if var.cut_type == VETO:
                 tc.cut_lo = var.lo + rng.random() * (var.hi - var.lo)
@@ -871,8 +938,14 @@ def random_grid_search(cuts: list[CutVar], events: Events,
             if var.cut_type != LEFT:
                 tc.cut_hi = var.hi - rng.random() * (var.hi - tc.cut_lo)
             test_cuts.append(tc)
+        trials.append(test_cuts)
 
-        n_sig, n_bkg = evaluate_yields(test_cuts, events)
+    n_sig_all, n_bkg_all = _evaluate_yields_batch(trials, events)
+
+    results: list[dict] = []
+    for test_cuts, n_sig, n_bkg in zip(trials, n_sig_all, n_bkg_all):
+        n_sig = float(n_sig)
+        n_bkg = float(n_bkg)
         if n_bkg <= 0.0:
             continue
         eff = n_sig / n_sig_0 if n_sig_0 > 0 else 0.0
