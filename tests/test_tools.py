@@ -6378,79 +6378,86 @@ def test_optimize_selection_ntuple_registered():
     assert spec.units  # units are declared
 
 
-# --- fullsim cut_mode="optimize" (optimize.py, tune.py, cosmic_reference.py) ---
+# --- fullsim cut_mode="optimize" (tune.py on optimize.py, cosmic_reference.py) ---
 
-from tools.analyses.fullsim import optimize as fs_opt
 from tools.analyses.fullsim import tune as fs_tune
 from tools.analyses.fullsim import cosmic_reference as fs_ref
 
 
-def _toy_table(seed=1, ns=3000, nb=12000):
-    """Signal peaked in x and at high q, background flat: the best cuts are
+def _toy_rows(seed=1, ns=3000, nb=12000):
+    """The tuned variables, signal peaked in d0 and at high trkqual,
+    background flat in both, the rest the same for both: the best cuts are
     obvious, so a search that misses them is broken."""
     rng = np.random.default_rng(seed)
-    x = np.r_[rng.normal(0, 1, ns), rng.uniform(-5, 5, nb)]
-    q = np.r_[rng.beta(5, 1, ns), rng.uniform(0, 1, nb)]
-    n = np.r_[np.round(rng.normal(30, 5, ns)), rng.integers(10, 61, nb)].astype(float)
-    sw = np.r_[np.full(ns, 5.0 / ns), np.zeros(nb)]
-    bw = np.r_[np.zeros(ns), np.full(nb, 20.0 / nb)]
-    return fs_opt.Table.from_columns({"x": x, "q": q, "n": n}, sw, bw, np.arange(ns + nb))
+    n = ns + nb
+    vals = {"cos": np.full(n, 0.6), "rmax": np.full(n, 500.0),
+            "trkpid": np.full(n, 0.5), "t0err": np.full(n, 1.0),
+            "d0": np.r_[rng.normal(0, 30, ns), rng.uniform(-200, 200, nb)],
+            "trkqual": np.r_[rng.beta(5, 1, ns), rng.uniform(0, 1, nb)],
+            "nactive": np.r_[np.round(rng.normal(30, 5, ns)),
+                             rng.integers(10, 61, nb)].astype(float)}
+    ev = fs_tune.op.Events(vals=vals, w_sig=np.r_[np.full(ns, 5.0 / ns), np.zeros(nb)],
+                           w_bkg=np.r_[np.zeros(ns), np.full(nb, 20.0 / nb)],
+                           event_numbers=np.arange(n))
+    ev.prepare()
+    return ev
 
 
-TOY_VARIABLES = (fs_opt.Variable("x", -5, 5), fs_opt.Variable("q", 0, 1, "low"),
-                 fs_opt.Variable("n", 9.5, 60.5, "both", discrete=True))
-
-
-def test_fullsim_optimize_finds_the_obvious_cuts_and_reports_the_held_out_half():
-    table = _toy_table()
-    r = fs_opt.optimize(table, TOY_VARIABLES, {}, n_random=2)
-    lo, hi = r.best.cuts["x"]
-    assert -2.5 < lo < -1.0 and 1.0 < hi < 2.5, r.best.cuts
-    assert 0.3 < r.best.cuts["q"][0] < 0.8 and r.best.cuts["q"][1] == np.inf
+def test_fullsim_search_finds_the_obvious_cuts_and_reports_the_held_out_half():
+    train, test = _toy_rows().split()
+    best = fs_tune.search(train, fs_tune.open_cuts(), [], step=0.01,
+                          min_efficiency=0.3, n_random=2)
+    lo, hi = best.cuts["d0"]
+    assert -90 < lo < -20 and 20 < hi < 90, best.cuts
+    assert 0.3 < best.cuts["trkqual"][0] < 0.8 and best.cuts["trkqual"][1] == np.inf
     # integer edges on half-integers
-    for edge in r.best.cuts["n"]:
-        assert not np.isfinite(edge) or edge % 1 == 0.5, r.best.cuts["n"]
+    for edge in best.cuts["nactive"]:
+        assert not np.isfinite(edge) or edge % 1 == 0.5, best.cuts["nactive"]
     # far better than no cut, and the odd events agree within the toy's noise
-    assert r.best.fom > 2.0 * r.seed_train.fom
-    assert abs(r.best_test.fom / r.best.fom - 1) < 0.15
-    # every reported selection re-evaluates to its yields
-    again = fs_opt.evaluate(table.half(True), r.best.cuts)
-    assert np.isclose(again.signal, r.best.signal) and np.isclose(again.background, r.best.background)
+    none = fs_tune.evaluate(train, fs_tune.open_cuts())
+    assert best.fom > 2.0 * none.fom
+    assert abs(fs_tune.evaluate(test, best.cuts).fom / best.fom - 1) < 0.15
+    # the optimizer's yields are the reported cuts' yields
+    again = fs_tune.evaluate(train, best.cuts)
+    assert np.isclose(again.signal, best.signal) and np.isclose(again.background, best.background)
 
 
-def test_fullsim_optimize_an_unplaced_edge_cuts_nothing():
-    # as the macro's Var_t.applied: values outside the range and at its end
-    # pass until an edge is placed, and a one-sided cut never gets the other
-    t = fs_opt.Table.from_columns({"q": [1.0, 1.0, 0.2, 5.0]}, [1, 1, 0, 1], [0, 0, 1, 0], [0, 2, 4, 6])
-    assert fs_opt.evaluate(t, fs_opt.open_cuts([fs_opt.Variable("q", 0, 1, "low")])).signal == 3
-    assert fs_opt.evaluate(t, {"q": (0.5, np.inf)}).signal == 3
+def test_fullsim_cut_vars_round_trip_and_an_unplaced_edge_cuts_nothing():
+    seed = {**fs_tune.open_cuts(),
+            **fs_tune.seed_cuts("run1a_tsda", (540.0, 1650.0))}
+    assert fs_tune.from_cut_vars(fs_tune.to_cut_vars(seed)) == seed
+    vars_ = {c.name: c for c in fs_tune.to_cut_vars(seed)}
+    # rmax is not in the cut set: no cut, so values outside its range pass
+    assert not vars_["rmax"].applied and vars_["trkqual"].applied
+    assert vars_["nactive"].cut_lo == 16.5 and vars_["nactive"].discrete
+    assert fs_tune.from_cut_vars(fs_tune.to_cut_vars({})) == fs_tune.open_cuts()
+    vals = {n: np.array([0.0]) for n in fs_tune.VARIABLE_NAMES}
+    vals["rmax"] = np.array([5000.0])
+    assert fs_tune.passes(vals, fs_tune.open_cuts()).all()
+    try:
+        fs_tune.to_cut_vars({"p": (100, 105)})
+    except fs_tune.TuneError as exc:
+        assert "not a tuned variable" in str(exc)
+    else:
+        raise AssertionError("a cut on an untuned variable was accepted")
 
 
-def test_fullsim_optimize_keeps_tiny_weights_beside_large_ones():
+def test_fullsim_search_keeps_tiny_weights_beside_large_ones():
     # a DIO stand-in of 1e-17 next to cosmics of 1: a total minus a prefix
     # would round it to 0 (the approx_ce_sensitivity numerics trap)
-    x = np.array([0.0, 1.0, 2.0, 3.0])
-    t = fs_opt.Table.from_columns({"x": x}, [1, 1, 0, 0], [1e-17, 2e-17, 1.0, 1.0], [0, 2, 4, 6])
-    edges, s, b = fs_opt._scan(t, {"x": (-np.inf, np.inf)}, fs_opt.Variable("x", -1, 4), upper=True)
-    kept_two = edges[(edges > 1.0) & (edges < 2.0)]
-    i = list(edges).index(kept_two[0]) if kept_two.size else None
-    assert i is not None and b[i] == 3e-17 and s[i] == 2, (edges, s, b)
-
-
-def test_fullsim_optimize_matches_the_macro_semantics_on_s_over_sqrt_b():
-    table = _toy_table(seed=3)
-    r = fs_opt.optimize(table, TOY_VARIABLES, {}, n_random=1, fom="s_over_sqrt_b")
-    sel = fs_opt.evaluate(table.half(True), r.best.cuts)
-    assert np.isclose(r.best.signal / np.sqrt(r.best.background),
-                      sel.signal / np.sqrt(sel.background))
-    # the module's figure of merit is back to Punzi afterwards
-    assert fs_opt._fom is fs_opt.punzi_fom
-    try:
-        fs_opt.optimize(table, TOY_VARIABLES, {}, fom="nope")
-    except fs_opt.OptimizeError as exc:
-        assert "punzi" in str(exc)
-    else:
-        raise AssertionError("an unknown fom was accepted")
+    op = fs_tune.op
+    # (a move losing no signal is taken one step further, as in the macro:
+    # the upper edge lands between 1 and 2, keeping two signal rows)
+    ev = op.Events(vals={"x": np.array([0.0, 1.0, 2.0, 3.0])},
+                   w_sig=np.array([1.0, 1.0, 1.0, 0.0]),
+                   w_bkg=np.array([1e-17, 2e-17, 4e-17, 1.0]),
+                   event_numbers=np.arange(4))
+    ev.prepare()
+    cuts = [op.CutVar("x", -1.0, 4.0)]
+    best = max(op._tighten_candidates(cuts, ev, 0.01, op.punzi_fom),
+               key=lambda tp: tp.fom_value)
+    assert 1.0 < best.new_hi < 2.0 and best.n_sig == 2.0, best
+    assert np.isclose(best.n_bkg, 3e-17, rtol=1e-12, atol=0), best
 
 
 def test_fullsim_dio_weights_integrate_the_spectrum_per_bin():

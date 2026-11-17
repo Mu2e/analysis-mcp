@@ -16,8 +16,7 @@ computed.
 | `eventntuple.py` | the branch set and reader (`read_eventntuple`), trigger paths, surface ids and process codes, and `origin_codes`: what made each event's first track |
 | `normalization.py` | stopped mu- per POT from the stop chain's stage efficiencies, computed from their SAM datasets as `CreateSimEfficiency.sh` does (`sim_efficiencies`, `stopped_muons_per_pot`), and the captures/DIO per stopped mu-, as Production's `normalizations.py` |
 | `provenance.py` | events generated to make a file: `dh.gencount` of its nearest SAM ancestor that has one (`generated_events`) |
-| `optimize.py` | the rectangular-cut search of `cut_mode="optimize"`: a numpy port of M. MacKenzie's `optimize_selection_fast.C` (greedy path, randomized paths, local search; even events choose, odd events report), on the Punzi FoM. Knows nothing about Mu2e |
-| `tune.py` | the optimize mode's table: the preselection's first track per event, the tuned variables, signal and per-event DIO weights in 0.1 MeV bins, the cosmic rows; the momentum-window scan and the window/cut alternation |
+| `tune.py` | the optimize mode's table: the preselection's first track per event, the tuned variables, signal and per-event DIO weights in 0.1 MeV bins, the cosmic rows; the momentum-window scan and the window/cut alternation. The cut search is the shared optimizer `tools/analyses/optimize.py` (M. MacKenzie's port of `optimize_selection_fast.C`, also behind `optimize_selection_ntuple`); `tune.py` converts its cuts to and from that optimizer's `CutVar`s |
 | `cosmic_reference.py` | the fixed cosmic reference table the optimize mode reads (`data/fullsim_cosmic_reference.npz`, made by `scripts/make_fullsim_cosmic_reference.py`), and its normalization |
 | `cuts.py` | pyfitter's `Analyze.define_cuts` with a cut set's thresholds (`CUT_SETS`: `run1a_tsda`, the default, and `80_1d`), as track-level masks (`cut_masks`), each set's default cuts and time window, toggling by name, and the cut flow |
 
@@ -160,9 +159,10 @@ the selection is also tuned on the inputs:
   (`cosmic_reference`), flat over 100-110 MeV/c and scaled to the window,
   normalized so that the loose set-81 selection gives the loose cosmic rate
   `approx_ce_sensitivity` uses in box mode.
-- **Search**: the macro's greedy path and five randomized paths from no cut,
-  the cut set and the previous round as further starts, each refined by a
-  local search; on the Punzi FoM `S/(1.28/2 + sqrt(B))`. Cuts and window
+- **Search**: the shared optimizer (`tools/analyses/optimize.py`, as
+  `optimize_selection_ntuple`): the macro's greedy path and five randomized
+  paths from no cut, the cut set and the previous round as further starts,
+  each refined by a local search; on the Punzi FoM `S/(1.28/2 + sqrt(B))`. Cuts and window
   are chosen on even event numbers and every `opt_*` FoM below is on odd
   ones, so the gain is not the search's own optimism.
 
@@ -270,7 +270,8 @@ synthetic events. When the CeMLeadingLogMix1BB file above is on disk it
 also checks pyfitter's cut flow, the measured efficiency, the window and
 the acceptance and `upstream_eff` scaling on it (with `n_generated`
 given, so it needs no network). The optimize mode's search is tested on toy
-tables (the obvious cuts, unplaced edges, half-integer edges, tiny DIO
-weights beside large cosmic ones), its DIO weights against the spectrum, the
+events through the shared optimizer (the obvious cuts, the cut conversion and
+unplaced edges, half-integer edges, tiny DIO weights beside large cosmic
+ones), its DIO weights against the spectrum, the
 reference's normalization, and, on the CE mix file, a full run with a toy
 reference.

@@ -63,7 +63,6 @@ from .normalization import (CAPTURES_PER_STOPPED_MUON, DIO_PER_STOPPED_MUON,
 from .provenance import ProvenanceError, generated_events
 from . import cosmic_reference
 from . import tune
-from .optimize import OptimizeError
 
 # cut_mode values: the cut set as it stands, or tuned per input (tune.py).
 CUT_MODES = ("fixed", "optimize")
@@ -546,7 +545,7 @@ def run(context: RunContext) -> RunOutcome:
             tuned, opt_metrics, opt_extra = _optimize_selection(
                 candidates, cut_set, (t_lo, t_hi), n_generated, upstream_eff,
                 spectra, rmue, params["cosmic_reference"])
-        except (tune.TuneError, OptimizeError, cosmic_reference.ReferenceError) as exc:
+        except (tune.TuneError, cosmic_reference.ReferenceError) as exc:
             return RunOutcome(error=f"cut_mode='optimize': {exc}", extra=extra)
         metrics.update(opt_metrics)
         extra["optimize"] = opt_extra

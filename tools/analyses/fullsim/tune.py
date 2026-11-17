@@ -4,8 +4,10 @@ The selection is a cut set's vetoes and requirements (the preselection:
 trigger, upstream and multi-track vetoes, a calorimeter cluster, no OPA, no
 TSDA, CRV) with the stopping-target cuts dropped, as M. MacKenzie's
 optimize_target_selection_fast does (they assume the standard target), and
-rectangular cuts on the tuned variables, chosen by optimize.optimize on the
-Punzi FoM from the cut set's own thresholds.
+rectangular cuts on the tuned variables, chosen on the Punzi FoM by the
+shared cut-set optimizer (tools/analyses/optimize.py, M. MacKenzie's port of
+optimize_selection_fast.C: greedy path, randomized paths, local search),
+started from no cut and from the cut set's own thresholds.
 
 The table's rows:
 
@@ -40,7 +42,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from . import optimize as op
+from .. import optimize as op
 from .cuts import CUT_ORDER, cut_masks, default_cuts, get_cut_set
 from .eventntuple import SID_TT_FRONT, SID_TT_MID, origin_codes
 
@@ -66,14 +68,41 @@ CALO_FLAG = "has_calo"
 # against the radiative pion captures and the beam flash, which this
 # background model (DIO and cosmics) does not hold, so a search would just
 # open it. It is applied to every row as the cut set's (time_window).
+# side: "both", or "low" (cuts low values, keeps x > lo) or "high" (cuts
+# high values, keeps x < hi), the optimizer's both / left / right.
+_CUT_TYPES = {"both": op.BOTH, "low": op.LEFT, "high": op.RIGHT}
+
+
+@dataclass(frozen=True)
+class Variable:
+    """A tuned variable and the range its edges may take. An integer-valued
+    variable's range ends sit on half-integers, and so do its edges."""
+    name: str
+    low: float
+    high: float
+    side: str = "both"
+    discrete: bool = False
+
+    def cut_var(self, lo: float = -np.inf, hi: float = np.inf) -> op.CutVar:
+        """The optimizer's CutVar for the cut lo < x < hi; an infinite edge
+        is no cut, and an edge outside the range sits at the range end."""
+        cut_type = _CUT_TYPES[self.side]
+        applied = ((cut_type != op.RIGHT and np.isfinite(lo))
+                   or (cut_type != op.LEFT and np.isfinite(hi)))
+        clip = lambda x, end: float(min(max(x, self.low), self.high)) if np.isfinite(x) else end
+        return op.CutVar(self.name, self.low, self.high,
+                         cut_lo=clip(lo, self.low), cut_hi=clip(hi, self.high),
+                         cut_type=cut_type, discrete=self.discrete, applied=applied)
+
+
 VARIABLES = (
-    op.Variable("cos", 0.30, 0.95),
-    op.Variable("rmax", 300.0, 750.0),
-    op.Variable("d0", -200.0, 200.0),
-    op.Variable("trkqual", -1.0, 1.0, "low"),
-    op.Variable("trkpid", -1.0, 1.0, "low"),
-    op.Variable("t0err", -1.0, 3.0, "high"),
-    op.Variable("nactive", 9.5, 200.5, "low", discrete=True),
+    Variable("cos", 0.30, 0.95),
+    Variable("rmax", 300.0, 750.0),
+    Variable("d0", -200.0, 200.0),
+    Variable("trkqual", -1.0, 1.0, "low"),
+    Variable("trkpid", -1.0, 1.0, "low"),
+    Variable("t0err", -1.0, 3.0, "high"),
+    Variable("nactive", 9.5, 200.5, "low", discrete=True),
 )
 VARIABLE_NAMES = tuple(v.name for v in VARIABLES)
 
@@ -240,7 +269,10 @@ class Rows:
     dio: np.ndarray       # CE rows x bins: DIO weight per bin
     cosmic_per_mev: np.ndarray  # cosmic rows' weight per MeV of window
 
-    def table(self, window) -> op.Table:
+    def events(self, window) -> op.Events:
+        """The optimizer's events for a momentum window (bin indices
+        [ka, kb)): every row, with its signal and background weight there.
+        Split them with .split() (even events train, odd test, each x2)."""
         ka, kb = window
         n_ce = int(self.is_ce.sum())
         s = np.zeros(self.event.size)
@@ -250,7 +282,11 @@ class Rows:
         # summed bin by bin over the few bins of the window
         b[:n_ce] = self.dio[:, ka:kb].sum(axis=1)
         b[n_ce:] = self.cosmic_per_mev * (kb - ka) * P_BIN_MEV
-        return op.Table.from_columns(self.values, s, b, self.event)
+        events = op.Events(vals={k: np.asarray(v, dtype=float) for k, v in self.values.items()},
+                           w_sig=s, w_bkg=b,
+                           event_numbers=np.asarray(self.event, dtype=np.int64))
+        events.prepare()
+        return events
 
 
 def build_rows(ce: dict, cosmic: dict, *, signal_per_event: float,
@@ -278,10 +314,7 @@ def scan_window(rows: Rows, cuts: dict, train: bool):
     """The momentum window (bin indices [ka, kb)) with the largest Punzi FoM
     for `cuts`, on one half. Returns (ka, kb, fom)."""
     half = (rows.event % 2 == 0) == train
-    table = op.Table({n: v[half] for n, v in rows.values.items()},
-                     np.zeros(int(half.sum())), np.zeros(int(half.sum())),
-                     np.full(int(half.sum()), train))
-    passing = op.passes(table, cuts)
+    passing = passes({n: v[half] for n, v in rows.values.items()}, cuts)
     n_ce = int(rows.is_ce.sum())
     ce_half, cos_half = half[:n_ce], half[n_ce:]
     ce_pass = passing[:int(ce_half.sum())]
@@ -306,16 +339,73 @@ def scan_window(rows: Rows, cuts: dict, train: bool):
     return best
 
 
+# --- the search ------------------------------------------------------------
+#
+# Cuts here are {name: (lo, hi)}, keeping lo < x < hi, an infinite edge no
+# cut: what sensitivity.py reports. The optimizer works on CutVar lists;
+# these convert, and a CutVar list converts back exactly.
+
+def open_cuts() -> dict:
+    return {v.name: (-np.inf, np.inf) for v in VARIABLES}
+
+
+def to_cut_vars(cuts: dict) -> list:
+    unknown = set(cuts) - set(VARIABLE_NAMES)
+    if unknown:
+        raise TuneError(f"cut on {', '.join(sorted(unknown))}, which is not a tuned variable")
+    return [v.cut_var(*cuts.get(v.name, (-np.inf, np.inf))) for v in VARIABLES]
+
+
+def from_cut_vars(cut_vars) -> dict:
+    out = open_cuts()
+    for c in cut_vars:
+        if not c.applied:
+            continue
+        out[c.name] = (c.cut_lo if c.cut_type != op.RIGHT else -np.inf,
+                       c.cut_hi if c.cut_type != op.LEFT else np.inf)
+    return out
+
+
+def passes(values: dict, cuts: dict) -> np.ndarray:
+    """Rows inside every cut (a NaN fails any finite one)."""
+    keep = np.ones(len(next(iter(values.values()))), dtype=bool)
+    for name, (lo, hi) in cuts.items():
+        v = values[name]
+        if np.isfinite(lo):
+            keep &= v > lo
+        if np.isfinite(hi):
+            keep &= v < hi
+    return keep
+
+
+@dataclass
+class Yields:
+    """Cuts and the signal and background they pass, on one half."""
+    cuts: dict
+    signal: float
+    background: float
+
+    @property
+    def fom(self) -> float:
+        return float(op.punzi_fom(self.signal, self.background))
+
+
+def evaluate(events: op.Events, cuts: dict) -> Yields:
+    keep = passes(events.vals, cuts)
+    return Yields(dict(cuts), float(events.w_sig[keep].sum()),
+                  float(events.w_bkg[keep].sum()))
+
+
 @dataclass
 class Tuned:
     seed_cuts: dict
     seed_window: tuple
     cuts: dict
     window: tuple
-    seed_train: op.Selection
-    seed_test: op.Selection
-    best_train: op.Selection
-    best_test: op.Selection
+    seed_train: Yields
+    seed_test: Yields
+    best_train: Yields
+    best_test: Yields
     rounds: list
 
     @property
@@ -328,26 +418,47 @@ class Tuned:
         return float(e[window[0]]), float(e[window[1]])
 
 
+def search(train: op.Events, seed: dict, starts: list, step: float,
+           min_efficiency: float, n_random: int) -> Yields:
+    """The optimizer's best selection on the train half: the greedy path from
+    no cut (as the macro's: a path from the seed only tightens, and the local
+    search loosens a step at a time, so a seed tighter than the optimum on
+    some variable would trap it), n_random randomized paths, and the seed and
+    `starts` as further starting points, each refined; Punzi FoM."""
+    if evaluate(train, seed).signal <= 0:
+        raise TuneError("no signal passes the seed cuts in the train half")
+    result = op.multi_start_optimize(
+        to_cut_vars({}), train, step, min_efficiency, op.punzi_fom,
+        seeds=[to_cut_vars(seed)] + [to_cut_vars(c) for c in starts],
+        n_random=n_random)
+    best = result["best"]
+    if best is None:
+        raise TuneError("the cut search found no selection with signal in the train half")
+    return Yields(from_cut_vars(best.cuts), best.n_sig, best.n_bkg)
+
+
 def tune(rows: Rows, seed: dict, step: float = 0.01, min_efficiency: float = 0.3,
          n_random: int = 5, rounds: int = 2) -> Tuned:
+    seed = {**open_cuts(), **seed}
     seed_window = scan_window(rows, seed, train=True)[:2]
     cuts, window = dict(seed), seed_window
     history = []
     for _ in range(rounds):
-        result = op.optimize(rows.table(window), VARIABLES, seed, step=step,
-                             min_efficiency=min_efficiency, n_random=n_random,
-                             extra_starts={"previous": cuts} if cuts != seed else None)
-        cuts = result.best.cuts
+        train, _test = rows.events(window).split()
+        best = search(train, seed, [cuts] if cuts != seed else [], step,
+                      min_efficiency, n_random)
+        cuts = best.cuts
         new_window = scan_window(rows, cuts, train=True)[:2]
-        history.append({"window": window, "fom_train": result.best.fom})
+        history.append({"window": window, "fom_train": best.fom})
         if new_window == window:
             break
         window = new_window
-    seed_table, best_table = rows.table(seed_window), rows.table(window)
+    seed_train, seed_test = rows.events(seed_window).split()
+    best_train, best_test = rows.events(window).split()
     return Tuned(seed_cuts=dict(seed), seed_window=seed_window, cuts=cuts,
                  window=window,
-                 seed_train=op.evaluate(seed_table.half(True), seed),
-                 seed_test=op.evaluate(seed_table.half(False), seed),
-                 best_train=op.evaluate(best_table.half(True), cuts),
-                 best_test=op.evaluate(best_table.half(False), cuts),
+                 seed_train=evaluate(seed_train, seed),
+                 seed_test=evaluate(seed_test, seed),
+                 best_train=evaluate(best_train, cuts),
+                 best_test=evaluate(best_test, cuts),
                  rounds=history)
