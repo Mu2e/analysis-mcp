@@ -1,0 +1,44 @@
+{
+ "dataset": "dts.mu2e.CosmicSignal.MDC2025ap.art",
+ "reco": "prodtools CosmicSignalFullNts MDC2025bc_cosref01 (cluster 30781738): EventNtuple/fcl/from_dts-primary.fcl, Code_ana_v020301_fcl_mdc2025bc, Sim_best v1_5, run 1430, primary only (no pileup)",
+ "cut_set": "run1a_tsda",
+ "loose_cuts": [
+  "has_a_track",
+  "is_good_track",
+  "has_trk_front_seg",
+  "is_reco_electron_or_positron",
+  "has_downstream",
+  "charge_selection",
+  "or_trigger",
+  "upstream_veto",
+  "no_multi_trk_veto"
+ ],
+ "n_files": 498,
+ "n_events": 4141415,
+ "files_first": "nts.sophie.CosmicSignalOnSpillTriggered.MDC2025bc_cosref01.001430_00005063.root",
+ "files_last": "nts.sophie.CosmicSignalOnSpillTriggered.MDC2025bc_cosref01.001430_00004955.root",
+ "n_rows": 106172,
+ "n_normalizing": 24836,
+ "columns": [
+  "cos",
+  "rmax",
+  "d0",
+  "trkqual",
+  "trkpid",
+  "t0err",
+  "nactive",
+  "t0",
+  "p",
+  "event",
+  "mc_pdg",
+  "has_calo",
+  "no_opa",
+  "no_tsda",
+  "no_crv_veto"
+ ],
+ "flat_mev": [
+  100.0,
+  110.0
+ ],
+ "normalized_to": "loose set-81 cosmic-electron rate (approx_ce_sensitivity recommended_cosmic_rate('box')) x on-spill time"
+}

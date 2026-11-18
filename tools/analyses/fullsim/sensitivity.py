@@ -5,7 +5,8 @@ but with the signal efficiency, shape and detector response measured from
 reconstructed CE events mixed with pileup (CeMLeadingLogMix1BB EventNtuple
 files) instead of from EdepAna's truth-level tree:
 
-1. Select CE-like tracks with pyfitter's cut-set 80 (cuts.py), file by file.
+1. Select CE-like tracks with a pyfitter cut set (cuts.py: run1a_tsda,
+   with a 540-1650 ns time window, by default, or 80_1d), file by file.
    Each surviving event is represented by its first selected track: its
    momentum and time at the tracker front, its MC origin
    (eventntuple.origin_codes) and its true momentum at birth. Events whose
@@ -47,9 +48,10 @@ from ..approx_ce_sensitivity import (COSMIC_RATE_PER_SECOND_PER_MEV,
                                      MEAN_POT_PER_EVENT, NPOT,
                                      ONSPILL_SECONDS_PER_EVENT, SIGNAL_REBIN,
                                      SensitivityError, load_dio_spectrum,
-                                     scan_signal_box)
-from .cuts import (CUT_DESCRIPTIONS, CUT_SET, DEFAULT_CUTS, TRKPID_MIN,
-                   TRKQUAL_MIN, CutError, active_cuts, apply_cuts, cut_masks)
+                                     recommended_cosmic_rate, scan_signal_box)
+from .cuts import (CUT_ORDER, CUT_SET, CUT_SETS, CutError, active_cuts,
+                   apply_cuts, cut_descriptions, cut_masks, default_cuts,
+                   get_cut_set)
 from .eventntuple import (DEFAULT_TRIGGERS, ORIGIN_NAMES, SID_TT_FRONT,
                           TREE_PATH, EventNtupleError, origin_codes,
                           parse_trigger_paths, read_eventntuple)
@@ -59,6 +61,25 @@ from .normalization import (CAPTURES_PER_STOPPED_MUON, DIO_PER_STOPPED_MUON,
                             sim_efficiencies, stop_chain_of_inputs,
                             stopped_muons_per_pot)
 from .provenance import ProvenanceError, generated_events
+from . import cosmic_reference
+from . import tune
+
+# cut_mode values: the cut set as it stands, or tuned per input (tune.py).
+CUT_MODES = ("fixed", "optimize")
+# The opt_* metrics' value outside cut_mode="optimize".
+NOT_OPTIMIZED = -1.0
+# An opt_cut_* edge the search left open (no cut there).
+UNPLACED_EDGE = float("nan")
+OPT_METRICS = (
+    "opt_punzi_train", "opt_punzi_test", "opt_seed_punzi_train",
+    "opt_seed_punzi_test", "opt_gain_test",
+    "opt_signal_test", "opt_background_test",
+    "opt_seed_signal_test", "opt_seed_background_test",
+    "opt_window_low_mevc", "opt_window_high_mevc",
+    "opt_seed_window_low_mevc", "opt_seed_window_high_mevc",
+    "opt_n_ce_rows", "opt_n_cosmic_rows",
+    *(f"opt_cut_{v}_{edge}" for v in tune.VARIABLE_NAMES for edge in ("low", "high")),
+)
 
 SIGN = "minus"
 # stop_datasets' value for tracing the stop chain from the inputs.
@@ -71,7 +92,8 @@ RMUE = 1.0e-13
 
 # The time window at the tracker front (ns) a CE must fall in: pyCount's
 # fixed window, which is also pyfitter's signal-region time window.
-TIME_WINDOW_NS = (640.0, 1650.0)
+# The default time window is the cut set's (CutSet.time_window_ns).
+TIME_WINDOW_NS = CUT_SETS[CUT_SET].time_window_ns
 
 # Reconstructed momentum, binned as approx_ce_sensitivity's signal
 # (EdepAna's trk_front_energy, then rebinned by SIGNAL_REBIN).
@@ -90,19 +112,21 @@ class FullsimError(RuntimeError):
 # --- per-file reduction ------------------------------------------------------
 
 def reduce_file(path: Path, active: list[str], trkqual_min: float,
-                trkpid_min: float, triggers=DEFAULT_TRIGGERS) -> dict:
+                trkpid_min: float, triggers=DEFAULT_TRIGGERS,
+                cut_set: str = CUT_SET) -> dict:
     """One file's selected events, reduced to flat per-event arrays, and its
     cut flow. Done per file so the jagged arrays never all sit in memory."""
     return reduce_data(read_eventntuple(path, triggers), active, trkqual_min,
-                       trkpid_min, triggers)
+                       trkpid_min, triggers, cut_set)
 
 
 def reduce_data(data: dict, active: list[str], trkqual_min: float,
-                trkpid_min: float, triggers=DEFAULT_TRIGGERS) -> dict:
+                trkpid_min: float, triggers=DEFAULT_TRIGGERS,
+                cut_set: str = CUT_SET) -> dict:
     """reduce_file for EventNtuple groups already in memory."""
     import awkward as ak
 
-    masks = cut_masks(data, SIGN, trkqual_min, trkpid_min, triggers)
+    masks = cut_masks(data, SIGN, trkqual_min, trkpid_min, triggers, cut_set)
     track_mask, flow = apply_cuts(masks, active, data["trk"]["trk.pdg"])
     keep = ak.to_numpy(ak.any(track_mask, axis=-1))
 
@@ -220,6 +244,92 @@ def build_spectra(p_reco: np.ndarray, p_true: np.ndarray, n_generated: int,
             "onspill_seconds": onspill_seconds}
 
 
+# --- cut_mode="optimize" -----------------------------------------------------
+
+def _optimize_selection(candidates, cut_set, presel, time_window, n_generated,
+                        upstream_eff, spectra, rmue, reference_path):
+    """Tune the selection on the inputs' CE and the cosmic reference
+    (tune.py). Returns (tune.Tuned, opt_* metrics, extra)."""
+    ce = tune.combine_tracks(candidates)
+    keep = (ce["origin"] == CE_ORIGIN) & np.isfinite(ce["p"]) & np.isfinite(ce["p_true"])
+    for name in tune.VARIABLE_NAMES:
+        keep &= np.isfinite(ce[name])
+    ce = tune.in_time({k: v[keep] for k, v in ce.items()}, time_window)
+    if ce["p"].size == 0:
+        raise tune.TuneError("no true CE passes the preselection in the time window")
+    rows, meta = cosmic_reference.load(reference_path)
+    flags = tuple(f for f in tune.EXTRA_PRESELECTION if f in presel)
+    rate = recommended_cosmic_rate("box")
+    cosmic, per_mev = cosmic_reference.rows_for(rows, flags, rate,
+                                                spectra["onspill_seconds"])
+    # the time window cuts the cosmics too; their weight is per track of the
+    # loose (untimed) selection, so dropping rows is the whole effect
+    cosmic = tune.in_time(cosmic, time_window)
+    per_event = upstream_eff / n_generated
+    stopped = spectra["stopped_muons"]
+    built = tune.build_rows(
+        ce, cosmic,
+        signal_per_event=stopped * CAPTURES_PER_STOPPED_MUON * rmue * per_event,
+        dio_per_event=stopped * DIO_PER_STOPPED_MUON * per_event,
+        cosmic_per_mev_per_row=per_mev, dio_density=load_dio_spectrum())
+    seed = tune.seed_cuts(cut_set, time_window)
+    result = tune.tune(built, seed)
+    metrics = {
+        "opt_punzi_train": result.best_train.fom,
+        "opt_punzi_test": result.best_test.fom,
+        "opt_seed_punzi_train": result.seed_train.fom,
+        "opt_seed_punzi_test": result.seed_test.fom,
+        "opt_gain_test": result.gain_test,
+        "opt_signal_test": result.best_test.signal,
+        "opt_background_test": result.best_test.background,
+        "opt_seed_signal_test": result.seed_test.signal,
+        "opt_seed_background_test": result.seed_test.background,
+        "opt_n_ce_rows": float(ce["p"].size),
+        "opt_n_cosmic_rows": float(cosmic["p"].size),
+    }
+    for key, window in (("opt_window", result.window), ("opt_seed_window", result.seed_window)):
+        lo, hi = result.window_mev(window)
+        metrics[f"{key}_low_mevc"], metrics[f"{key}_high_mevc"] = lo, hi
+    for name, (lo, hi) in result.cuts.items():
+        # an edge never placed (no cut) is NaN: a range end can equal
+        # NOT_OPTIMIZED (-1, the low end of trkqual, trkpid and t0err)
+        metrics[f"opt_cut_{name}_low"] = float(lo) if np.isfinite(lo) else UNPLACED_EDGE
+        metrics[f"opt_cut_{name}_high"] = float(hi) if np.isfinite(hi) else UNPLACED_EDGE
+    extra = {"cuts": {k: [float(a), float(b)] for k, (a, b) in result.cuts.items()},
+             "seed_cuts": {k: [float(a), float(b)] for k, (a, b) in seed.items()},
+             "preselection": list(presel),
+             "time_window": [float(t) for t in time_window],
+             "cosmic_reference": meta, "cosmic_rate_per_s_per_mev": rate,
+             "rounds": [{"window": list(result.window_mev(r["window"])),
+                         "fom_train": r["fom_train"]} for r in result.rounds]}
+    return result, metrics, extra
+
+
+def _optimize_lines(result, extra) -> list[str]:
+    def cut_text(cuts):
+        return " && ".join(f"{lo:.5g} < {k} < {hi:.5g}" if np.isfinite(lo) and np.isfinite(hi)
+                           else (f"{k} > {lo:.5g}" if np.isfinite(lo) else f"{k} < {hi:.5g}")
+                           for k, (lo, hi) in cuts.items()
+                           if np.isfinite(lo) or np.isfinite(hi))
+    ref = extra["cosmic_reference"]
+    return [
+        "cut_mode = optimize: the preselection (" + ", ".join(extra["preselection"])
+        + "), the time window {:g}-{:g} ns (fixed)".format(*extra["time_window"])
+        + " and cuts tuned on the Punzi FoM, chosen on even events, reported on odd",
+        f"  cosmic reference {ref.get('path')} ({ref.get('dataset', '?')}; "
+        f"reco {ref.get('reco', '?')}; {ref.get('n_normalizing', '?')} normalizing tracks)",
+        "  seed:  [{:.1f}, {:.1f}] MeV/c, ".format(*result.window_mev(result.seed_window))
+        + cut_text(result.seed_cuts),
+        f"         Punzi train {result.seed_train.fom:.4g}, test {result.seed_test.fom:.4g} "
+        f"(S = {result.seed_test.signal:.3g}, B = {result.seed_test.background:.3g})",
+        "  tuned: [{:.1f}, {:.1f}] MeV/c, ".format(*result.window_mev(result.window))
+        + cut_text(result.cuts),
+        f"         Punzi train {result.best_train.fom:.4g}, test {result.best_test.fom:.4g} "
+        f"(S = {result.best_test.signal:.3g}, B = {result.best_test.background:.3g}); "
+        f"gain on test {result.gain_test:.3f}",
+    ]
+
+
 # --- plots -------------------------------------------------------------------
 
 def _write_plots(outdir: Path, spectra: dict, best: dict, ev: dict,
@@ -298,15 +408,40 @@ def run(context: RunContext) -> RunOutcome:
     extra: dict = {}
 
     try:
-        active = active_cuts(params["enable_cuts"], params["disable_cuts"])
-        extra["cut_set"] = CUT_SET
+        cut_set = params["cut_set"].strip()
+        cs = get_cut_set(cut_set)
+        # A negative threshold means the cut set's own.
+        trkqual_min = (cs.trkqual_min if params["trkqual_min"] < 0
+                       else params["trkqual_min"])
+        trkpid_min = (cs.trkpid_min if params["trkpid_min"] < 0
+                      else params["trkpid_min"])
+        active = active_cuts(params["enable_cuts"], params["disable_cuts"], cut_set)
+        extra["cut_set"] = cut_set
+        extra["trkqual_min"] = trkqual_min
+        extra["trkpid_min"] = trkpid_min
         extra["cuts"] = active
         triggers = parse_trigger_paths(params["trigger_paths"])
         extra["trigger_paths"] = triggers
-        t_lo, t_hi = parse_time_window(params["time_window"])
-        parts = [reduce_file(path, active, params["trkqual_min"],
-                             params["trkpid_min"], triggers)
-                 for path in context.input_paths]
+        t_lo, t_hi = (parse_time_window(params["time_window"])
+                      if params["time_window"].strip() else cs.time_window_ns)
+        extra["time_window"] = [t_lo, t_hi]
+        cut_mode = params["cut_mode"].strip()
+        if cut_mode not in CUT_MODES:
+            raise FullsimError(f"cut_mode must be one of {', '.join(CUT_MODES)}, "
+                               f"got {cut_mode!r}")
+        extra["cut_mode"] = cut_mode
+        # optimize: the active cuts less the tuned and target ones, checked
+        # against what the cosmic reference can follow before any file is read
+        presel = tune.optimize_preselection(active) if cut_mode == "optimize" else ()
+        parts, candidates = [], []
+        for path in context.input_paths:
+            data = read_eventntuple(path, triggers)
+            parts.append(reduce_data(data, active, trkqual_min, trkpid_min,
+                                     triggers, cut_set))
+            if cut_mode == "optimize":
+                candidates.append(tune.candidate_tracks(
+                    data, presel, triggers, cut_set))
+            del data
         ev = combine(parts)
         if n_generated <= 0:
             n_generated = sum(generated_events(path.name)
@@ -358,6 +493,8 @@ def run(context: RunContext) -> RunOutcome:
                                     spectra["cosmic"])
     except (FullsimError, EventNtupleError, CutError, SensitivityError) as exc:
         return RunOutcome(error=str(exc), extra=extra)
+    except tune.TuneError as exc:
+        return RunOutcome(error=f"cut_mode='optimize': {exc}", extra=extra)
     except NormalizationError as exc:
         return RunOutcome(error=(
             f"{exc}. Stopped mu- per POT is computed from the stop chain's "
@@ -408,8 +545,21 @@ def run(context: RunContext) -> RunOutcome:
         "n_conversions": float(spectra["conversions"]),
     }
 
+    metrics.update({name: NOT_OPTIMIZED for name in OPT_METRICS})
+    tuned = None
+    if cut_mode == "optimize":
+        try:
+            tuned, opt_metrics, opt_extra = _optimize_selection(
+                candidates, cut_set, presel, (t_lo, t_hi), n_generated, upstream_eff,
+                spectra, rmue, params["cosmic_reference"])
+        except (tune.TuneError, cosmic_reference.ReferenceError) as exc:
+            return RunOutcome(error=f"cut_mode='optimize': {exc}", extra=extra)
+        metrics.update(opt_metrics)
+        extra["optimize"] = opt_extra
+
     flow_rows = [("No cuts", ev["n_events"], "no selection")] + [
-        (name, n, CUT_DESCRIPTIONS[name]) for name, n in zip(active, ev["flow"])]
+        (name, n, cut_descriptions(cut_set)[name])
+        for name, n in zip(active, ev["flow"])]
     flow_path = outdir / "cut_flow.csv"
     flow_path.write_text(
         "cut,events_passing,description\n"
@@ -426,7 +576,7 @@ def run(context: RunContext) -> RunOutcome:
     lines = [
         "fullsim_sensitivity",
         *(f"  input            {path}" for path in context.input_paths),
-        f"  cut set          pyfitter {CUT_SET}",
+        f"  cut set          pyfitter {cut_set}",
         f"  trigger paths    any of {', '.join(triggers)}",
         f"  time window      {t_lo:g}-{t_hi:g} ns at the tracker front",
         f"  NPOT             {npot:g}",
@@ -464,6 +614,8 @@ def run(context: RunContext) -> RunOutcome:
           f"DIO = {e['dio']:9.3g}  cosmic = {e['cosmic']:9.3g}  "
           f"S/sqrt(B) = {e['sensitivity']:.4g}" for e in top),
     ]
+    if tuned is not None:
+        lines += ["", *_optimize_lines(tuned, extra["optimize"])]
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     files = [str(flow_path)]
@@ -502,7 +654,7 @@ SPEC = AnalysisSpec(
         "approx_ce_sensitivity: the signal efficiency, momentum shape and "
         "detector response are measured from reconstructed CE mixed with "
         "pileup (CeMLeadingLogMix1BB EventNtuple files) after pyfitter's "
-        f"cut-set {CUT_SET} CE-like cuts. Signal and DIO (theory spectrum "
+        "CE-like cuts (cut_set: 80_1d or run1a_tsda). Signal and DIO (theory spectrum "
         "folded with that response) are normalized to the stopped mu- NPOT "
         "gives, as Production's normalizations.py; cosmics are flat per "
         "MeV/c over the on-spill time; the best-window scan is "
@@ -520,6 +672,7 @@ SPEC = AnalysisSpec(
         "n_events_generated", "acceptance",
         "n_files", "npot", "upstream_eff", "cosmic_rate_per_s_per_mev",
         "stopped_muons_per_pot", "n_stopped_muons", "rmue", "n_conversions",
+        *OPT_METRICS,
     ),
     units={
         "signal_mom_low_mevc": "MeV/c", "signal_mom_high_mevc": "MeV/c",
@@ -531,6 +684,14 @@ SPEC = AnalysisSpec(
         "cosmic_rate_per_s_per_mev": "per second per MeV/c",
         "stopped_muons_per_pot": "per POT", "n_stopped_muons": "muons",
         "n_conversions": "events",
+        "opt_signal_test": "events", "opt_background_test": "events",
+        "opt_seed_signal_test": "events", "opt_seed_background_test": "events",
+        "opt_window_low_mevc": "MeV/c", "opt_window_high_mevc": "MeV/c",
+        "opt_seed_window_low_mevc": "MeV/c", "opt_seed_window_high_mevc": "MeV/c",
+        "opt_n_ce_rows": "events", "opt_n_cosmic_rows": "tracks",
+        "opt_cut_rmax_low": "mm", "opt_cut_rmax_high": "mm",
+        "opt_cut_d0_low": "mm", "opt_cut_d0_high": "mm",
+        "opt_cut_t0err_low": "ns", "opt_cut_t0err_high": "ns",
     },
     parameters=(
         ParamSpec(
@@ -614,10 +775,12 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="time_window",
             description="'t_low,t_high' (ns): the window a CE's time at the "
-                        "tracker front must fall in (open interval). The "
-                        "default is pyfitter's signal-region time window. The "
-                        "momentum window is scanned.",
-            default="{:g},{:g}".format(*TIME_WINDOW_NS), kind="text",
+                        "tracker front must fall in (open interval). Empty, "
+                        "the default: cut_set's ("
+                        + "; ".join("{}: {:g},{:g}".format(n, *c.time_window_ns)
+                                    for n, c in CUT_SETS.items())
+                        + "). The momentum window is scanned.",
+            default="", kind="text", allow_empty=True,
         ),
         ParamSpec(
             name="trigger_paths",
@@ -629,14 +792,51 @@ SPEC = AnalysisSpec(
             default=", ".join(DEFAULT_TRIGGERS), kind="text",
         ),
         ParamSpec(
+            name="cut_mode",
+            description="'fixed' (default): the cut set as it stands. "
+                        "'optimize': also tune the selection on these inputs "
+                        "(the active cuts' vetoes, as enable_cuts and "
+                        "disable_cuts leave them, no stopping-target cuts, "
+                        "the time window fixed, and rectangular cuts on "
+                        "cos(theta), R(max), d0, TrkQual, TrkPID, t0err and "
+                        "N(active)) on the Punzi FoM, against a fixed "
+                        "reconstructed cosmic reference (cosmic_reference; "
+                        "electrons and muons) and the DIO folded per event; "
+                        "chosen on even events, reported on odd ones as the "
+                        "opt_* metrics (-1 in fixed mode; an opt_cut_* edge "
+                        "left open is NaN). The default reference is CRY "
+                        "signal-region cosmics (MDC2025ap) reconstructed "
+                        "primary-only, without pileup, with "
+                        "Code_ana_v020301_fcl_mdc2025bc: its TrkQual, TrkPID, "
+                        "N(active) and t0err match inputs reconstructed the "
+                        "same way; for mixed (Mix1BB) or other-release inputs "
+                        "they are approximate, and a matching reference should "
+                        "be made. The fixed result is reported either way.",
+            default="fixed", kind="text",
+        ),
+        ParamSpec(
+            name="cosmic_reference",
+            description="cut_mode='optimize': the cosmic reference table "
+                        "(.npz, from scripts/make_fullsim_cosmic_reference.py). "
+                        "Empty: data/fullsim_cosmic_reference.npz.",
+            default="", kind="text", allow_empty=True,
+        ),
+        ParamSpec(
+            name="cut_set",
+            description="The pyfitter cut set (config.py VERSION_CUTS) the "
+                        "thresholds and default cuts come from: "
+                        + "; ".join(f"{name}: {', '.join(default_cuts(name))}"
+                                    for name in CUT_SETS)
+                        + ". run1a_tsda adds the signed-d0 window and the TSDA "
+                        "veto (needs trk.tsdainter).",
+            default=CUT_SET, kind="text",
+        ),
+        ParamSpec(
             name="enable_cuts",
-            description="Comma-separated cuts to apply on top of the default "
-                        f"set (pyfitter cut-set {CUT_SET}: "
-                        f"{', '.join(DEFAULT_CUTS)}). The others, pyfitter's "
-                        "fit ranges, which the momentum scan and time_window "
-                        "stand in for here: "
-                        + ", ".join(n for n in CUT_DESCRIPTIONS
-                                    if n not in DEFAULT_CUTS) + ".",
+            description="Comma-separated cuts to apply on top of cut_set's "
+                        "defaults. Known cuts: " + ", ".join(CUT_ORDER) + ". "
+                        "in_mom_range and within_t0 are pyfitter's fit ranges, "
+                        "which the momentum scan and time_window stand in for.",
             default="", kind="text", allow_empty=True,
         ),
         ParamSpec(
@@ -648,14 +848,16 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="trkqual_min",
             description="good_trkqual threshold: keep tracks with TrkQual "
-                        f"above this. Default: pyfitter cut-set {CUT_SET}'s.",
-            default=TRKQUAL_MIN, minimum=0.0, maximum=1.0,
+                        "above this. Negative (the default): cut_set's "
+                        f"({', '.join(f'{n} {c.trkqual_min:g}' for n, c in CUT_SETS.items())}).",
+            default=-1.0, minimum=-1.0, maximum=1.0,
         ),
         ParamSpec(
             name="trkpid_min",
             description="good_trkpid threshold: keep tracks with TrkPID above "
-                        f"this. Default: pyfitter cut-set {CUT_SET}'s.",
-            default=TRKPID_MIN, minimum=0.0, maximum=1.0,
+                        "this. Negative (the default): cut_set's "
+                        f"({', '.join(f'{n} {c.trkpid_min:g}' for n, c in CUT_SETS.items())}).",
+            default=-1.0, minimum=-1.0, maximum=1.0,
         ),
     ),
     input_hint=(

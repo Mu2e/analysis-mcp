@@ -2777,16 +2777,16 @@ def test_stop_materials_names_the_file_in_a_list_that_lacks_the_histogram(tmp_di
 # --- fullsim_sensitivity -----------------------------------------------------
 
 def _seg(sid, time=900.0, p=(0.0, 85.0, 60.0), t0err=0.5, maxr=500.0, d0=50.0,
-         tandip=0.7):
+         tandip=0.7, rad=230.0):
     """One track segment and its loop-helix parameters. The default momentum
     is CE-like: |p| = 104 MeV/c, p_z/p_T = 0.71."""
     return ({"sid": sid, "time": time,
              "mom": {"fCoordinates": {"fX": p[0], "fY": p[1], "fZ": p[2]}}},
-            {"t0err": t0err, "maxr": maxr, "d0": d0, "tanDip": tandip})
+            {"t0err": t0err, "maxr": maxr, "d0": d0, "tanDip": tandip, "rad": rad})
 
 
 def _track(pdg=11, nactive=30, qual=0.9, pid=0.9, status=1, goodfit=1, segs=None,
-           sims=((168, 0, 10.0),)):
+           sims=((168, 0, 10.0),), tsdainter=0):
     """A track passing every default cut unless told otherwise: segments at
     the tracker front and middle, an ST boundary and the ST foils. `sims` are
     (startCode, gen, rho) for the track's particle, then its ancestors."""
@@ -2794,6 +2794,7 @@ def _track(pdg=11, nactive=30, qual=0.9, pid=0.9, status=1, goodfit=1, segs=None
         segs = [_seg(0), _seg(1), _seg(100), _seg(104)]
     return {"pdg": pdg, "nactive": nactive, "qual": qual, "pid": pid,
             "status": status, "goodfit": goodfit, "segs": segs,
+            "tsdainter": tsdainter,
             "sims": [{"startCode": code, "gen": gen,
                       "pos": {"fCoordinates": {"fX": rho, "fY": 0.0}},
                       "mom": {"fCoordinates": {"fX": 0.0, "fY": 84.0, "fZ": 63.0}}}
@@ -2828,7 +2829,8 @@ def _eventntuple(events):
                           "trk.status": [t["status"] for t in trks],
                           "trk.goodfit": [t["goodfit"] for t in trks],
                           "trkqual.result": [t["qual"] for t in trks],
-                          "trkpid.result": [t["pid"] for t in trks]}
+                          "trkpid.result": [t["pid"] for t in trks],
+                          "trk.tsdainter": [t["tsdainter"] for t in trks]}
                          for trks in tracks]),
         "trkfit": ak.Array([{"trksegs": [[s for s, _ in t["segs"]] for t in trks],
                              "trksegpars_lh": [[lh for _, lh in t["segs"]] for t in trks]}
@@ -2852,7 +2854,7 @@ def test_fullsim_each_default_cut_rejects_what_it_should():
         (["is_good_track"], {"tracks": [_track(status=-1)]}),
         (["is_good_track"], {"tracks": [_track(goodfit=0)]}),
         # without a front segment there is no direction or tan(dip) either
-        (["has_downstream", "has_trk_front_seg", "pz_over_pt"],
+        (["has_downstream", "has_trk_front_seg", "pz_over_pt", "within_d0"],
          {"tracks": [_track(segs=[mid, boundary, foils])]}),
         (["charge_selection", "is_reco_electron_or_positron"], {"tracks": [_track(pdg=13)]}),
         (["has_downstream"],
@@ -2867,7 +2869,7 @@ def test_fullsim_each_default_cut_rejects_what_it_should():
         (["has_st"], {"tracks": [_track(segs=[front, mid, boundary])]}),
         (["no_opa"], {"tracks": [_track(segs=[front, mid, boundary, foils, _seg(95)])]}),
         (["good_trkqual"], {"tracks": [_track(qual=0.1)]}),
-        (["has_hits"], {"tracks": [_track(nactive=19)]}),
+        (["has_hits"], {"tracks": [_track(nactive=16)]}),
         # t0err counts at the tracker middle, not the front
         (["within_t0err"],
          {"tracks": [_track(segs=[front, _seg(1, t0err=1.0), boundary, foils])]}),
@@ -2938,6 +2940,64 @@ def test_fullsim_active_cuts_toggle_by_name_and_refuse_unknown_ones():
         assert "Known:" in str(exc), exc
     else:
         raise AssertionError("not_a_cut was accepted")
+
+
+def test_fullsim_run1a_tsda_is_the_default_with_its_thresholds_d0_and_tsda_veto():
+    assert fs_cuts.CUT_SET == "run1a_tsda"
+    run1a = fs_cuts.DEFAULT_CUTS
+    assert run1a == fs_cuts.default_cuts("run1a_tsda")
+    # within_d0 after pz_over_pt, no_tsda after no_opa, as pyfitter
+    assert run1a.index("within_d0") == run1a.index("pz_over_pt") + 1
+    assert run1a.index("no_tsda") == run1a.index("no_opa") + 1
+    # 80_1d keeps the selection it always had
+    old = fs_cuts.default_cuts("80_1d")
+    assert "within_d0" not in old and "no_tsda" not in old
+    assert fs_cuts.CUT_SETS["run1a_tsda"].time_window_ns == (540.0, 1650.0)
+    assert fs_cuts.CUT_SETS["80_1d"].time_window_ns == (640.0, 1650.0)
+
+    def seg0(**kw):
+        return [_seg(0, **kw), _seg(1), _seg(100), _seg(104)]
+    # d0 = maxr - 2|rad| = 500 - 2 rad: (-60, 94) is rad in (203, 280)
+    assert _failed_cuts({"tracks": [_track(segs=seg0(rad=200.0))]}) == ["within_d0"]
+    assert _failed_cuts({"tracks": [_track(segs=seg0(rad=300.0))]}) == ["within_d0"]
+    # d0 is taken at the tracker front, not elsewhere
+    other = [_seg(0), _seg(1, rad=300.0), _seg(100), _seg(104)]
+    assert _failed_cuts({"tracks": [_track(segs=other)]}) == []
+    assert _failed_cuts({"tracks": [_track(tsdainter=1)]}) == ["no_tsda"]
+    # run1a's thresholds, not 80_1d's
+    assert _failed_cuts({"tracks": [_track(nactive=17)]}) == []          # 17, not 20
+    assert _failed_cuts({"tracks": [_track(qual=0.15)]}) == []           # 0.145, not 0.155
+    assert _failed_cuts({"tracks": [_track(pid=0.56)]}) == ["good_trkpid"]  # 0.574, not 0.54
+    assert _failed_cuts({"tracks": [_track(segs=seg0(tandip=0.86))]}) == []  # < 0.8787
+    t0err = [_seg(0), _seg(1, t0err=0.83), _seg(100), _seg(104)]
+    assert _failed_cuts({"tracks": [_track(segs=t0err)]}) == ["within_t0err"]  # 0.81
+    # and 80_1d's on request
+    masks = fs_cuts.cut_masks(_eventntuple([{"tracks": [_track(nactive=17)]}]),
+                              "minus", cut_set="80_1d")
+    assert not masks["has_hits"][0][0]
+
+
+def test_fullsim_a_cut_without_its_branch_is_refused_not_skipped():
+    import awkward as ak
+    data = _eventntuple([{"tracks": [_track()]}])
+    data["trk"] = data["trk"][[f for f in ak.fields(data["trk"])
+                               if f != "trk.tsdainter"]]
+    masks = fs_cuts.cut_masks(data, "minus")
+    assert "no_tsda" not in masks
+    try:
+        fs_cuts.apply_cuts(masks, fs_cuts.active_cuts("", ""), data["trk"]["trk.pdg"])
+    except fs_cuts.CutError as exc:
+        assert "trk.tsdainter" in str(exc), exc
+    else:
+        raise AssertionError("no_tsda without trk.tsdainter was accepted")
+    # 80_1d does not need it
+    fs_cuts.apply_cuts(masks, fs_cuts.active_cuts("", "", "80_1d"), data["trk"]["trk.pdg"])
+    try:
+        fs_cuts.active_cuts("", "", "not_a_set")
+    except fs_cuts.CutError as exc:
+        assert "run1a_tsda" in str(exc), exc
+    else:
+        raise AssertionError("an unknown cut set was accepted")
 
 
 def test_fullsim_origin_is_the_first_classified_particle_in_the_chain():
@@ -3246,7 +3306,8 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
     # no network
     from tools.analyses.fullsim import normalization as norm
     generated = {"n_generated": 20000,
-                 "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
+                 "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT,
+                 "cut_set": "80_1d"}
     result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                           output_dir=tmp_dir, parameters=generated)
     assert result.status == "success", result.message
@@ -3279,6 +3340,22 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
     few = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                        output_dir=tmp_dir, parameters={**generated, "n_generated": 100})
     assert few.status == "error" and "n_generated 100" in few.message
+    # the default, run1a_tsda with 540-1650 ns: its relative cut efficiencies
+    # match pyfitter's au_run1a_tsda CeM_mix cut flow within this file's
+    # statistics (good_trkpid 89.9 vs 89.7%, within_d0 92.9 vs 92.9%,
+    # no_tsda 99.6 vs 99.3%, good_trkqual 97.7 vs 97.7%)
+    del generated["cut_set"]
+    run1a = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                         output_dir=tmp_dir, parameters=generated)
+    assert run1a.status == "success", run1a.message
+    rm = run1a.metadata
+    assert rm["cut_set"] == "run1a_tsda" and rm["time_window"] == [540.0, 1650.0]
+    assert (rm["n_events_selected"], rm["n_events_counted"]) == (4243, 3595)
+    assert np.isclose(rm["signal_efficiency"], 3595 / 20000)
+    assert rm["cut_flow"]["within_d0"] == 4499 and rm["cut_flow"]["no_tsda"] == 4355
+    assert rm["cut_flow"]["good_trkpid"] == 6209 and rm["cut_flow"]["pz_over_pt"] == 4841
+    assert np.isclose(rm["signal_time_low_ns"], 540.0)
+    assert np.isclose(rm["sensitivity"], 4.0711, rtol=1e-4)
 
 
 # --- occupancy (OccupancyAna: digi and reco from a job, ntuple from a file) ---------
@@ -6299,6 +6376,248 @@ def test_optimize_selection_ntuple_registered():
     assert any(p.name == "fom" for p in spec.parameters)
     assert any(p.name == "seed_selections" for p in spec.parameters)
     assert spec.units  # units are declared
+
+
+# --- fullsim cut_mode="optimize" (tune.py on optimize.py, cosmic_reference.py) ---
+
+from tools.analyses.fullsim import tune as fs_tune
+from tools.analyses.fullsim import cosmic_reference as fs_ref
+
+
+def _toy_rows(seed=1, ns=3000, nb=12000):
+    """The tuned variables, signal peaked in d0 and at high trkqual,
+    background flat in both, the rest the same for both: the best cuts are
+    obvious, so a search that misses them is broken."""
+    rng = np.random.default_rng(seed)
+    n = ns + nb
+    vals = {"cos": np.full(n, 0.6), "rmax": np.full(n, 500.0),
+            "trkpid": np.full(n, 0.5), "t0err": np.full(n, 1.0),
+            "d0": np.r_[rng.normal(0, 30, ns), rng.uniform(-200, 200, nb)],
+            "trkqual": np.r_[rng.beta(5, 1, ns), rng.uniform(0, 1, nb)],
+            "nactive": np.r_[np.round(rng.normal(30, 5, ns)),
+                             rng.integers(10, 61, nb)].astype(float)}
+    ev = fs_tune.op.Events(vals=vals, w_sig=np.r_[np.full(ns, 5.0 / ns), np.zeros(nb)],
+                           w_bkg=np.r_[np.zeros(ns), np.full(nb, 20.0 / nb)],
+                           event_numbers=np.arange(n))
+    ev.prepare()
+    return ev
+
+
+def test_fullsim_search_finds_the_obvious_cuts_and_reports_the_held_out_half():
+    train, test = _toy_rows().split()
+    best = fs_tune.search(train, fs_tune.open_cuts(), [], step=0.01,
+                          min_efficiency=0.3, n_random=2)
+    lo, hi = best.cuts["d0"]
+    assert -90 < lo < -20 and 20 < hi < 90, best.cuts
+    assert 0.3 < best.cuts["trkqual"][0] < 0.8 and best.cuts["trkqual"][1] == np.inf
+    # integer edges on half-integers
+    for edge in best.cuts["nactive"]:
+        assert not np.isfinite(edge) or edge % 1 == 0.5, best.cuts["nactive"]
+    # far better than no cut, and the odd events agree within the toy's noise
+    none = fs_tune.evaluate(train, fs_tune.open_cuts())
+    assert best.fom > 2.0 * none.fom
+    assert abs(fs_tune.evaluate(test, best.cuts).fom / best.fom - 1) < 0.15
+    # the optimizer's yields are the reported cuts' yields
+    again = fs_tune.evaluate(train, best.cuts)
+    assert np.isclose(again.signal, best.signal) and np.isclose(again.background, best.background)
+
+
+def test_fullsim_cut_vars_round_trip_and_an_unplaced_edge_cuts_nothing():
+    seed = {**fs_tune.open_cuts(),
+            **fs_tune.seed_cuts("run1a_tsda", (540.0, 1650.0))}
+    assert fs_tune.from_cut_vars(fs_tune.to_cut_vars(seed)) == seed
+    vars_ = {c.name: c for c in fs_tune.to_cut_vars(seed)}
+    # rmax is not in the cut set: no cut, so values outside its range pass
+    assert not vars_["rmax"].applied and vars_["trkqual"].applied
+    assert vars_["nactive"].cut_lo == 16.5 and vars_["nactive"].discrete
+    assert fs_tune.from_cut_vars(fs_tune.to_cut_vars({})) == fs_tune.open_cuts()
+    vals = {n: np.array([0.0]) for n in fs_tune.VARIABLE_NAMES}
+    vals["rmax"] = np.array([5000.0])
+    assert fs_tune.passes(vals, fs_tune.open_cuts()).all()
+    try:
+        fs_tune.to_cut_vars({"p": (100, 105)})
+    except fs_tune.TuneError as exc:
+        assert "not a tuned variable" in str(exc)
+    else:
+        raise AssertionError("a cut on an untuned variable was accepted")
+
+
+def test_fullsim_search_keeps_tiny_weights_beside_large_ones():
+    # a DIO stand-in of 1e-17 next to cosmics of 1: a total minus a prefix
+    # would round it to 0 (the approx_ce_sensitivity numerics trap)
+    op = fs_tune.op
+    # (a move losing no signal is taken one step further, as in the macro:
+    # the upper edge lands between 1 and 2, keeping two signal rows)
+    ev = op.Events(vals={"x": np.array([0.0, 1.0, 2.0, 3.0])},
+                   w_sig=np.array([1.0, 1.0, 1.0, 0.0]),
+                   w_bkg=np.array([1e-17, 2e-17, 4e-17, 1.0]),
+                   event_numbers=np.arange(4))
+    ev.prepare()
+    cuts = [op.CutVar("x", -1.0, 4.0)]
+    best = max(op._tighten_candidates(cuts, ev, 0.01, op.punzi_fom),
+               key=lambda tp: tp.fom_value)
+    assert 1.0 < best.new_hi < 2.0 and best.n_sig == 2.0, best
+    assert np.isclose(best.n_bkg, 3e-17, rtol=1e-12, atol=0), best
+
+
+def test_fullsim_dio_weights_integrate_the_spectrum_per_bin():
+    dio = sens.load_dio_spectrum()
+    edges = fs_tune.p_edges()
+    w = fs_tune.dio_bin_weights(np.array([0.0, -1.0]), dio, edges)
+    x = dio.xmin + dio.width * (np.arange(dio.values.size) + 0.5)
+    inside = (x > edges[0]) & (x < edges[-1])
+    # no energy change: the spectrum over 100-106 MeV
+    assert np.isclose(w[0].sum(), dio.values[inside].sum() * dio.width, rtol=1e-3)
+    # a 1 MeV loss reads the spectrum 1 MeV higher, where it is far smaller
+    assert 0.1 * w[0].sum() < w[1].sum() < 0.5 * w[0].sum()
+    assert (w >= 0).all()
+
+
+def test_fullsim_cosmic_reference_normalizes_to_the_loose_rate(tmp_dir):
+    n = 40
+    rows = {name: np.full(n, 0.5) for name in fs_tune.VARIABLE_NAMES}
+    rows.update({"t0": np.full(n, 900.0), "p": np.linspace(96, 114, n),
+                 "event": np.arange(n), "mc_pdg": np.where(np.arange(n) % 4 == 0, 13, 11),
+                 "has_calo": np.ones(n, bool), "no_opa": np.ones(n, bool),
+                 "no_tsda": np.arange(n) % 2 == 0, "no_crv_veto": np.ones(n, bool)})
+    path = Path(tmp_dir) / "ref.npz"
+    fs_ref.save(path, rows, {"dataset": "test", "reco": "test"})
+    loaded, meta = fs_ref.load(path)
+    assert meta["n_normalizing"] == fs_ref.normalizing_count(rows) > 0
+    kept, per_mev = fs_ref.rows_for(loaded, ("no_tsda",), 2.0, 3.0)
+    # rate x time over the normalizing count, per MeV of window
+    assert np.isclose(per_mev * meta["n_normalizing"], 2.0 * 3.0)
+    # every species is kept (the muons must meet the tuned cuts too); only
+    # the electrons normalize
+    assert set(np.abs(kept["mc_pdg"])) == {11, 13} and kept["no_tsda"].all()
+    flat = (rows["p"] > 100) & (rows["p"] < 110) & rows["no_tsda"]
+    assert kept["p"].size == int(flat.sum())
+    try:
+        fs_ref.load(Path(tmp_dir) / "missing.npz")
+    except fs_ref.ReferenceError as exc:
+        assert "make_fullsim_cosmic_reference" in str(exc)
+    else:
+        raise AssertionError("a missing reference was accepted")
+
+
+def test_fullsim_seed_is_the_cut_set_without_the_target_cuts():
+    seed = fs_tune.seed_cuts("run1a_tsda", (540.0, 1650.0))
+    assert seed["d0"] == (-60.0, 94.0) and seed["trkqual"] == (0.145, np.inf)
+    assert seed["nactive"] == (16.5, np.inf) and seed["rmax"] == (-np.inf, np.inf)
+    assert "t0" not in seed            # the time window is applied, not tuned
+    pre = fs_tune.preselection("run1a_tsda")
+    assert "has_st" not in pre and "st_boundary" not in pre and "no_tsda" in pre
+    assert not set(fs_tune.TUNED_CUTS) & set(pre)
+
+
+def test_fullsim_optimize_mode_runs_and_fixed_mode_reports_minus_one(tmp_dir):
+    if not CE_MIX_FILE.exists():
+        print("     (skipped: CE mix file not on disk)")
+        return
+    from tools.analyses.fullsim import normalization as norm
+    base = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
+    fixed = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                         output_dir=tmp_dir, parameters=base)
+    assert fixed.status == "success" and fixed.metadata["opt_punzi_test"] == -1.0
+    # a reference of cosmics spread over the tuned variables
+    rng = np.random.default_rng(5)
+    n = 400
+    rows = {"cos": rng.uniform(0.3, 0.9, n), "t0": rng.uniform(450, 1700, n),
+            "rmax": rng.uniform(350, 700, n), "d0": rng.uniform(-200, 200, n),
+            "trkqual": rng.uniform(0, 1, n), "trkpid": rng.uniform(0, 1, n),
+            "t0err": rng.uniform(0.3, 2, n), "nactive": rng.integers(10, 60, n).astype(float),
+            "p": rng.uniform(100, 110, n), "event": np.arange(n), "mc_pdg": np.full(n, 11),
+            "has_calo": np.ones(n, bool), "no_opa": np.ones(n, bool),
+            "no_tsda": np.ones(n, bool), "no_crv_veto": np.ones(n, bool)}
+    ref = Path(tmp_dir) / "ref.npz"
+    fs_ref.save(ref, rows, {"dataset": "toy", "reco": "toy"})
+    r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                     output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                     "cosmic_reference": str(ref)})
+    assert r.status == "success", r.message
+    m = r.metadata
+    # the fixed result is reported unchanged alongside
+    assert m["sensitivity"] == fixed.metadata["sensitivity"]
+    assert m["opt_punzi_test"] > 0 and m["opt_seed_punzi_test"] > 0
+    assert np.isclose(m["opt_gain_test"], m["opt_punzi_test"] / m["opt_seed_punzi_test"])
+    # trkqual is cut from below only: its upper edge is never placed (NaN,
+    # never a range end that could read as NOT_OPTIMIZED)
+    assert m["opt_n_cosmic_rows"] > 0 and np.isnan(m["opt_cut_trkqual_high"])
+    assert 100.0 <= m["opt_window_low_mevc"] < m["opt_window_high_mevc"] <= 106.0
+    bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                       output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                       "cosmic_reference": str(Path(tmp_dir) / "none.npz")})
+    assert bad.status == "error" and "cosmic reference" in bad.message
+    # the preselection follows disable_cuts (CE and cosmics alike) ...
+    r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                     output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                     "cosmic_reference": str(ref),
+                                                     "disable_cuts": "no_tsda"})
+    assert r.status == "success", r.message
+    assert "no_tsda" not in r.metadata.get("optimize", {}).get("preselection", [])
+    # ... and a cut the reference cannot follow is a plain error
+    for cut_params in ({"disable_cuts": "upstream_veto"}, {"enable_cuts": "in_mom_range"}):
+        bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                           output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                           "cosmic_reference": str(ref),
+                                                           **cut_params})
+        assert bad.status == "error" and "optimize" in bad.message, bad.message
+
+
+def test_fullsim_optimize_preselection_follows_the_active_cuts():
+    active = fs_cuts.active_cuts("", "no_tsda", "run1a_tsda")
+    pre = fs_tune.optimize_preselection(active)
+    assert "no_tsda" not in pre and "no_opa" in pre and "has_st" not in pre
+    assert fs_tune.optimize_preselection(fs_cuts.default_cuts("run1a_tsda")) \
+        == fs_tune.preselection("run1a_tsda")
+    for enable, disable, word in (("", "upstream_veto", "upstream_veto"),
+                                  ("in_mom_range", "", "in_mom_range")):
+        try:
+            fs_tune.optimize_preselection(fs_cuts.active_cuts(enable, disable, "run1a_tsda"))
+        except fs_tune.TuneError as exc:
+            assert word in str(exc)
+        else:
+            raise AssertionError(f"{word} was accepted in optimize mode")
+
+
+def test_fullsim_80_1d_seed_has_no_d0_cut():
+    # 80_1d applies no within_d0, so neither does its seed
+    assert "within_d0" not in fs_cuts.default_cuts("80_1d")
+    assert fs_tune.seed_cuts("80_1d", (640.0, 1650.0))["d0"] == (-np.inf, np.inf)
+    assert "within_d0" in fs_cuts.default_cuts("run1a_tsda")
+
+
+def test_fullsim_tuned_trkpid_stays_closed_against_cosmic_muons():
+    """CE and cosmic electrons have high TrkPID, cosmic muons low: with the
+    muons in the reference the search must keep a TrkPID cut that removes
+    them, not open it."""
+    rng = np.random.default_rng(7)
+    n_ce, n_e, n_mu = 2000, 300, 300
+
+    def table(n, trkpid):
+        return {"cos": np.full(n, 0.55), "rmax": np.full(n, 500.0), "d0": np.zeros(n),
+                "trkqual": np.full(n, 0.8), "trkpid": trkpid, "t0err": np.full(n, 0.5),
+                "nactive": np.full(n, 30.0), "t0": np.full(n, 900.0)}
+    ce = table(n_ce, rng.uniform(0.6, 1.0, n_ce))
+    ce.update(p=rng.uniform(103.5, 104.8, n_ce), event=np.arange(n_ce))
+    ce["p_true"] = ce["p"] + 0.7
+    ref = {k: np.r_[a, b] for (k, a), b in zip(
+        table(n_e, rng.uniform(0.6, 1.0, n_e)).items(),
+        table(n_mu, rng.uniform(-1.0, 0.3, n_mu)).values())}
+    ref.update(p=rng.uniform(100, 110, n_e + n_mu), event=np.arange(n_e + n_mu),
+               mc_pdg=np.r_[np.full(n_e, 11), np.full(n_mu, 13)],
+               has_calo=np.ones(n_e + n_mu, bool))
+    for flag in fs_tune.EXTRA_PRESELECTION:
+        ref[flag] = np.ones(n_e + n_mu, bool)
+    cosmic, per_mev = fs_ref.rows_for(ref, (), 1.0, 1.0)
+    assert (np.abs(cosmic["mc_pdg"]) == 13).sum() > 0
+    rows = fs_tune.build_rows(ce, cosmic, signal_per_event=5.0 / n_ce,
+                              dio_per_event=0.0, cosmic_per_mev_per_row=per_mev * 50,
+                              dio_density=sens.load_dio_spectrum())
+    result = fs_tune.tune(rows, fs_tune.seed_cuts("run1a_tsda", (540.0, 1650.0)),
+                          n_random=1)
+    lo = result.cuts["trkpid"][0]
+    assert np.isfinite(lo) and lo > 0.3, result.cuts["trkpid"]
 
 
 def main() -> int:
