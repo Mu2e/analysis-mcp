@@ -141,9 +141,12 @@ In `output_dir`:
 With `cut_mode="optimize"` the fixed result above is reported unchanged, and
 the selection is also tuned on the inputs:
 
-- **Preselection**: the cut set's vetoes and requirements (trigger, upstream
-  and multi-track vetoes, a calorimeter cluster, no OPA, no TSDA, CRV) and
-  its time window, fixed. The stopping-target cuts are dropped, as in
+- **Preselection**: the active cuts' vetoes and requirements (trigger,
+  upstream and multi-track vetoes, a calorimeter cluster, no OPA, no TSDA,
+  CRV), as `enable_cuts` and `disable_cuts` leave them, and the time window,
+  fixed. The reference can follow only `no_opa`, `no_tsda` and `no_crv_veto`
+  beyond the loose set 81 it was cut to, so dropping a set-81 cut or adding
+  any other is an error in this mode. The stopping-target cuts are dropped, as in
   M. MacKenzie's `optimize_target_selection_fast`: they assume the standard
   target. The time window is not tuned: it stands against radiative pion
   captures and the beam flash, which this background model does not hold.
@@ -155,10 +158,13 @@ the selection is also tuned on the inputs:
   electron: its DIO weight is the theory spectrum integrated over the true
   energies that land in the window. Summed over events this is the fixed
   mode's folded DIO; per event it passes or fails the cuts with its CE.
-- **Cosmics**: a fixed reference sample reconstructed like the inputs
-  (`cosmic_reference`), flat over 100-110 MeV/c and scaled to the window,
-  normalized so that the loose set-81 selection gives the loose cosmic rate
-  `approx_ce_sensitivity` uses in box mode.
+- **Cosmics**: a fixed reference sample (`cosmic_reference`), flat over
+  100-110 MeV/c and scaled to the window, normalized so that the loose
+  set-81 selection's true electrons give the loose cosmic rate
+  `approx_ce_sensitivity` uses in box mode. Every species is kept at that
+  same weight: about a third of the loose tracks are muons, and without them
+  the search would drop TrkPID for free (it did, before they were kept: the
+  tuned cuts passed 116 reference muons, against 2 now).
 - **Search**: the shared optimizer (`tools/analyses/optimize.py`, as
   `optimize_selection_ntuple`): the macro's greedy path and five randomized
   paths from no cut, the cut set and the previous round as further starts,
@@ -173,7 +179,7 @@ the selection is also tuned on the inputs:
 | `opt_gain_test` | `opt_punzi_test / opt_seed_punzi_test` |
 | `opt_signal_test`, `opt_background_test`, `opt_seed_*` | S and B behind them, for `npot` |
 | `opt_window_*_mevc`, `opt_seed_window_*_mevc` | the momentum windows |
-| `opt_cut_<var>_low`, `opt_cut_<var>_high` | the tuned cuts; an edge never placed reads as its search range's end |
+| `opt_cut_<var>_low`, `opt_cut_<var>_high` | the tuned cuts; an edge never placed (no cut there) is NaN |
 | `opt_n_ce_rows`, `opt_n_cosmic_rows` | CE and cosmic rows of the table |
 
 The search was checked against the macro itself: on the macro's own
@@ -182,7 +188,13 @@ in-memory table for `st37plus6up6dn` (dumped from it), the port finds S/sqrt(B)
 same cuts within their flat directions.
 
 The reference must be reconstructed with the same code and conditions as the
-inputs (TrkQual and TrkPID are MVAs that change between releases). Make it
+inputs (TrkQual and TrkPID are MVAs that change between releases). Nothing
+checks this. The committed one (`data/fullsim_cosmic_reference.npz`) is
+reconstructed primary-only, without pileup, with
+`Code_ana_v020301_fcl_mdc2025bc`. For inputs mixed with pileup (Mix1BB) or
+from another release, its TrkQual, N(active) and t0err are measured without
+the pileup hits the CE rows carry, so the tuned cuts are approximate. Make a
+matching reference for those inputs. Make it
 from the CRY signal-region cosmics, `dts.mu2e.CosmicSignal.MDC2025ap.art`,
 run through the inputs' own reconstruction, then:
 
@@ -273,5 +285,8 @@ given, so it needs no network). The optimize mode's search is tested on toy
 events through the shared optimizer (the obvious cuts, the cut conversion and
 unplaced edges, half-integer edges, tiny DIO weights beside large cosmic
 ones), its DIO weights against the spectrum, the
-reference's normalization, and, on the CE mix file, a full run with a toy
-reference.
+reference's normalization (muons kept, electrons normalizing), a toy in
+which TrkPID must stay cut against cosmic muons, the preselection following
+`enable_cuts`/`disable_cuts` (and refusing what the reference cannot
+follow), `80_1d`'s seed without a d0 cut, and, on the CE mix file, a full run
+with a toy reference.

@@ -131,7 +131,8 @@ def seed_cuts(cut_set: str, time_window) -> dict:
         "cos": tuple(float(_tandip_to_cos(t)) for t in cs.tandip_window),
         # rmax is not in the cut sets: left open (no cut) for the search
         "rmax": (-np.inf, np.inf),
-        "d0": tuple(cs.d0_window_mm),
+        # open where the set has no d0 cut (80_1d), so the seed is the set
+        "d0": tuple(cs.d0_window_mm) if cs.d0_cut else (-np.inf, np.inf),
         "trkqual": (cs.trkqual_min, np.inf),
         "trkpid": (cs.trkpid_min, np.inf),
         "t0err": (-np.inf, cs.t0err_max_ns),
@@ -141,8 +142,30 @@ def seed_cuts(cut_set: str, time_window) -> dict:
 
 def preselection(cut_set: str) -> tuple:
     """The cut set's default cuts less the tuned and stopping-target ones."""
+    return optimize_preselection(default_cuts(cut_set))
+
+
+def optimize_preselection(active) -> tuple:
+    """The active cuts (enable_cuts and disable_cuts applied) less the tuned
+    and stopping-target ones. The cosmic reference applies LOOSE_CUTS and
+    carries EXTRA_PRESELECTION as flags, nothing else, so a preselection
+    outside that would cut the CE and the cosmics differently: refused."""
     drop = set(TUNED_CUTS) | set(ST_CUTS)
-    return tuple(n for n in default_cuts(cut_set) if n not in drop)
+    pre = tuple(n for n in active if n not in drop)
+    missing = [n for n in LOOSE_CUTS if n not in pre]
+    if missing:
+        raise TuneError(
+            f"disable_cuts removes {', '.join(missing)}, which the cosmic "
+            "reference always applies (it holds only tracks passing set 81): "
+            "keep them in optimize mode")
+    unknown = [n for n in pre if n not in LOOSE_CUTS + EXTRA_PRESELECTION]
+    if unknown:
+        raise TuneError(
+            f"enable_cuts adds {', '.join(unknown)}, which the cosmic reference "
+            "has no flag for (it can follow only "
+            f"{', '.join(EXTRA_PRESELECTION)} beyond set 81; the momentum and "
+            "time windows are the scan and time_window): drop them in optimize mode")
+    return pre
 
 
 def candidate_tracks(data: dict, cuts: tuple, triggers, cut_set: str,

@@ -43,6 +43,9 @@ class CutSet:
     min_active_hits: int
     d0_window_mm: tuple
     tsda_veto: bool
+    # Whether pyfitter applies within_d0 in this set (d0_window_mm is
+    # there to enable either way).
+    d0_cut: bool
     # The CE time window at the tracker front (ns, open), the default of
     # fullsim_sensitivity's time_window.
     time_window_ns: tuple
@@ -54,12 +57,12 @@ CUT_SETS: dict[str, CutSet] = {
     "80_1d": CutSet("80_1d", trkpid_min=0.54, tandip_window=(0.575, 0.85),
                     trkqual_min=0.155, t0err_max_ns=0.85, min_active_hits=20,
                     d0_window_mm=(-114.066, 76.5017), tsda_veto=False,
-                    time_window_ns=(640.0, 1650.0)),
+                    d0_cut=False, time_window_ns=(640.0, 1650.0)),
     "run1a_tsda": CutSet("run1a_tsda", trkpid_min=0.574,
                          tandip_window=(0.56, 0.8787), trkqual_min=0.145,
                          t0err_max_ns=0.81, min_active_hits=17,
                          d0_window_mm=(-60.0, 94.0), tsda_veto=True,
-                         time_window_ns=(540.0, 1650.0)),
+                         d0_cut=True, time_window_ns=(540.0, 1650.0)),
 }
 CUT_SET = "run1a_tsda"            # the default
 TRKPID_MIN = CUT_SETS[CUT_SET].trkpid_min
@@ -144,9 +147,9 @@ def default_cuts(cut_set: str = CUT_SET) -> tuple:
     """`cut_set`'s switch set, less the fit-range cuts (module docstring)."""
     cs = get_cut_set(cut_set)
     off = set(_FIT_RANGES)
-    if cut_set == "80_1d":
-        off |= {"within_d0", "no_tsda"}
-    elif not cs.tsda_veto:
+    if not cs.d0_cut:
+        off.add("within_d0")
+    if not cs.tsda_veto:
         off.add("no_tsda")
     return tuple(n for n in CUT_ORDER if n not in off)
 

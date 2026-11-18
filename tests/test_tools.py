@@ -6487,7 +6487,11 @@ def test_fullsim_cosmic_reference_normalizes_to_the_loose_rate(tmp_dir):
     kept, per_mev = fs_ref.rows_for(loaded, ("no_tsda",), 2.0, 3.0)
     # rate x time over the normalizing count, per MeV of window
     assert np.isclose(per_mev * meta["n_normalizing"], 2.0 * 3.0)
-    assert (np.abs(kept["mc_pdg"]) == 11).all() and kept["no_tsda"].all()
+    # every species is kept (the muons must meet the tuned cuts too); only
+    # the electrons normalize
+    assert set(np.abs(kept["mc_pdg"])) == {11, 13} and kept["no_tsda"].all()
+    flat = (rows["p"] > 100) & (rows["p"] < 110) & rows["no_tsda"]
+    assert kept["p"].size == int(flat.sum())
     try:
         fs_ref.load(Path(tmp_dir) / "missing.npz")
     except fs_ref.ReferenceError as exc:
@@ -6536,12 +6540,84 @@ def test_fullsim_optimize_mode_runs_and_fixed_mode_reports_minus_one(tmp_dir):
     assert m["sensitivity"] == fixed.metadata["sensitivity"]
     assert m["opt_punzi_test"] > 0 and m["opt_seed_punzi_test"] > 0
     assert np.isclose(m["opt_gain_test"], m["opt_punzi_test"] / m["opt_seed_punzi_test"])
-    assert m["opt_n_cosmic_rows"] > 0 and m["opt_cut_trkqual_high"] == 1.0
+    # trkqual is cut from below only: its upper edge is never placed (NaN,
+    # never a range end that could read as NOT_OPTIMIZED)
+    assert m["opt_n_cosmic_rows"] > 0 and np.isnan(m["opt_cut_trkqual_high"])
     assert 100.0 <= m["opt_window_low_mevc"] < m["opt_window_high_mevc"] <= 106.0
     bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                        output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
                                                        "cosmic_reference": str(Path(tmp_dir) / "none.npz")})
     assert bad.status == "error" and "cosmic reference" in bad.message
+    # the preselection follows disable_cuts (CE and cosmics alike) ...
+    r = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                     output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                     "cosmic_reference": str(ref),
+                                                     "disable_cuts": "no_tsda"})
+    assert r.status == "success", r.message
+    assert "no_tsda" not in r.metadata.get("optimize", {}).get("preselection", [])
+    # ... and a cut the reference cannot follow is a plain error
+    for cut_params in ({"disable_cuts": "upstream_veto"}, {"enable_cuts": "in_mom_range"}):
+        bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                           output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                           "cosmic_reference": str(ref),
+                                                           **cut_params})
+        assert bad.status == "error" and "optimize" in bad.message, bad.message
+
+
+def test_fullsim_optimize_preselection_follows_the_active_cuts():
+    active = fs_cuts.active_cuts("", "no_tsda", "run1a_tsda")
+    pre = fs_tune.optimize_preselection(active)
+    assert "no_tsda" not in pre and "no_opa" in pre and "has_st" not in pre
+    assert fs_tune.optimize_preselection(fs_cuts.default_cuts("run1a_tsda")) \
+        == fs_tune.preselection("run1a_tsda")
+    for enable, disable, word in (("", "upstream_veto", "upstream_veto"),
+                                  ("in_mom_range", "", "in_mom_range")):
+        try:
+            fs_tune.optimize_preselection(fs_cuts.active_cuts(enable, disable, "run1a_tsda"))
+        except fs_tune.TuneError as exc:
+            assert word in str(exc)
+        else:
+            raise AssertionError(f"{word} was accepted in optimize mode")
+
+
+def test_fullsim_80_1d_seed_has_no_d0_cut():
+    # 80_1d applies no within_d0, so neither does its seed
+    assert "within_d0" not in fs_cuts.default_cuts("80_1d")
+    assert fs_tune.seed_cuts("80_1d", (640.0, 1650.0))["d0"] == (-np.inf, np.inf)
+    assert "within_d0" in fs_cuts.default_cuts("run1a_tsda")
+
+
+def test_fullsim_tuned_trkpid_stays_closed_against_cosmic_muons():
+    """CE and cosmic electrons have high TrkPID, cosmic muons low: with the
+    muons in the reference the search must keep a TrkPID cut that removes
+    them, not open it."""
+    rng = np.random.default_rng(7)
+    n_ce, n_e, n_mu = 2000, 300, 300
+
+    def table(n, trkpid):
+        return {"cos": np.full(n, 0.55), "rmax": np.full(n, 500.0), "d0": np.zeros(n),
+                "trkqual": np.full(n, 0.8), "trkpid": trkpid, "t0err": np.full(n, 0.5),
+                "nactive": np.full(n, 30.0), "t0": np.full(n, 900.0)}
+    ce = table(n_ce, rng.uniform(0.6, 1.0, n_ce))
+    ce.update(p=rng.uniform(103.5, 104.8, n_ce), event=np.arange(n_ce))
+    ce["p_true"] = ce["p"] + 0.7
+    ref = {k: np.r_[a, b] for (k, a), b in zip(
+        table(n_e, rng.uniform(0.6, 1.0, n_e)).items(),
+        table(n_mu, rng.uniform(-1.0, 0.3, n_mu)).values())}
+    ref.update(p=rng.uniform(100, 110, n_e + n_mu), event=np.arange(n_e + n_mu),
+               mc_pdg=np.r_[np.full(n_e, 11), np.full(n_mu, 13)],
+               has_calo=np.ones(n_e + n_mu, bool))
+    for flag in fs_tune.EXTRA_PRESELECTION:
+        ref[flag] = np.ones(n_e + n_mu, bool)
+    cosmic, per_mev = fs_ref.rows_for(ref, (), 1.0, 1.0)
+    assert (np.abs(cosmic["mc_pdg"]) == 13).sum() > 0
+    rows = fs_tune.build_rows(ce, cosmic, signal_per_event=5.0 / n_ce,
+                              dio_per_event=0.0, cosmic_per_mev_per_row=per_mev * 50,
+                              dio_density=sens.load_dio_spectrum())
+    result = fs_tune.tune(rows, fs_tune.seed_cuts("run1a_tsda", (540.0, 1650.0)),
+                          n_random=1)
+    lo = result.cuts["trkpid"][0]
+    assert np.isfinite(lo) and lo > 0.3, result.cuts["trkpid"]
 
 
 def main() -> int:

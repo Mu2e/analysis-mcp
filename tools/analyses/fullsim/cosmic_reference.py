@@ -90,15 +90,22 @@ def load(path: Path | str = "") -> tuple[dict, dict]:
 
 def rows_for(rows: dict, preselection_flags: tuple, rate_per_s_per_mev: float,
              onspill_seconds: float) -> tuple[dict, float]:
-    """The reference's true electrons in the flat range passing the extra
-    preselection, and the weight each carries per MeV/c of window."""
+    """The reference's tracks in the flat range passing the extra
+    preselection, of every species, and the weight each carries per MeV/c
+    of window.
+
+    The loose rate counts true electrons, so only they normalize the weight;
+    but the weight is then the reference's live-time scale, the same for
+    every row. Muons (about a third of the loose tracks) are kept: the tuned
+    cuts must still reject them, TrkPID above all, and a table without them
+    lets the search drop that cut for free."""
     norm = normalizing_count(rows)
     if norm <= 0:
         raise ReferenceError("the cosmic reference has no true electron passing "
                              f"set 81 in {COSMIC_FLAT_MEV[0]:g}-{COSMIC_FLAT_MEV[1]:g} MeV/c")
     p = rows["p"]
     keep = ((p > COSMIC_FLAT_MEV[0]) & (p < COSMIC_FLAT_MEV[1])
-            & (np.abs(rows["mc_pdg"]) == 11) & rows[CALO_FLAG].astype(bool))
+            & rows[CALO_FLAG].astype(bool))
     for flag in preselection_flags:
         keep &= rows[flag].astype(bool)
     per_mev = rate_per_s_per_mev * onspill_seconds / norm
