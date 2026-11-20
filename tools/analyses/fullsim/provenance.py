@@ -125,6 +125,67 @@ def files_metadata(names: list[str]) -> list[dict]:
     return metadata
 
 
+def generated_events_bulk(names: list[str], fetch_many=files_metadata) -> dict[str, int]:
+    """generated_events for many files, a generation at a time, so 500 files
+    take a few bulk requests rather than a thousand single ones. Each file's
+    count is the dh.gencount of it or its nearest single-parent ancestor
+    with one. `fetch_many` returns the metadata of a list of names (in any
+    order); tests pass a fake."""
+    counts: dict[str, int] = {}
+    current = {name: name for name in names}     # file -> ancestor to read
+    for _ in range(MAX_ANCESTRY):
+        if not current:
+            break
+        try:
+            metadata = {m["file_name"]: m
+                        for m in fetch_many(sorted(set(current.values())))}
+        except Exception as exc:
+            raise ProvenanceError(
+                f"cannot read the SAM metadata of {len(current)} file(s) "
+                f"({exc}), so the events generated for them are unknown"
+            ) from None
+        following = {}
+        for name, ancestor in current.items():
+            record = metadata.get(ancestor, {})
+            if record.get("dh.gencount"):
+                counts[name] = int(record["dh.gencount"])
+                continue
+            parents = record.get("parents") or []
+            if len(parents) != 1:
+                raise ProvenanceError(
+                    f"no dh.gencount in SAM for {name} or its parents "
+                    f"(stopped at {ancestor}), so the events generated for "
+                    "it are unknown")
+            following[name] = parents[0]["file_name"]
+        current = following
+    if current:
+        name, ancestor = next(iter(current.items()))
+        raise ProvenanceError(
+            f"no dh.gencount in SAM for {name} within {MAX_ANCESTRY} "
+            f"generations (stopped at {ancestor})")
+    return counts
+
+
+def root_ancestor(name: str, fetch=sam_metadata) -> str:
+    """The first-generation file `name` descends from, following its first
+    parent until a file has none: for a cosmic ntuple, the S1 file of
+    CRY cosmics its events were resampled from."""
+    current = name
+    for _ in range(MAX_STAGE_SEARCH + 1):
+        try:
+            parents = fetch(current).get("parents") or []
+        except Exception as exc:
+            raise ProvenanceError(
+                f"cannot read the SAM metadata of {current} ({exc}), so the "
+                f"simulation {name} descends from is unknown") from None
+        if not parents:
+            return current
+        current = parents[0]["file_name"]
+    raise ProvenanceError(
+        f"{name} has more than {MAX_STAGE_SEARCH} generations of parents in "
+        f"SAM (stopped at {current})")
+
+
 def generated_events(name: str, fetch=sam_metadata) -> int:
     """Events generated to make file `name` (a SAM file name): the
     `dh.gencount` of the file or its nearest ancestor that has one.

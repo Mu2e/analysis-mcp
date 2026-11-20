@@ -1,8 +1,9 @@
 """The CE-like track selection: a pyfitter cut set (config.py VERSION_CUTS,
-cuts as analyze.py Analyze.define_cuts applies them). Two are supported:
-'run1a_tsda' (the default), the Run 1A track selection with the signed-d0 cut
-and the TSDA intersection veto (Mu2eEvtAna ConvAna set 79), with the CE time
-window 540-1650 ns (pyfitter's within_t0_540); and '80_1d', with 640-1650 ns.
+cuts as analyze.py Analyze.define_cuts applies them). One is supported:
+'run1a_tsda', the Run 1A track selection with the signed-d0 cut and the TSDA
+intersection veto (Mu2eEvtAna ConvAna set 79), with the CE time window
+540-1650 ns (pyfitter's within_t0_540). The set is still named (cut_set) so
+callers that pass it keep working and a result says what it used.
 
 Every cut is a track-level mask (events x tracks). A cut on a segment
 quantity applies at one surface, as in pyfitter:
@@ -18,9 +19,7 @@ vetoes ask for trk.t0, which pyfitter never reads, so they fall back to the
 tracker-front segment times (the first one, and the mean, respectively).
 DEFAULT_CUTS is pyfitter's switch set less its fit ranges: in_mom_range and
 within_t0 are there to enable, but here the momentum window is scanned and
-the time window is the time_window parameter. within_d0 and no_tsda are in
-a set's defaults only where pyfitter applies them ('run1a_tsda'); for '80_1d'
-they are there to enable, so its selection is unchanged.
+the time window is the time_window parameter.
 """
 
 from dataclasses import dataclass
@@ -42,29 +41,21 @@ class CutSet:
     t0err_max_ns: float
     min_active_hits: int
     d0_window_mm: tuple
-    tsda_veto: bool
-    # Whether pyfitter applies within_d0 in this set (d0_window_mm is
-    # there to enable either way).
-    d0_cut: bool
     # The CE time window at the tracker front (ns, open), the default of
     # fullsim_sensitivity's time_window.
     time_window_ns: tuple
 
 
-# '80_1d' and '80_2d' differ only in within_t0's lower edge. 'run1a_tsda' is
-# pyfitter's 'run1a' (identical thresholds) with tsda_veto, as ConvAna set 79.
+# 'run1a_tsda' is pyfitter's 'run1a' (identical thresholds) with tsda_veto,
+# as ConvAna set 79.
 CUT_SETS: dict[str, CutSet] = {
-    "80_1d": CutSet("80_1d", trkpid_min=0.54, tandip_window=(0.575, 0.85),
-                    trkqual_min=0.155, t0err_max_ns=0.85, min_active_hits=20,
-                    d0_window_mm=(-114.066, 76.5017), tsda_veto=False,
-                    d0_cut=False, time_window_ns=(640.0, 1650.0)),
     "run1a_tsda": CutSet("run1a_tsda", trkpid_min=0.574,
                          tandip_window=(0.56, 0.8787), trkqual_min=0.145,
                          t0err_max_ns=0.81, min_active_hits=17,
-                         d0_window_mm=(-60.0, 94.0), tsda_veto=True,
-                         d0_cut=True, time_window_ns=(540.0, 1650.0)),
+                         d0_window_mm=(-60.0, 94.0),
+                         time_window_ns=(540.0, 1650.0)),
 }
-CUT_SET = "run1a_tsda"            # the default
+CUT_SET = "run1a_tsda"            # the only one
 TRKPID_MIN = CUT_SETS[CUT_SET].trkpid_min
 TANDIP_WINDOW = CUT_SETS[CUT_SET].tandip_window
 TRKQUAL_MIN = CUT_SETS[CUT_SET].trkqual_min
@@ -78,8 +69,8 @@ CRV_DT_NS = (0.0, 150.0)
 UPSTREAM_VETO_DT_NS = (40.0, 110.0)
 # Two downstream e+- tracks closer in time than this veto each other.
 MULTI_TRK_DT_NS = 150.0
-# pyfitter's fit ranges, as cuts: its default momentum fit range, and the
-# 1D cut set's time range.
+# pyfitter's fit ranges, as cuts: its default momentum fit range, and
+# run1a_tsda's time range.
 MOM_RANGE_MEVC = (100.0, 110.0)
 T0_WINDOW_NS = (540.0, 1650.0)
 
@@ -93,8 +84,7 @@ CUT_ORDER = (
     "good_trkqual", "has_hits", "within_t0err", "no_crv_veto", "in_mom_range",
     "within_t0",
 )
-# Cuts outside a set's defaults: the fit ranges always, and the d0 and TSDA
-# cuts where pyfitter does not apply them.
+# Cuts outside the defaults: the fit ranges.
 _FIT_RANGES = ("in_mom_range", "within_t0")
 
 
@@ -145,13 +135,8 @@ def cut_descriptions(cut_set: str = CUT_SET) -> dict[str, str]:
 
 def default_cuts(cut_set: str = CUT_SET) -> tuple:
     """`cut_set`'s switch set, less the fit-range cuts (module docstring)."""
-    cs = get_cut_set(cut_set)
-    off = set(_FIT_RANGES)
-    if not cs.d0_cut:
-        off.add("within_d0")
-    if not cs.tsda_veto:
-        off.add("no_tsda")
-    return tuple(n for n in CUT_ORDER if n not in off)
+    get_cut_set(cut_set)
+    return tuple(n for n in CUT_ORDER if n not in _FIT_RANGES)
 
 
 class CutError(ValueError):

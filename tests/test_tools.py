@@ -2949,11 +2949,9 @@ def test_fullsim_run1a_tsda_is_the_default_with_its_thresholds_d0_and_tsda_veto(
     # within_d0 after pz_over_pt, no_tsda after no_opa, as pyfitter
     assert run1a.index("within_d0") == run1a.index("pz_over_pt") + 1
     assert run1a.index("no_tsda") == run1a.index("no_opa") + 1
-    # 80_1d keeps the selection it always had
-    old = fs_cuts.default_cuts("80_1d")
-    assert "within_d0" not in old and "no_tsda" not in old
+    # the only cut set
+    assert list(fs_cuts.CUT_SETS) == ["run1a_tsda"]
     assert fs_cuts.CUT_SETS["run1a_tsda"].time_window_ns == (540.0, 1650.0)
-    assert fs_cuts.CUT_SETS["80_1d"].time_window_ns == (640.0, 1650.0)
 
     def seg0(**kw):
         return [_seg(0, **kw), _seg(1), _seg(100), _seg(104)]
@@ -2964,17 +2962,13 @@ def test_fullsim_run1a_tsda_is_the_default_with_its_thresholds_d0_and_tsda_veto(
     other = [_seg(0), _seg(1, rad=300.0), _seg(100), _seg(104)]
     assert _failed_cuts({"tracks": [_track(segs=other)]}) == []
     assert _failed_cuts({"tracks": [_track(tsdainter=1)]}) == ["no_tsda"]
-    # run1a's thresholds, not 80_1d's
+    # run1a's thresholds
     assert _failed_cuts({"tracks": [_track(nactive=17)]}) == []          # 17, not 20
     assert _failed_cuts({"tracks": [_track(qual=0.15)]}) == []           # 0.145, not 0.155
     assert _failed_cuts({"tracks": [_track(pid=0.56)]}) == ["good_trkpid"]  # 0.574, not 0.54
     assert _failed_cuts({"tracks": [_track(segs=seg0(tandip=0.86))]}) == []  # < 0.8787
     t0err = [_seg(0), _seg(1, t0err=0.83), _seg(100), _seg(104)]
     assert _failed_cuts({"tracks": [_track(segs=t0err)]}) == ["within_t0err"]  # 0.81
-    # and 80_1d's on request
-    masks = fs_cuts.cut_masks(_eventntuple([{"tracks": [_track(nactive=17)]}]),
-                              "minus", cut_set="80_1d")
-    assert not masks["has_hits"][0][0]
 
 
 def test_fullsim_a_cut_without_its_branch_is_refused_not_skipped():
@@ -2990,14 +2984,15 @@ def test_fullsim_a_cut_without_its_branch_is_refused_not_skipped():
         assert "trk.tsdainter" in str(exc), exc
     else:
         raise AssertionError("no_tsda without trk.tsdainter was accepted")
-    # 80_1d does not need it
-    fs_cuts.apply_cuts(masks, fs_cuts.active_cuts("", "", "80_1d"), data["trk"]["trk.pdg"])
-    try:
-        fs_cuts.active_cuts("", "", "not_a_set")
-    except fs_cuts.CutError as exc:
-        assert "run1a_tsda" in str(exc), exc
-    else:
-        raise AssertionError("an unknown cut set was accepted")
+    # disabling it is how to run without the branch
+    fs_cuts.apply_cuts(masks, fs_cuts.active_cuts("", "no_tsda"), data["trk"]["trk.pdg"])
+    for removed in ("not_a_set", "80_1d"):
+        try:
+            fs_cuts.active_cuts("", "", removed)
+        except fs_cuts.CutError as exc:
+            assert "run1a_tsda" in str(exc), exc
+        else:
+            raise AssertionError(f"cut set {removed} was accepted")
 
 
 def test_fullsim_origin_is_the_first_classified_particle_in_the_chain():
@@ -3307,32 +3302,39 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
     from tools.analyses.fullsim import normalization as norm
     generated = {"n_generated": 20000,
                  "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT,
-                 "cut_set": "80_1d"}
+                 "cosmic_source": "rate"}
     result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                           output_dir=tmp_dir, parameters=generated)
     assert result.status == "success", result.message
     md = result.metadata
+    # run1a_tsda with 540-1650 ns: its relative cut efficiencies match
+    # pyfitter's au_run1a_tsda CeM_mix cut flow within this file's statistics
+    # (good_trkpid 89.9 vs 89.7%, within_d0 92.9 vs 92.9%, no_tsda 99.6 vs
+    # 99.3%, good_trkqual 97.7 vs 97.7%)
+    assert md["cut_set"] == "run1a_tsda" and md["time_window"] == [540.0, 1650.0]
     assert md["n_events_processed"] == 8212 and md["n_events_generated"] == 20000
     assert np.isclose(md["acceptance"], 8212 / 20000)
-    assert (md["n_events_selected"], md["n_events_counted"]) == (4181, 3010)
+    assert (md["n_events_selected"], md["n_events_counted"]) == (4243, 3595)
     # the efficiency counts against what was generated, so it carries the
     # digitization filter's acceptance
-    assert np.isclose(md["signal_efficiency"], 3010 / 20000)
-    assert np.isclose(md["signal_rate"], 4.686, rtol=1e-3)
-    # the cut flow is pyfitter's for cut-set 80_1d on this file
-    assert list(md["cut_flow"].values())[-1] == 4181
-    assert md["cut_flow"]["no_multi_trk_veto"] == 6909 and md["cut_flow"]["pz_over_pt"] == 4550
-    assert np.allclose((md["signal_mom_low_mevc"], md["signal_mom_high_mevc"]), (103.5, 104.7))
+    assert np.isclose(md["signal_efficiency"], 3595 / 20000)
+    assert list(md["cut_flow"].values())[-1] == 4243
+    assert md["cut_flow"]["within_d0"] == 4499 and md["cut_flow"]["no_tsda"] == 4355
+    assert md["cut_flow"]["good_trkpid"] == 6209 and md["cut_flow"]["pz_over_pt"] == 4841
+    assert np.isclose(md["signal_time_low_ns"], 540.0)
+    assert np.isclose(md["sensitivity"], 4.0711, rtol=1e-4)
     # 1e18 POT x 7.67e-4 stopped mu-/POT x 0.609 captures x R_mue 1e-13
     assert np.isclose(md["n_conversions"], 46.717, rtol=1e-4)
     assert md["total_background"] == md["dio_background"] + md["cosmic_background"]
-    # a pileup DIO track that passes the cuts is not signal
-    assert md["selected_by_origin"] == {"DIO": 1, "CE-": 4180}
+    # a pileup track that passes the cuts is not signal
+    assert md["selected_by_origin"]["CE-"] < md["n_events_selected"]
+    # the flat rate measures no cosmic sample, and says so
+    assert md["n_cosmic_files"] == -1 and md["cosmic_livetime_s"] == -1
     # upstream_eff scales the signal and the DIO alike, not the cosmics
     half = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                         output_dir=tmp_dir, parameters={**generated, "upstream_eff": 0.5})
     hm = half.metadata
-    assert np.isclose(hm["signal_efficiency"], 0.5 * 3010 / 20000)
+    assert np.isclose(hm["signal_efficiency"], 0.5 * 3595 / 20000)
     assert hm["cosmic_rate_per_s_per_mev"] == md["cosmic_rate_per_s_per_mev"]
     bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                        output_dir=tmp_dir, parameters={**generated, "trigger_paths": "apr_Nope"})
@@ -3340,22 +3342,207 @@ def test_fullsim_measures_the_efficiency_on_ce_mix(tmp_dir):
     few = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                        output_dir=tmp_dir, parameters={**generated, "n_generated": 100})
     assert few.status == "error" and "n_generated 100" in few.message
-    # the default, run1a_tsda with 540-1650 ns: its relative cut efficiencies
-    # match pyfitter's au_run1a_tsda CeM_mix cut flow within this file's
-    # statistics (good_trkpid 89.9 vs 89.7%, within_d0 92.9 vs 92.9%,
-    # no_tsda 99.6 vs 99.3%, good_trkqual 97.7 vs 97.7%)
-    del generated["cut_set"]
-    run1a = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
-                         output_dir=tmp_dir, parameters=generated)
-    assert run1a.status == "success", run1a.message
-    rm = run1a.metadata
-    assert rm["cut_set"] == "run1a_tsda" and rm["time_window"] == [540.0, 1650.0]
-    assert (rm["n_events_selected"], rm["n_events_counted"]) == (4243, 3595)
-    assert np.isclose(rm["signal_efficiency"], 3595 / 20000)
-    assert rm["cut_flow"]["within_d0"] == 4499 and rm["cut_flow"]["no_tsda"] == 4355
-    assert rm["cut_flow"]["good_trkpid"] == 6209 and rm["cut_flow"]["pz_over_pt"] == 4841
-    assert np.isclose(rm["signal_time_low_ns"], 540.0)
-    assert np.isclose(rm["sensitivity"], 4.0711, rtol=1e-4)
+    # the removed cut set is refused, by name
+    old = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                       output_dir=tmp_dir, parameters={**generated, "cut_set": "80_1d"})
+    assert old.status == "error" and "run1a_tsda" in old.message
+
+
+# --- fullsim cosmics: the cosmic background from the official cosmic mix -----
+
+# One S1 CRY subrun's CosmicLivetime and GenEventCount as streamed in
+# sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab.001430_00004843.art.
+S1_LIVETIME_BYTES = bytes.fromhex(
+    "4000002200000ba0af11000000000000000147afc8003d4ccccd47c35000468ca00041ecd6f1")
+S1_GENCOUNT_BYTES = bytes.fromhex("4000000e0000d4e9e3b1000000000001fbda")
+CE_MIX_NAME = "nts.mu2e.CeMLeadingLogMix1BB.MDC2025au_best_v1_1-001.001430_00000000.root"
+
+
+def test_fullsim_cosmic_mix_is_found_from_the_ce_mix_name():
+    from tools.analyses.fullsim import cosmics
+    assert cosmics.cosmic_datasets_for([CE_MIX_NAME]) == [
+        "nts.mu2e.CosmicSignalMix1BB.MDC2025au_best_v1_1-001.root",
+        "nts.mu2e.CosmicCRYAllMix1BB.MDC2025au_best_v1_1-001.root"]
+    run1b = "nts.mu2e.CeEndpointMix1BB-KL.Run1Baw_best_v1_5.001470_00000010.root"
+    assert cosmics.cosmic_datasets_for([run1b])[1] == \
+        "nts.mu2e.CosmicCRYAllMix1BB-KL.Run1Baw_best_v1_5.root"
+    for names, needle in (
+            ([CE_MIX_NAME, "nts.mu2e.CeMLeadingLogMix1BB.other.001430_00000000.root"],
+             "2 datasets"),
+            (["renamed.root"], "not all SAM file names"),
+            (["nts.mu2e.CeMLeadingLog.MDC2025au.001430_00000000.root"], "mixed input")):
+        try:
+            cosmics.cosmic_datasets_for(names)
+        except cosmics.CosmicError as exc:
+            assert needle in str(exc), (needle, str(exc))
+        else:
+            raise AssertionError(f"no error for {names}")
+
+
+def test_fullsim_auto_takes_the_first_cosmic_mix_the_catalog_has(tmp_dir):
+    from tools import catalog
+    from tools.analyses.fullsim import cosmics
+    second = "nts.mu2e.CosmicCRYAllMix1BB.MDC2025au_best_v1_1-001.root"
+    real = catalog.CLIENT
+    catalog.CLIENT = FakeCatalogs(sam_defs={second: ["f"]})
+    try:
+        assert fs_sens.find_cosmic_dataset("auto", [CE_MIX_NAME]) == second
+        assert fs_sens.find_cosmic_dataset("my.cosmic.set.v1.root", [CE_MIX_NAME]) \
+            == "my.cosmic.set.v1.root"
+        catalog.CLIENT = FakeCatalogs()
+        try:
+            fs_sens.find_cosmic_dataset("auto", [CE_MIX_NAME])
+        except cosmics.CosmicError as exc:
+            assert "no cosmic mix matching" in str(exc) and "'rate'" in str(exc)
+        else:
+            raise AssertionError("no error without a cosmic mix")
+    finally:
+        catalog.CLIENT = real
+
+
+def test_fullsim_s1_livetime_is_decoded_from_the_streamed_products():
+    """uproot reads these classes misaligned; the raw layout gives the
+    subrun's 29.6 s for 130010 events, near the dataset's tau."""
+    from tools.analyses.fullsim import cosmics
+    livetime, count = cosmics.decode_s1_subrun(S1_LIVETIME_BYTES, S1_GENCOUNT_BYTES)
+    assert count == 130010 and np.isclose(livetime, 29.605, atol=1e-3)
+    tau = cosmics.S1_LIVETIME_PER_EVENT["sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab.art"]
+    assert abs(livetime / count / tau - 1) < 0.01
+    assert cosmics.livetime_per_event(
+        "sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab.001430_00004843.art") == tau
+    try:
+        cosmics.livetime_per_event("sim.mu2e.CosmicCORSIKA.MDC2026a.001430_00000000.art")
+    except cosmics.CosmicError as exc:
+        assert "cosmic_livetime_per_event" in str(exc)
+    else:
+        raise AssertionError("no error for an unmeasured S1 dataset")
+
+
+def _cosmic_chain():
+    """nts -> mcs (gencount 50M) -> dig -> dts -> S1, as SAM has the
+    CosmicSignalMix1BB chain, for two nts files."""
+    records = {}
+    for i in (0, 1):
+        nts = f"nts.mu2e.CosmicSignalMix1BB.v1.001430_0000000{i}.root"
+        mcs = f"mcs.mu2e.CosmicSignalMix1BB.v1.001430_0000000{i}.art"
+        records[nts] = {"file_name": nts, "parents": [{"file_name": mcs}]}
+        records[mcs] = {"file_name": mcs, "dh.gencount": 50000000,
+                        "parents": [{"file_name": "dig.x"}]}
+    records["dig.x"] = {"file_name": "dig.x", "parents": [{"file_name": "dts.y"},
+                                                          {"file_name": "dts.z"}]}
+    records["dts.y"] = {"file_name": "dts.y", "parents": [{"file_name": "sim.s1"}]}
+    records["sim.s1"] = {"file_name": "sim.s1"}
+    return records
+
+
+def test_fullsim_cosmic_livetime_counts_the_s2_events_behind_each_file():
+    from tools.analyses.fullsim import provenance
+    records = _cosmic_chain()
+    asked = []
+
+    def fetch_many(names):
+        asked.append(len(names))
+        return [records[n] for n in names]
+
+    names = [n for n in records if n.startswith("nts.")]
+    assert provenance.generated_events_bulk(names, fetch_many) == {n: 50000000 for n in names}
+    assert asked == [2, 2]          # a bulk request per generation
+    assert provenance.root_ancestor(names[0], records.__getitem__) == "sim.s1"
+    records["mcs.mu2e.CosmicSignalMix1BB.v1.001430_00000000.art"].pop("dh.gencount")
+    try:
+        provenance.generated_events_bulk(names, fetch_many)
+    except provenance.ProvenanceError as exc:
+        assert "no dh.gencount" in str(exc)
+    else:
+        raise AssertionError("no error without a gencount")
+
+
+def test_fullsim_cosmic_spectrum_is_flat_at_the_measured_count():
+    from tools.analyses.fullsim import cosmics
+    from tools.spectrum import Spectrum
+    like = Spectrum.from_values(np.zeros(0), *fs_sens.SIGNAL_BINNING).rebin(2)
+    p = np.array([95.0, 101.0, 104.0, 109.9, 112.0])   # 3 in 100-110
+    flat = cosmics.cosmic_spectrum(p, 0.5, like, "flat")
+    assert flat["n_flat_range"] == 3 and not flat["upper_limit"]
+    assert np.allclose(flat["values"], 3 * 0.5 / 10 * like.width)
+    measured = cosmics.cosmic_spectrum(p, 0.5, like, "measured")
+    assert np.isclose(measured["values"].sum(), 5 * 0.5)
+    none = cosmics.cosmic_spectrum(np.array([95.0]), 0.5, like, "flat")
+    assert none["upper_limit"] and np.isclose(
+        none["values"].sum(), cosmics.ZERO_COUNT_UPPER_LIMIT * 0.5 / 10 * like.width * like.nbins)
+    try:
+        cosmics.cosmic_spectrum(p, 0.5, like, "smooth")
+    except cosmics.CosmicError as exc:
+        assert "cosmic_shape" in str(exc)
+    else:
+        raise AssertionError("no error for an unknown shape")
+
+
+def test_fullsim_only_cosmic_tracks_in_time_count_as_cosmic_background():
+    from tools.analyses.fullsim.eventntuple import ORIGIN_COSMIC
+    from tools.analyses.fullsim import cosmics
+    ev = {"origin": np.array([ORIGIN_COSMIC, ORIGIN_COSMIC, 166, ORIGIN_COSMIC]),
+          "t": np.array([900.0, 500.0, 900.0, 900.0]),
+          "p": np.array([104.0, 104.0, 104.0, np.nan])}
+    assert list(cosmics.cosmic_counts(ev, (640.0, 1650.0))) == [True, False, False, False]
+
+
+def test_fullsim_measured_cosmics_replace_the_flat_rate():
+    from tools.analyses import approx_ce_sensitivity as fast
+    if not fast.DIO_TABLE.exists():
+        print("     (skipped: DIO table not on disk)")
+        return
+    p = np.full(100, 104.5)
+    base = dict(n_generated=1000, upstream_eff=1.0, npot=1e18, mean_pot_per_event=1.6e7,
+                cosmic_rate_per_s_per_mev=1e-5, stopped_muons_per_pot=1e-3)
+    flat = fs_sens.build_spectra(p, p, **base)
+    values = np.arange(flat["cosmic"].nbins, dtype=float)
+    given = fs_sens.build_spectra(p, p, **base, cosmic_values=values)
+    assert np.array_equal(given["cosmic"].values, values)
+    assert np.array_equal(given["signal"].values, flat["signal"].values)
+
+
+def test_fullsim_measures_cosmics_on_the_cosmic_mix(tmp_dir):
+    """Three files of the official cosmic mix next to the CE mix file: 50M
+    S2 events each at the MDC2025ab S1 tau (needs SAM for the livetime)."""
+    if not CE_MIX_FILE.exists():
+        print("     (skipped: CE mix file not on disk)")
+        return
+    from tools.analyses.fullsim import cosmics, normalization as norm
+    params = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT,
+              "cosmic_max_files": 3}
+    try:
+        result = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                              output_dir=tmp_dir, parameters=params)
+    except Exception as exc:
+        print(f"     (skipped: {exc})")
+        return
+    if result.status != "success" and ("SAM" in result.message or "staged" in result.message):
+        print(f"     (skipped: {result.message[:100]})")
+        return
+    assert result.status == "success", result.message
+    md = result.metadata
+    tau = cosmics.S1_LIVETIME_PER_EVENT["sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab.art"]
+    assert md["n_cosmic_files"] == 3
+    assert np.isclose(md["cosmic_livetime_s"], 3 * 50000000 * tau)
+    onspill = 1e18 / 1.6e7 * 1.695e-6
+    assert np.isclose(md["cosmic_weight"], onspill / md["cosmic_livetime_s"])
+    n = md["n_cosmic_flat_range"]
+    assert np.isclose(md["cosmic_rate_per_s_per_mev"],
+                      (n or cosmics.ZERO_COUNT_UPPER_LIMIT) / md["cosmic_livetime_s"] / 10)
+    assert md["cosmic_upper_limit"] == float(n == 0)
+
+
+def test_fullsim_a_bad_cosmic_shape_is_refused_before_any_cosmic_is_read():
+    from tools.analyses.fullsim import cosmics
+    params = {"cosmic_source": "auto", "cosmic_shape": "smooth"}
+    try:
+        fs_sens.measure_cosmics(params, [CE_MIX_NAME], [], (), (640.0, 1650.0), 1.0,
+                                0.0, 0.0, fs_cuts.CUT_SET)
+    except cosmics.CosmicError as exc:
+        assert "cosmic_shape" in str(exc)
+    else:
+        raise AssertionError("no error for an unknown shape")
 
 
 # --- occupancy (OccupancyAna: digi and reco from a job, ntuple from a file) ---------
@@ -6500,6 +6687,44 @@ def test_fullsim_cosmic_reference_normalizes_to_the_loose_rate(tmp_dir):
         raise AssertionError("a missing reference was accepted")
 
 
+def test_fullsim_cosmic_reference_with_a_livetime_weighs_each_track_by_it(tmp_dir):
+    n = 40
+    rows = {name: np.full(n, 0.5) for name in fs_tune.VARIABLE_NAMES}
+    rows.update({"t0": np.full(n, 900.0), "p": np.linspace(96, 114, n),
+                 "event": np.arange(n), "mc_pdg": np.where(np.arange(n) % 4 == 0, 13, 11),
+                 "has_calo": np.ones(n, bool), "no_opa": np.ones(n, bool),
+                 "no_tsda": np.ones(n, bool), "no_crv_veto": np.ones(n, bool)})
+    # the jobs' inputs: two dts files each, 5M S2 events per file
+    log = ('Opened input file "xroot://x//pnfs/a/dts.mu2e.CosmicSignal.MDC2025ap.001430_00000001.art"\n'
+           'Opened input file "/pnfs/b/dts.mu2e.CosmicSignal.MDC2025ap.001430_00000002.art"\n'
+           + fs_ref.ART_COMPLETED + ".\n")
+    inputs = fs_ref.inputs_from_log(log)
+    assert inputs == ["dts.mu2e.CosmicSignal.MDC2025ap.001430_00000001.art",
+                      "dts.mu2e.CosmicSignal.MDC2025ap.001430_00000002.art"]
+    gencounts = {name: 5_000_000 for name in inputs}
+    meta = fs_ref.add_livetime({"dataset": "test"}, inputs, gencounts, "s1.art", 2.0e-4)
+    assert meta["s2_events"] == 10_000_000 and np.isclose(meta["livetime_s"], 2000.0)
+    path = Path(tmp_dir) / "ref.npz"
+    fs_ref.save(path, rows, meta)
+    loaded, loaded_meta = fs_ref.load(path)
+    assert np.isclose(loaded_meta["livetime_s"], 2000.0)
+    kept, per_mev = fs_ref.rows_for(loaded, (), 99.0, 300.0, loaded_meta["livetime_s"])
+    # on-spill time over livetime, spread flat over 100-110 MeV/c; the loose
+    # rate (99) and the electron count play no part
+    assert np.isclose(per_mev, 300.0 / 2000.0 / 10.0)
+    assert set(np.abs(kept["mc_pdg"])) == {11, 13}
+    # an unfinished job, an input read twice, an input SAM has no count for
+    for bad in (lambda: fs_ref.inputs_from_log(log.replace(fs_ref.ART_COMPLETED, "")),
+                lambda: fs_ref.add_livetime({}, inputs + inputs[:1], gencounts, "s1", 1.0),
+                lambda: fs_ref.add_livetime({}, inputs + ["other.art"], gencounts, "s1", 1.0)):
+        try:
+            bad()
+        except fs_ref.ReferenceError:
+            pass
+        else:
+            raise AssertionError("a bad livetime input was accepted")
+
+
 def test_fullsim_seed_is_the_cut_set_without_the_target_cuts():
     seed = fs_tune.seed_cuts("run1a_tsda", (540.0, 1650.0))
     assert seed["d0"] == (-60.0, 94.0) and seed["trkqual"] == (0.145, np.inf)
@@ -6515,7 +6740,8 @@ def test_fullsim_optimize_mode_runs_and_fixed_mode_reports_minus_one(tmp_dir):
         print("     (skipped: CE mix file not on disk)")
         return
     from tools.analyses.fullsim import normalization as norm
-    base = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT}
+    base = {"n_generated": 20000, "stopped_muons_per_pot": norm.STOPPED_MUONS_PER_POT,
+            "cosmic_source": "rate"}
     fixed = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                          output_dir=tmp_dir, parameters=base)
     assert fixed.status == "success" and fixed.metadata["opt_punzi_test"] == -1.0
@@ -6544,6 +6770,18 @@ def test_fullsim_optimize_mode_runs_and_fixed_mode_reports_minus_one(tmp_dir):
     # never a range end that could read as NOT_OPTIMIZED)
     assert m["opt_n_cosmic_rows"] > 0 and np.isnan(m["opt_cut_trkqual_high"])
     assert 100.0 <= m["opt_window_low_mevc"] < m["opt_window_high_mevc"] <= 106.0
+    # a reference without a livetime normalizes to the loose rate, and says so
+    assert m["opt_cosmic_livetime_s"] == -1.0
+    assert fixed.metadata["opt_cosmic_livetime_s"] == -1.0
+    # with one, every cosmic weight scales as 1 / livetime
+    timed = Path(tmp_dir) / "timed.npz"
+    fs_ref.save(timed, rows, {"dataset": "toy", "reco": "toy", "livetime_s": 1.0e5})
+    lt = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
+                      output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
+                                                      "cosmic_reference": str(timed)})
+    assert lt.status == "success", lt.message
+    assert lt.metadata["opt_cosmic_livetime_s"] == 1.0e5
+    assert lt.metadata["opt_seed_background_test"] != m["opt_seed_background_test"]
     bad = run_analysis(analysis="fullsim_sensitivity", data_file=str(CE_MIX_FILE),
                        output_dir=tmp_dir, parameters={**base, "cut_mode": "optimize",
                                                        "cosmic_reference": str(Path(tmp_dir) / "none.npz")})
@@ -6580,11 +6818,10 @@ def test_fullsim_optimize_preselection_follows_the_active_cuts():
             raise AssertionError(f"{word} was accepted in optimize mode")
 
 
-def test_fullsim_80_1d_seed_has_no_d0_cut():
-    # 80_1d applies no within_d0, so neither does its seed
-    assert "within_d0" not in fs_cuts.default_cuts("80_1d")
-    assert fs_tune.seed_cuts("80_1d", (640.0, 1650.0))["d0"] == (-np.inf, np.inf)
+def test_fullsim_seed_has_run1a_d0_cut():
+    # the seed is run1a_tsda, signed-d0 window included
     assert "within_d0" in fs_cuts.default_cuts("run1a_tsda")
+    assert fs_tune.seed_cuts("run1a_tsda", (540.0, 1650.0))["d0"] == (-60.0, 94.0)
 
 
 def test_fullsim_tuned_trkpid_stays_closed_against_cosmic_muons():

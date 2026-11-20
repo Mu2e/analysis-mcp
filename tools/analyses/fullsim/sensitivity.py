@@ -5,8 +5,8 @@ but with the signal efficiency, shape and detector response measured from
 reconstructed CE events mixed with pileup (CeMLeadingLogMix1BB EventNtuple
 files) instead of from EdepAna's truth-level tree:
 
-1. Select CE-like tracks with a pyfitter cut set (cuts.py: run1a_tsda,
-   with a 540-1650 ns time window, by default, or 80_1d), file by file.
+1. Select CE-like tracks with pyfitter's run1a_tsda cut set (cuts.py),
+   with a 540-1650 ns time window, file by file.
    Each surviving event is represented by its first selected track: its
    momentum and time at the tracker front, its MC origin
    (eventntuple.origin_codes) and its true momentum at birth. Events whose
@@ -30,9 +30,17 @@ files) instead of from EdepAna's truth-level tree:
    (reconstructed momentum at the tracker front minus true momentum at
    birth: energy loss and resolution together), normalized to the measured
    efficiency so DIO electrons pass the selection as CE ones do.
-4. Cosmic background: flat in momentum at `cosmic_rate_per_s_per_mev`,
-   scaled by the on-spill live time NPOT implies, as approx_ce_sensitivity
-   has it.
+4. Cosmic background: measured from the official cosmic mix that matches
+   the inputs (cosmics.py; CosmicSignalMix1BB for CeMLeadingLogMix1BB, same
+   configuration). Its files go through the same cuts and time window; the
+   selected events whose first track a cosmic made each stand for the
+   on-spill time NPOT implies over the sample's cosmic livetime (S2 events
+   resampled, from SAM, times the S1 livetime per event), spread flat over
+   the momentum axis at the count in 100-110 MeV/c by default. With
+   cosmic_source 'rate', flat at `cosmic_rate_per_s_per_mev` instead, as
+   approx_ce_sensitivity has it. (cut_mode="optimize" tunes against its
+   own cosmic reference, normalized by that reference's CRY livetime the
+   same way; the loose fast-sim rate only for a sidecar without one.)
 5. Scan every momentum window with approx_ce_sensitivity's scan_signal_box
    and keep the one maximizing S/sqrt(B).
 """
@@ -42,6 +50,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ... import catalog
+from ...catalog import CatalogError, dataset_file_names, resolve_inputs
 from ...spec import AnalysisSpec, ParamSpec, RunContext, RunOutcome
 from ...spectrum import Kernel, Spectrum
 from ..approx_ce_sensitivity import (COSMIC_RATE_PER_SECOND_PER_MEV,
@@ -60,8 +70,10 @@ from .normalization import (CAPTURES_PER_STOPPED_MUON, DIO_PER_STOPPED_MUON,
                             STOPPED_MUONS_PER_POT, NormalizationError,
                             sim_efficiencies, stop_chain_of_inputs,
                             stopped_muons_per_pot)
-from .provenance import ProvenanceError, generated_events
+from .provenance import (ProvenanceError, generated_events,
+                         generated_events_bulk, root_ancestor)
 from . import cosmic_reference
+from . import cosmics
 from . import tune
 
 # cut_mode values: the cut set as it stands, or tuned per input (tune.py).
@@ -78,6 +90,9 @@ OPT_METRICS = (
     "opt_window_low_mevc", "opt_window_high_mevc",
     "opt_seed_window_low_mevc", "opt_seed_window_high_mevc",
     "opt_n_ce_rows", "opt_n_cosmic_rows",
+    # the cosmic reference's CRY livetime; -1 for a reference normalized
+    # to the loose rate (a sidecar without livetime_s)
+    "opt_cosmic_livetime_s",
     *(f"opt_cut_{v}_{edge}" for v in tune.VARIABLE_NAMES for edge in ("low", "high")),
 )
 
@@ -202,13 +217,15 @@ def build_spectra(p_reco: np.ndarray, p_true: np.ndarray, n_generated: int,
                   upstream_eff: float, npot: float, mean_pot_per_event: float,
                   cosmic_rate_per_s_per_mev: float,
                   stopped_muons_per_pot: float = STOPPED_MUONS_PER_POT,
-                  rmue: float = RMUE) -> dict:
+                  rmue: float = RMUE, cosmic_values=None) -> dict:
     """Signal, DIO and cosmic rates on one momentum binning, from the
     signal events' reconstructed and true momenta.
 
     Every count is per event generated, times upstream_eff, so the signal
     and the response carry the measured efficiency. Signal and DIO scale
-    with the stopped mu- NPOT gives; cosmics with the on-spill time.
+    with the stopped mu- NPOT gives; cosmics with the on-spill time, flat
+    at cosmic_rate_per_s_per_mev unless `cosmic_values` (a count per bin of
+    the signal's binning, measured) is given.
     """
     per_event = upstream_eff / n_generated
     stopped_muons = npot * stopped_muons_per_pot
@@ -233,8 +250,10 @@ def build_spectra(p_reco: np.ndarray, p_true: np.ndarray, n_generated: int,
 
     onspill_seconds = npot / mean_pot_per_event * ONSPILL_SECONDS_PER_EVENT
     cosmic_rate = cosmic_rate_per_s_per_mev * onspill_seconds
+    if cosmic_values is None:
+        cosmic_values = np.full(signal.nbins, cosmic_rate * signal.width)
     cosmic = replace(signal, name="cosmic", title="Cosmics",
-                     values=np.full(signal.nbins, cosmic_rate * signal.width))
+                     values=np.asarray(cosmic_values, dtype=np.float64))
     return {"signal": signal, "dio": dio, "cosmic": cosmic,
             "response": response, "dio_true": dio_true,
             "efficiency": float(p_reco.size * per_event),
@@ -260,8 +279,9 @@ def _optimize_selection(candidates, cut_set, presel, time_window, n_generated,
     rows, meta = cosmic_reference.load(reference_path)
     flags = tuple(f for f in tune.EXTRA_PRESELECTION if f in presel)
     rate = recommended_cosmic_rate("box")
+    livetime = float(meta.get("livetime_s") or 0.0)
     cosmic, per_mev = cosmic_reference.rows_for(rows, flags, rate,
-                                                spectra["onspill_seconds"])
+                                                spectra["onspill_seconds"], livetime)
     # the time window cuts the cosmics too; their weight is per track of the
     # loose (untimed) selection, so dropping rows is the whole effect
     cosmic = tune.in_time(cosmic, time_window)
@@ -286,6 +306,7 @@ def _optimize_selection(candidates, cut_set, presel, time_window, n_generated,
         "opt_seed_background_test": result.seed_test.background,
         "opt_n_ce_rows": float(ce["p"].size),
         "opt_n_cosmic_rows": float(cosmic["p"].size),
+        "opt_cosmic_livetime_s": livetime if livetime > 0 else NOT_OPTIMIZED,
     }
     for key, window in (("opt_window", result.window), ("opt_seed_window", result.seed_window)):
         lo, hi = result.window_mev(window)
@@ -299,7 +320,9 @@ def _optimize_selection(candidates, cut_set, presel, time_window, n_generated,
              "seed_cuts": {k: [float(a), float(b)] for k, (a, b) in seed.items()},
              "preselection": list(presel),
              "time_window": [float(t) for t in time_window],
-             "cosmic_reference": meta, "cosmic_rate_per_s_per_mev": rate,
+             "cosmic_reference": meta,
+             # the loose rate only normalizes a reference without a livetime
+             "cosmic_rate_per_s_per_mev": None if livetime > 0 else rate,
              "rounds": [{"window": list(result.window_mev(r["window"])),
                          "fom_train": r["fom_train"]} for r in result.rounds]}
     return result, metrics, extra
@@ -317,7 +340,10 @@ def _optimize_lines(result, extra) -> list[str]:
         + "), the time window {:g}-{:g} ns (fixed)".format(*extra["time_window"])
         + " and cuts tuned on the Punzi FoM, chosen on even events, reported on odd",
         f"  cosmic reference {ref.get('path')} ({ref.get('dataset', '?')}; "
-        f"reco {ref.get('reco', '?')}; {ref.get('n_normalizing', '?')} normalizing tracks)",
+        f"reco {ref.get('reco', '?')}; "
+        + (f"CRY livetime {ref['livetime_s']:.4g} s from {ref.get('s2_events', 0):.4g} S2 events)"
+           if ref.get("livetime_s") else
+           f"{ref.get('n_normalizing', '?')} tracks normalizing to the loose rate)"),
         "  seed:  [{:.1f}, {:.1f}] MeV/c, ".format(*result.window_mev(result.seed_window))
         + cut_text(result.seed_cuts),
         f"         Punzi train {result.seed_train.fom:.4g}, test {result.seed_test.fom:.4g} "
@@ -330,10 +356,115 @@ def _optimize_lines(result, extra) -> list[str]:
     ]
 
 
+# --- the measured cosmics ----------------------------------------------------
+
+def find_cosmic_dataset(source: str, input_names: list[str]) -> str:
+    """The cosmic mix dataset cosmic_source names, or for 'auto' the first
+    of the ones matching the inputs that the catalogs know."""
+    if source.lower() != cosmics.COSMIC_AUTO:
+        return source
+    candidates = cosmics.cosmic_datasets_for(input_names)
+    for candidate in candidates:
+        try:
+            if dataset_file_names(candidate, catalog.CLIENT)[0]:
+                return candidate
+        except CatalogError:
+            continue
+    raise cosmics.CosmicError(
+        f"no cosmic mix matching the inputs in SAM or metacat (tried "
+        f"{', '.join(candidates)}); name one in cosmic_source, or 'rate' "
+        "for the flat rate")
+
+
+def measure_cosmics(params: dict, input_names: list[str], active: list[str],
+                    triggers, time_window, onspill_seconds: float,
+                    trkqual_min: float, trkpid_min: float,
+                    cut_set: str) -> dict | None:
+    """The cosmic background from the cosmic mix: its files reduced with the
+    same cuts and thresholds as the inputs (trkqual_min/trkpid_min as
+    resolved from the cut set), the cosmic tracks in the time window, and
+    the weight each carries (on-spill time over the sample's livetime).
+    None for 'rate'."""
+    source = params["cosmic_source"].strip()
+    if source.lower() == cosmics.COSMIC_RATE:
+        return None
+    shape = params["cosmic_shape"].strip().lower()
+    if shape not in (cosmics.SHAPE_FLAT, cosmics.SHAPE_MEASURED):
+        # Before reading the sample, which can take most of an hour.
+        raise cosmics.CosmicError(
+            f"cosmic_shape {shape!r} must be '{cosmics.SHAPE_FLAT}' or "
+            f"'{cosmics.SHAPE_MEASURED}'")
+    dataset = find_cosmic_dataset(source, input_names)
+    max_files = int(params["cosmic_max_files"]) or None
+    paths = resolve_inputs(dataset=dataset, max_files=max_files).paths
+    names = [path.name for path in paths]
+    if set(names) & set(input_names):
+        raise cosmics.CosmicError(
+            f"the cosmic sample {dataset} shares files with the inputs; the "
+            "inputs must be the CE mix")
+    s1_file = root_ancestor(names[0])
+    tau = params["cosmic_livetime_per_event"] or cosmics.livetime_per_event(s1_file)
+    s2_events = sum(generated_events_bulk(names).values())
+    livetime = s2_events * tau
+    ev = combine([reduce_file(path, active, trkqual_min, trkpid_min, triggers,
+                              cut_set) for path in paths])
+    counted = cosmics.cosmic_counts(ev, time_window)
+    like = Spectrum.from_values(np.zeros(0), *SIGNAL_BINNING).rebin(SIGNAL_REBIN)
+    weight = onspill_seconds / livetime
+    spectrum = cosmics.cosmic_spectrum(ev["p"][counted], weight, like, shape)
+    return {"dataset": dataset, "n_files": len(paths), "s1_file": s1_file,
+            "livetime_per_event": tau, "s2_events": s2_events,
+            "livetime": livetime, "weight": weight, "ev": ev,
+            "counted": counted, "n_counted": int(counted.sum()),
+            "shape": shape, **spectrum}
+
+
+COSMIC_METRICS = ("cosmic_livetime_s", "cosmic_weight", "n_cosmic_files",
+                  "n_cosmic_events", "n_cosmic_counted",
+                  "n_cosmic_flat_range", "cosmic_upper_limit")
+
+
+def cosmic_metrics(cosmic: dict | None) -> dict[str, float]:
+    if cosmic is None:
+        return {name: -1.0 for name in COSMIC_METRICS}
+    return {
+        "cosmic_livetime_s": float(cosmic["livetime"]),
+        "cosmic_weight": float(cosmic["weight"]),
+        "n_cosmic_files": float(cosmic["n_files"]),
+        "n_cosmic_events": float(cosmic["ev"]["n_events"]),
+        "n_cosmic_counted": float(cosmic["n_counted"]),
+        "n_cosmic_flat_range": float(cosmic["n_flat_range"]),
+        "cosmic_upper_limit": float(cosmic["upper_limit"]),
+    }
+
+
+def cosmic_log_lines(cosmic: dict | None, rate: float, spectra: dict) -> list[str]:
+    onspill = f"({spectra['onspill_seconds']:.4g} s on-spill)"
+    if cosmic is None:
+        return [f"  cosmic rate      {rate:.4g} per s per MeV/c (cosmic_source "
+                f"'rate') -> {spectra['cosmic_rate_per_mev']:.4g} per MeV/c {onspill}"]
+    lo, hi = cosmics.COSMIC_FLAT_RANGE
+    seen = (f"{cosmics.ZERO_COUNT_UPPER_LIMIT:g} (90% CL limit: none seen)"
+            if cosmic["upper_limit"] else str(cosmic["n_flat_range"]))
+    return [
+        f"  cosmic sample    {cosmic['dataset']}, {cosmic['n_files']} files, "
+        f"{cosmic['ev']['n_events']} events",
+        f"    livetime       {cosmic['s2_events']:.6g} S2 events resampled x "
+        f"{cosmic['livetime_per_event']:.5g} s per S1 event (S1 "
+        f"{cosmic['s1_file']}) = {cosmic['livetime']:.5g} s",
+        f"    weight         {cosmic['weight']:.4g} per cosmic {onspill}",
+        f"    counted        {cosmic['n_counted']} cosmic tracks pass the cuts "
+        f"in the time window, {cosmic['n_flat_range']} in {lo:g}-{hi:g} MeV/c",
+        f"    rate           {seen} x weight / {hi - lo:g} MeV/c = "
+        f"{cosmic['rate_per_mev']:.4g} per MeV/c ({rate:.4g} per s per MeV/c); "
+        f"shape {cosmic['shape']}",
+    ]
+
+
 # --- plots -------------------------------------------------------------------
 
 def _write_plots(outdir: Path, spectra: dict, best: dict, ev: dict,
-                 is_signal: np.ndarray, time_window) -> list[str]:
+                 is_signal: np.ndarray, time_window, cosmic_sample=None) -> list[str]:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -380,6 +511,12 @@ def _write_plots(outdir: Path, spectra: dict, best: dict, ev: dict,
                alpha=0.5, label="Not CE (pileup)")
     ax.scatter(ev["p"][is_signal], ev["t"][is_signal], s=6, color="tab:blue",
                alpha=0.5, label="True CE")
+    if cosmic_sample is not None:
+        from .eventntuple import ORIGIN_COSMIC
+        cev = cosmic_sample["ev"]
+        mine = cev["origin"] == ORIGIN_COSMIC
+        ax.scatter(cev["p"][mine], cev["t"][mine], s=14, marker="x",
+                   color="tab:green", label="Cosmic (cosmic mix)")
     t_lo, t_hi = time_window
     ax.add_patch(matplotlib.patches.Rectangle(
         (best["low_mev"], t_lo), best["high_mev"] - best["low_mev"], t_hi - t_lo,
@@ -484,15 +621,35 @@ def run(context: RunContext) -> RunOutcome:
                 "CeMLeadingLogMix1BB EventNtuple (nts.*.root) files; or loosen "
                 "the cuts with disable_cuts."
             )
+        onspill_seconds = (npot / params["mean_pot_per_event"]
+                           * ONSPILL_SECONDS_PER_EVENT)
+        cosmic = measure_cosmics(params, [path.name for path in context.input_paths],
+                                 active, triggers, (t_lo, t_hi), onspill_seconds,
+                                 trkqual_min, trkpid_min, cut_set)
+        if cosmic is not None:
+            # The rate the measurement amounts to, per second per MeV/c of
+            # on-spill time, so the metric means what it did with 'rate'.
+            cosmic_rate_per_s_per_mev = cosmic["rate_per_mev"] / onspill_seconds
+            extra["cosmic_sample"] = {
+                key: cosmic[key] for key in
+                ("dataset", "n_files", "s1_file", "livetime_per_event",
+                 "s2_events", "livetime", "weight", "n_counted",
+                 "n_flat_range", "upper_limit")}
         spectra = build_spectra(ev["p"][counted], ev["p_true"][counted],
                                 n_generated, upstream_eff, npot,
                                 params["mean_pot_per_event"],
                                 cosmic_rate_per_s_per_mev,
-                                stops_per_pot, rmue)
+                                stops_per_pot, rmue,
+                                None if cosmic is None else cosmic["values"])
         best, top = scan_signal_box(spectra["signal"], spectra["dio"],
                                     spectra["cosmic"])
-    except (FullsimError, EventNtupleError, CutError, SensitivityError) as exc:
+    except (FullsimError, EventNtupleError, CutError, SensitivityError,
+            cosmics.CosmicError) as exc:
         return RunOutcome(error=str(exc), extra=extra)
+    except CatalogError as exc:
+        return RunOutcome(error=(
+            f"cosmic sample: {exc}. Or set cosmic_source to 'rate' for the "
+            "flat cosmic rate"), extra=extra)
     except tune.TuneError as exc:
         return RunOutcome(error=f"cut_mode='optimize': {exc}", extra=extra)
     except NormalizationError as exc:
@@ -506,9 +663,10 @@ def run(context: RunContext) -> RunOutcome:
         ), extra=extra)
     except ProvenanceError as exc:
         return RunOutcome(error=(
-            f"{exc}. The efficiency counts against the events generated, which "
-            "come from SAM; without SAM, pass n_generated: the sum of dh.gencount "
-            "over the input files' parent mcs files (samweb get-metadata)"
+            f"{exc}. The efficiency counts against the events generated, and "
+            "the cosmic livetime against the cosmic sample's, both from SAM; "
+            "without SAM, pass n_generated (the sum of dh.gencount over the "
+            "input files' parent mcs files) and cosmic_source 'rate'"
         ), extra=extra)
 
     in_window = counted & (ev["p"] >= best["low_mev"]) & (ev["p"] <= best["high_mev"])
@@ -543,6 +701,9 @@ def run(context: RunContext) -> RunOutcome:
         "n_stopped_muons": float(spectra["stopped_muons"]),
         "rmue": float(rmue),
         "n_conversions": float(spectra["conversions"]),
+        # The cosmic sample behind cosmic_background; -1 with cosmic_source
+        # 'rate', which measures none.
+        **cosmic_metrics(cosmic),
     }
 
     metrics.update({name: NOT_OPTIMIZED for name in OPT_METRICS})
@@ -590,9 +751,7 @@ def run(context: RunContext) -> RunOutcome:
         f"({CAPTURES_PER_STOPPED_MUON:g} captures, {DIO_PER_STOPPED_MUON:g} "
         "DIO per stopped mu-)",
         f"  upstream_eff     {upstream_eff:g}",
-        f"  cosmic rate      {cosmic_rate_per_s_per_mev:.4g} per s per MeV/c "
-        f"-> {spectra['cosmic_rate_per_mev']:.4g} per MeV/c "
-        f"({spectra['onspill_seconds']:.4g} s on-spill)",
+        *cosmic_log_lines(cosmic, cosmic_rate_per_s_per_mev, spectra),
         "",
         "Cut flow (events with a track passing every cut so far):",
         *(f"  {name:<28s} {n:>9d}   {desc}" for name, n, desc in flow_rows),
@@ -619,7 +778,8 @@ def run(context: RunContext) -> RunOutcome:
     log_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     files = [str(flow_path)]
-    files += _write_plots(outdir, spectra, best, ev, is_signal, (t_lo, t_hi))
+    files += _write_plots(outdir, spectra, best, ev, is_signal, (t_lo, t_hi),
+                          cosmic)
 
     extra.update({
         "cut_flow": {name: int(n) for name, n, _ in flow_rows},
@@ -643,7 +803,14 @@ def summarize(metrics: dict[str, float]) -> str:
         f"for {metrics['npot']:.3g} POT ({metrics['n_stopped_muons']:.3g} stopped "
         f"mu-, R_mue = {metrics['rmue']:.3g}); signal efficiency "
         f"{metrics['signal_efficiency']:.3g} from "
-        f"{metrics['n_events_counted']:.0f} reconstructed CE."
+        f"{metrics['n_events_counted']:.0f} reconstructed CE; "
+        + (f"cosmics measured: {metrics['n_cosmic_flat_range']:.0f} cosmic "
+           f"tracks in {cosmics.COSMIC_FLAT_RANGE[0]:g}-"
+           f"{cosmics.COSMIC_FLAT_RANGE[1]:g} MeV/c in "
+           f"{metrics['cosmic_livetime_s']:.3g} s of cosmics"
+           + (" (none: 90% CL upper limit used)." if metrics["cosmic_upper_limit"] > 0
+              else ".")
+           if metrics["n_cosmic_files"] > 0 else "cosmics from the flat rate.")
     )
 
 
@@ -654,11 +821,12 @@ SPEC = AnalysisSpec(
         "approx_ce_sensitivity: the signal efficiency, momentum shape and "
         "detector response are measured from reconstructed CE mixed with "
         "pileup (CeMLeadingLogMix1BB EventNtuple files) after pyfitter's "
-        "CE-like cuts (cut_set: 80_1d or run1a_tsda). Signal and DIO (theory spectrum "
+        "CE-like cuts (run1a_tsda). Signal and DIO (theory spectrum "
         "folded with that response) are normalized to the stopped mu- NPOT "
-        "gives, as Production's normalizations.py; cosmics are flat per "
-        "MeV/c over the on-spill time; the best-window scan is "
-        "approx_ce_sensitivity's."
+        "gives, as Production's normalizations.py; cosmics are measured on "
+        "the matching official cosmic mix (same cuts, livetime from SAM and "
+        "the S1 sample) unless cosmic_source is 'rate'; the best-window "
+        "scan is approx_ce_sensitivity's."
     ),
     input_kind="root_file",
     combines_files=True,
@@ -672,7 +840,7 @@ SPEC = AnalysisSpec(
         "n_events_generated", "acceptance",
         "n_files", "npot", "upstream_eff", "cosmic_rate_per_s_per_mev",
         "stopped_muons_per_pot", "n_stopped_muons", "rmue", "n_conversions",
-        *OPT_METRICS,
+        *OPT_METRICS, *COSMIC_METRICS,
     ),
     units={
         "signal_mom_low_mevc": "MeV/c", "signal_mom_high_mevc": "MeV/c",
@@ -684,11 +852,15 @@ SPEC = AnalysisSpec(
         "cosmic_rate_per_s_per_mev": "per second per MeV/c",
         "stopped_muons_per_pot": "per POT", "n_stopped_muons": "muons",
         "n_conversions": "events",
+        "cosmic_livetime_s": "s", "cosmic_weight": "run events per cosmic event",
+        "n_cosmic_files": "files", "n_cosmic_events": "events",
+        "n_cosmic_counted": "events", "n_cosmic_flat_range": "events",
         "opt_signal_test": "events", "opt_background_test": "events",
         "opt_seed_signal_test": "events", "opt_seed_background_test": "events",
         "opt_window_low_mevc": "MeV/c", "opt_window_high_mevc": "MeV/c",
         "opt_seed_window_low_mevc": "MeV/c", "opt_seed_window_high_mevc": "MeV/c",
         "opt_n_ce_rows": "events", "opt_n_cosmic_rows": "tracks",
+        "opt_cosmic_livetime_s": "s",
         "opt_cut_rmax_low": "mm", "opt_cut_rmax_high": "mm",
         "opt_cut_d0_low": "mm", "opt_cut_d0_high": "mm",
         "opt_cut_t0err_low": "ns", "opt_cut_t0err_high": "ns",
@@ -740,16 +912,72 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="mean_pot_per_event",
             description="Mean number of protons on target per event; sets the "
-                        "on-spill live time the cosmic rate is scaled by.",
+                        "on-spill live time the cosmic background is scaled to.",
             default=MEAN_POT_PER_EVENT, minimum=1.0,
         ),
         ParamSpec(
+            name="cosmic_source",
+            description="Where the cosmic background comes from. 'auto' (the "
+                        "default) measures it on the official cosmic mix that "
+                        "matches the inputs (same configuration and mix, "
+                        "description CosmicSignal or CosmicCRYAll + the mix, "
+                        "e.g. nts.mu2e.CosmicSignalMix1BB.MDC2025au_best_v1_1-001"
+                        ".root for the CeMLeadingLogMix1BB one): its files "
+                        "pass the same cuts, trigger and time window, the "
+                        "events whose first track a cosmic made are counted, "
+                        "and each stands for the on-spill time over the "
+                        "sample's cosmic livetime. A SAM dataset name measures "
+                        "on that sample instead. 'rate' uses the flat "
+                        "cosmic_rate_per_s_per_mev and reads no cosmic files. "
+                        "Measuring reads every file of the sample (500 for "
+                        "MDC2025au, ~6 s each) unless cosmic_max_files caps it.",
+            default=cosmics.COSMIC_AUTO, kind="text",
+        ),
+        ParamSpec(
+            name="cosmic_max_files",
+            description="Read only the first this-many files (by name) of the "
+                        "cosmic sample; the livetime counts only those. 0 (the "
+                        "default) reads them all. Each MDC2025au "
+                        "CosmicSignalMix1BB file is ~11,400 s of cosmics, about "
+                        "a tenth of the on-spill time of 1e18 POT.",
+            default=0, minimum=0.0,
+        ),
+        ParamSpec(
+            name="cosmic_shape",
+            description="The cosmic momentum spectrum the window scan sees. "
+                        "'flat' (the default): the cosmic tracks counted in "
+                        f"{cosmics.COSMIC_FLAT_RANGE[0]:g}-"
+                        f"{cosmics.COSMIC_FLAT_RANGE[1]:g} MeV/c spread evenly "
+                        "per MeV/c, or the 90% CL upper limit "
+                        f"({cosmics.ZERO_COUNT_UPPER_LIMIT:g} events) when "
+                        "none is, so the scan cannot chase gaps between single "
+                        "events. 'measured': the counted tracks binned as they "
+                        "are.",
+            default=cosmics.SHAPE_FLAT, kind="text",
+        ),
+        ParamSpec(
+            name="cosmic_livetime_per_event",
+            description="Seconds of cosmic exposure per event of the S1 CRY "
+                        "sample the cosmic mix was resampled from (its summed "
+                        "CosmicLivetime over its GenEventCount). 0 (the "
+                        "default) takes it from the measured table by the S1 "
+                        "dataset the cosmic files trace to in SAM ("
+                        + ", ".join(f"{d}: {t:.5g}" for d, t in
+                                    cosmics.S1_LIVETIME_PER_EVENT.items())
+                        + "). The livetime stored in resampled cosmic files "
+                        "is truncated by a Mu2eProductMixer bug and is not "
+                        "used.",
+            default=0.0, minimum=0.0,
+        ),
+        ParamSpec(
             name="cosmic_rate_per_s_per_mev",
-            description="Cosmic-ray background rate, flat in momentum, per "
-                        "second per MeV/c, as in approx_ce_sensitivity (whose "
-                        "default this is: the rough Run-1A mu- -> e- number). "
-                        "Scaled by the on-spill live time npot and "
-                        "mean_pot_per_event imply.",
+            description="With cosmic_source 'rate': the cosmic-ray background "
+                        "rate, flat in momentum, per second per MeV/c, as in "
+                        "approx_ce_sensitivity (whose default this is: the "
+                        "rough Run-1A mu- -> e- number), scaled by the "
+                        "on-spill live time npot and mean_pot_per_event imply. "
+                        "Ignored otherwise; the metric of the same name then "
+                        "reports the measured rate.",
             default=COSMIC_RATE_PER_SECOND_PER_MEV, minimum=0.0,
         ),
         ParamSpec(
@@ -824,11 +1052,11 @@ SPEC = AnalysisSpec(
         ParamSpec(
             name="cut_set",
             description="The pyfitter cut set (config.py VERSION_CUTS) the "
-                        "thresholds and default cuts come from: "
-                        + "; ".join(f"{name}: {', '.join(default_cuts(name))}"
-                                    for name in CUT_SETS)
-                        + ". run1a_tsda adds the signed-d0 window and the TSDA "
-                        "veto (needs trk.tsdainter).",
+                        "thresholds and default cuts come from. Only "
+                        "run1a_tsda is supported (the Run 1A selection with "
+                        "the signed-d0 window and the TSDA veto, which needs "
+                        "trk.tsdainter): "
+                        + ", ".join(default_cuts(CUT_SET)) + ".",
             default=CUT_SET, kind="text",
         ),
         ParamSpec(

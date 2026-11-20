@@ -131,8 +131,7 @@ def seed_cuts(cut_set: str, time_window) -> dict:
         "cos": tuple(float(_tandip_to_cos(t)) for t in cs.tandip_window),
         # rmax is not in the cut sets: left open (no cut) for the search
         "rmax": (-np.inf, np.inf),
-        # open where the set has no d0 cut (80_1d), so the seed is the set
-        "d0": tuple(cs.d0_window_mm) if cs.d0_cut else (-np.inf, np.inf),
+        "d0": tuple(cs.d0_window_mm),
         "trkqual": (cs.trkqual_min, np.inf),
         "trkpid": (cs.trkpid_min, np.inf),
         "t0err": (-np.inf, cs.t0err_max_ns),

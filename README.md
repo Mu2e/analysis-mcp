@@ -83,7 +83,8 @@ tools/
     edep_occupancy_combine.py  adds those histograms over pileup components
     fullsim/                   full-simulation analyses of EventNtuple
       eventntuple.py           reading EventNtuple/ntuple; MC origin of a track
-      cuts.py                  the CE-like track cuts (pyfitter cut sets run1a_tsda, 80_1d)
+      cuts.py                  the CE-like track cuts (pyfitter cut set run1a_tsda)
+      cosmics.py               the cosmic background from the official cosmic mix
       sensitivity.py           fullsim_sensitivity: S/sqrt(B) in the best window
   analysis_tools.py   the MCP tools: list_analyses, run_analysis
   __init__.py         __all__ — ONLY these names become tools
@@ -1187,12 +1188,11 @@ mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
 `/pnfs/mu2e/tape/phy-nts/nts/mu2e/CeMLeadingLogMix1BB/MDC2025au_best_v1_1-001/`.
 `fullsim/README.md` says how to run it.
 
-1. **Cuts**: a pyfitter cut set (`cut_set`), track by track, as its
-   `Analyze.define_cuts` applies them and in its order (`fullsim/cuts.py`).
-   The default, `run1a_tsda`, is the Run 1A track selection with the
+1. **Cuts**: pyfitter's `run1a_tsda` cut set (`cut_set`, the only one
+   supported), track by track, as its `Analyze.define_cuts` applies them
+   and in its order (`fullsim/cuts.py`): the Run 1A track selection with the
    signed-d0 window and the TSDA veto (ConvAna set 79) and a 540-1650 ns
-   time window (pyfitter's `within_t0_540`); `80_1d` is cut-set 80 with
-   640-1650 ns. On by default: every cut pyfitter switches on for the set
+   time window (pyfitter's `within_t0_540`). On by default: every cut pyfitter switches on for the set
    except its fit ranges (`in_mom_range`, `within_t0`), which the momentum
    scan and `time_window` stand in for. Add or drop cuts by name with
    `enable_cuts` / `disable_cuts`, and move the `trkqual_min` / `trkpid_min`
@@ -1206,7 +1206,7 @@ mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
    and true momentum at birth. An event whose first track has more than one
    front segment is not counted, as in pyCount. The signal is the true CE
    among these with a time inside `time_window` (default the cut set's:
-   540-1650 ns for `run1a_tsda`, 640-1650 ns for `80_1d`; open),
+   540-1650 ns; open),
    so a pileup track passing the cuts is not signal. Their reconstructed
    momentum, binned as `approx_ce_sensitivity`'s signal (0.2 MeV/c), is
    scaled as Production's `normalizations.py` has it: NPOT x
@@ -1234,16 +1234,52 @@ mixed with pileup: CeMLeadingLogMix1BB EventNtuple files, e.g.
    events (reconstructed momentum at the tracker front minus true momentum
    at birth: energy loss and resolution together). The response integrates
    to the measured efficiency, so DIO electrons pass the selection as CE do.
-4. **Cosmics**: flat in momentum at `cosmic_rate_per_s_per_mev` over the
-   on-spill time NPOT implies, exactly as in `approx_ce_sensitivity`, whose
-   defaults (`npot`, `mean_pot_per_event`, the rate) it shares.
+4. **Cosmics**: measured on the official cosmic mix that matches the
+   inputs (`cosmic_source` `auto`; `fullsim/cosmics.py`): same tier, owner,
+   configuration and mix, description `CosmicSignal` (MDC2025) or
+   `CosmicCRYAll` (Run-1B) + the mix, so
+   `nts.mu2e.CosmicSignalMix1BB.MDC2025au_best_v1_1-001.root` for the CE
+   mix above. Its files pass the same cuts, trigger and time window; an
+   event counts when a cosmic made its first selected track (pileup DIO in
+   the cosmic mix is already in the DIO background). Each counted event
+   stands for (on-spill time NPOT implies) / (the sample's cosmic livetime).
+   The livetime is (S2 events resampled) x (S1 livetime per S1 event): the
+   first is the files' `dh.gencount` in SAM (50M per MDC2025au file, the
+   S2 events behind its mcs parent), the second the S1 CRY sample's,
+   measured once from its subrun products (2.2882e-4 s for
+   `sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab`, 0.27% rms over 318 subruns;
+   `cosmic_livetime_per_event` overrides it). The livetime stored in the
+   files is not used: `Mu2eProductMixer::endSubRun` truncates it with an
+   integer division (zero or up to ~25% low), and EventNtuple keeps none.
+   The 500 MDC2025au files hold 5.7e6 s, about 54 times the on-spill time
+   of 1e18 POT; `cosmic_max_files` reads only the first ones (~6 s each).
+   With the default cuts, 272 cosmic tracks pass in 100-110 MeV/c inside
+   540-1650 ns: 4.76e-6 per s per MeV/c (6% statistical), 2.7 times below
+   the flat Run-1A rate, so 0.71 cosmics instead of 1.90 in the best window
+   for 1e18 POT (`fullsim/README.md` has the full run).
+   `cosmic_shape` `flat` (default) spreads the count in 100-110 MeV/c
+   evenly per MeV/c (or the 90% CL limit of 2.3 events when there is none),
+   since the window scan would otherwise chase the gaps between single
+   events; `measured` bins them as they are. `cosmic_source` `rate` keeps
+   the old model, flat at `cosmic_rate_per_s_per_mev` over the on-spill
+   time, as `approx_ce_sensitivity` has it; a SAM dataset name measures on
+   that sample. The cosmic files take the same `cut_set`, thresholds and
+   time window as the CE. This is the fixed-cut result; `cut_mode`
+   `optimize` tunes against its own cosmic reference
+   (`fullsim/cosmic_reference.py`), weighted the same way by its CRY
+   livetime (`opt_cosmic_livetime_s`).
 5. **Window**: `approx_ce_sensitivity`'s `scan_signal_box` over momentum. The
    time window is fixed.
 
 The metrics carry `approx_ce_sensitivity`'s meanings: `signal_rate`,
 `dio_background`, `cosmic_background`, `total_background` in the window,
 and `npot`, `stopped_muons_per_pot`, `n_stopped_muons`, `rmue`,
-`n_conversions` and `cosmic_rate_per_s_per_mev` behind them. Also
+`n_conversions` and `cosmic_rate_per_s_per_mev` (measured, per second per
+MeV/c of on-spill time, unless `cosmic_source` is `rate`) behind them. The
+cosmic sample: `cosmic_livetime_s`, `cosmic_weight` (run events per cosmic
+event), `n_cosmic_files`, `n_cosmic_events`, `n_cosmic_counted` (in the
+time window, any momentum), `n_cosmic_flat_range` (in 100-110 MeV/c) and
+`cosmic_upper_limit` (1 when the limit was used); all -1 with `rate`. Also
 `signal_efficiency` (overall) and `signal_efficiency_window`,
 `n_signal_window` (reconstructed CE in the window), and the event counts.
 Outputs: `fullsim_sensitivity.log` (with the top windows scanned),
@@ -1654,8 +1690,10 @@ goes to `mu2e`, art resolves it on `FHICL_FILE_PATH`, `fcl_exists` comes back
 python3 tests/test_tools.py
 ```
 
-342 tests, none of which start a mu2e job or reach SAM or metacat (the
-catalog tests use a fake). (The `ana` env has no pytest, so
+352 tests, none of which start a mu2e job. Only one reaches SAM:
+`test_fullsim_measures_cosmics_on_the_cosmic_mix`, which needs the cosmic
+livetime from `dh.gencount`, and skips without SAM or the files on disk;
+the others use fakes (the catalog tests) or pass the numbers SAM would give. (The `ana` env has no pytest, so
 these are bare asserts.)
 
 ## Run the server
