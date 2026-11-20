@@ -40,5 +40,11 @@
   100.0,
   110.0
  ],
- "normalized_to": "loose set-81 cosmic-electron rate (approx_ce_sensitivity recommended_cosmic_rate('box')) x on-spill time"
+ "normalized_to": "CRY livetime (S2 events from SAM x S1 livetime per event)",
+ "n_inputs": 4980,
+ "s2_events": 24900000000,
+ "s1_file": "sim.mu2e.CosmicDSStopsCRYAll.MDC2025ab.001430_00018735.art",
+ "livetime_per_event": 0.00022882,
+ "livetime_s": 5697618.0,
+ "livetime_note": "added 2026-11-19 from the jobs' logs and SAM: the build read 498 of cluster 30781738's 500 ntuples and did not record which, but every job finished and read 10 dts.mu2e.CosmicSignal.MDC2025ap files (5000 distinct), each dh.gencount 5e6 in SAM (50000 distinct CosmicCRYAll parents), so any 498 give these S2 events"
 }
